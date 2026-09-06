@@ -1,0 +1,24 @@
+services:
+  flowops:
+    build: .
+    container_name: flowops-preview
+    restart: unless-stopped
+    ports:
+      - "8088:8080"
+    environment:
+      FLOWOPS_DB: /data/flowops.db
+      FLOWOPS_HOST: 0.0.0.0
+      FLOWOPS_PORT: "8080"
+      FLOWOPS_BOOTSTRAP_PASSWORD: ${FLOWOPS_BOOTSTRAP_PASSWORD:-FlowOps!Preview2026}
+      SERVICEOPS_URL: ${SERVICEOPS_URL:-http://host.docker.internal:8080}
+      SERVICEOPS_TOKEN: ${SERVICEOPS_TOKEN:-}
+      JENKINS_URL: ${JENKINS_URL:-}
+      JENKINS_USER: ${JENKINS_USER:-flowops}
+      JENKINS_TOKEN: ${JENKINS_TOKEN:-}
+    volumes:
+      - flowops-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  flowops-data:
