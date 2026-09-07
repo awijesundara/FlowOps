@@ -8,6 +8,9 @@ import json
 import os
 import secrets
 import sqlite3
+import smtplib
+import ssl
+import subprocess
 import time
 import base64
 import urllib.error
@@ -15,15 +18,66 @@ import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timezone
+from email.message import EmailMessage
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+
+class InvalidToken(ValueError):
+    """Raised when an encrypted administrator setting fails authentication."""
+
+
+class SettingsCipher:
+    """Small OpenSSL-backed authenticated cipher for portable secret storage."""
+
+    VERSION = b"FO1"
+
+    def __init__(self, encoded_key: str):
+        try:
+            self.master_key = base64.urlsafe_b64decode(encoded_key.encode())
+        except (ValueError, TypeError) as exc:
+            raise ValueError("invalid encryption key") from exc
+        if len(self.master_key) != 32:
+            raise ValueError("invalid encryption key")
+        self.encryption_key = hmac.new(self.master_key, b"flowops:encryption", hashlib.sha256).digest()
+        self.authentication_key = hmac.new(self.master_key, b"flowops:authentication", hashlib.sha256).digest()
+
+    def _crypt(self, payload: bytes, nonce: bytes, decrypt: bool = False) -> bytes:
+        command = ["openssl", "enc", "-aes-256-ctr", "-K", self.encryption_key.hex(), "-iv", nonce.hex()]
+        if decrypt:
+            command.append("-d")
+        try:
+            return subprocess.run(command, input=payload, capture_output=True, check=True).stdout
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise RuntimeError("OpenSSL credential encryption failed") from exc
+
+    def encrypt(self, plaintext: bytes) -> bytes:
+        nonce = secrets.token_bytes(16)
+        ciphertext = self._crypt(plaintext, nonce)
+        authenticated = self.VERSION + nonce + ciphertext
+        tag = hmac.new(self.authentication_key, authenticated, hashlib.sha256).digest()
+        return base64.urlsafe_b64encode(authenticated + tag)
+
+    def decrypt(self, token: bytes) -> bytes:
+        try:
+            decoded = base64.urlsafe_b64decode(token)
+        except (ValueError, TypeError) as exc:
+            raise InvalidToken("invalid credential encoding") from exc
+        if len(decoded) < 51 or decoded[:3] != self.VERSION:
+            raise InvalidToken("invalid credential format")
+        authenticated, supplied_tag = decoded[:-32], decoded[-32:]
+        expected_tag = hmac.new(self.authentication_key, authenticated, hashlib.sha256).digest()
+        if not hmac.compare_digest(supplied_tag, expected_tag):
+            raise InvalidToken("credential authentication failed")
+        return self._crypt(authenticated[19:], authenticated[3:19], decrypt=True)
+
 DB_PATH = os.getenv("FLOWOPS_DB", str(Path(__file__).with_name("flowops.db")))
 STATIC = Path(__file__).with_name("static")
 MAX_BODY = 1_000_000
 SESSION_SECONDS = 8 * 60 * 60
+DEFAULT_INSTANCE_SLUG = "flowops"
 ROLE_PERMISSIONS = {
     "Admin": {"runbooks:view","runbooks:edit","runbooks:execute","integrations:sync","admin:access","admin:users","admin:settings"},
     "Editor": {"runbooks:view","runbooks:edit","runbooks:execute","integrations:sync"},
@@ -97,6 +151,10 @@ def init_db() -> None:
           token_hash TEXT NOT NULL UNIQUE, expires_at INTEGER NOT NULL,
           accepted_at TEXT, created_by INTEGER REFERENCES users(id), created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS password_resets (
+          id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          token_hash TEXT NOT NULL UNIQUE, expires_at INTEGER NOT NULL, used_at TEXT, created_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS runbook_teams (
           id INTEGER PRIMARY KEY, runbook_id INTEGER NOT NULL REFERENCES runbooks(id) ON DELETE CASCADE,
           name TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(runbook_id,name)
@@ -106,7 +164,28 @@ def init_db() -> None:
           user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           PRIMARY KEY(team_id,user_id)
         );
+        CREATE TABLE IF NOT EXISTS instances (
+          id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE COLLATE NOCASE,
+          name TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS instance_settings (
+          instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+          key TEXT NOT NULL, value TEXT NOT NULL, updated_at TEXT NOT NULL,
+          PRIMARY KEY(instance_id,key)
+        );
+        CREATE TABLE IF NOT EXISTS integration_credentials (
+          instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+          provider TEXT NOT NULL, secret_encrypted TEXT NOT NULL,
+          updated_by INTEGER REFERENCES users(id), updated_at TEXT NOT NULL,
+          PRIMARY KEY(instance_id,provider)
+        );
         """)
+        db.execute("INSERT OR IGNORE INTO instances(slug,name,created_at) VALUES(?,?,?)",(DEFAULT_INSTANCE_SLUG,"FlowOps",now()))
+        default_instance=db.execute("SELECT id FROM instances WHERE slug=?",(DEFAULT_INSTANCE_SLUG,)).fetchone()[0]
+        for table in ("users","workspaces","invitations","audit"):
+            existing={row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+            if "instance_id" not in existing: db.execute(f"ALTER TABLE {table} ADD COLUMN instance_id INTEGER REFERENCES instances(id)")
+            db.execute(f"UPDATE {table} SET instance_id=? WHERE instance_id IS NULL",(default_instance,))
         columns={row[1] for row in db.execute("PRAGMA table_info(runbooks)")}
         if "workspace_id" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN workspace_id INTEGER REFERENCES workspaces(id)")
         if "actual_started_at" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN actual_started_at TEXT")
@@ -124,11 +203,14 @@ def init_db() -> None:
         }
         for column,definition in task_migrations.items():
             if column not in task_columns: db.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
+        session_columns={row[1] for row in db.execute("PRAGMA table_info(sessions)")}
+        for column,definition in {"ip_address":"TEXT NOT NULL DEFAULT ''","user_agent":"TEXT NOT NULL DEFAULT ''"}.items():
+            if column not in session_columns:db.execute(f"ALTER TABLE sessions ADD COLUMN {column} {definition}")
         db.execute("UPDATE users SET role='Admin' WHERE role='Administrator'")
         db.execute("UPDATE users SET role='Editor' WHERE role='Runbook Manager'")
         db.execute("UPDATE users SET role='Member' WHERE role IN ('Operator','Viewer')")
-        db.execute("INSERT OR IGNORE INTO workspaces(name,description,color,created_at) VALUES(?,?,?,?)",("Resilience Operations","Production change, recovery, and release orchestration.","#3158c7",now()))
-        default_workspace=db.execute("SELECT id FROM workspaces ORDER BY id LIMIT 1").fetchone()[0]
+        db.execute("INSERT OR IGNORE INTO workspaces(name,description,color,created_at,instance_id) VALUES(?,?,?,?,?)",("Resilience Operations","Production change, recovery, and release orchestration.","#3158c7",now(),default_instance))
+        default_workspace=db.execute("SELECT id FROM workspaces WHERE instance_id=? ORDER BY id LIMIT 1",(default_instance,)).fetchone()[0]
         db.execute("UPDATE runbooks SET workspace_id=? WHERE workspace_id IS NULL",(default_workspace,))
         if db.execute("SELECT COUNT(*) FROM runbooks").fetchone()[0] == 0:
             stamp = now()
@@ -153,14 +235,17 @@ def init_db() -> None:
         db.execute("UPDATE runbooks SET workspace_id=? WHERE workspace_id IS NULL",(default_workspace,))
         if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             password=os.getenv("FLOWOPS_BOOTSTRAP_PASSWORD","FlowOps!Preview2026")
-            db.execute("INSERT INTO users(username,display_name,email,role,team,password_hash,created_at) VALUES(?,?,?,?,?,?,?)",
-                       ("admin","Anushka","admin@flowops.local","Admin","Platform Operations",password_hash(password),now()))
-            db.execute("INSERT INTO users(username,display_name,email,role,team,password_hash,created_at) VALUES(?,?,?,?,?,?,?)",
-                       ("operator","Release Operator","operator@flowops.local","Member","Release Engineering",password_hash("Operator!Preview2026"),now()))
-        defaults={"workspace_name":"Resilience Operations","timezone":"Asia/Tokyo","require_approval":"true","session_hours":"8","serviceops_enabled":"true",
+            db.execute("INSERT INTO users(username,display_name,email,role,team,password_hash,created_at,instance_id) VALUES(?,?,?,?,?,?,?,?)",
+                       ("admin","Anushka","admin@flowops.local","Admin","Platform Operations",password_hash(password),now(),default_instance))
+            db.execute("INSERT INTO users(username,display_name,email,role,team,password_hash,created_at,instance_id) VALUES(?,?,?,?,?,?,?,?)",
+                       ("operator","Release Operator","operator@flowops.local","Member","Release Engineering",password_hash("Operator!Preview2026"),now(),default_instance))
+        defaults={"workspace_name":"Resilience Operations","timezone":"Asia/Tokyo","require_approval":"true","session_hours":"8","serviceops_enabled":"true","directory_enabled":"false","directory_domain":"",
           "serviceops_url":os.getenv("SERVICEOPS_URL","http://host.docker.internal:8080"),"serviceops_sync_on_live":"true","serviceops_sync_on_complete":"true","serviceops_require_approved":"true","serviceops_trigger_workflow":"false",
-          "jenkins_enabled":"false","jenkins_url":os.getenv("JENKINS_URL",""),"jenkins_live_only":"true","jenkins_auto_complete":"true","jenkins_allow_parameters":"true"}
+        }
         for key,value in defaults.items(): db.execute("INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES(?,?,?)",(key,value,now()))
+        for key,value in defaults.items():
+            legacy=db.execute("SELECT value FROM settings WHERE key=?",(key,)).fetchone()
+            db.execute("INSERT OR IGNORE INTO instance_settings(instance_id,key,value,updated_at) VALUES(?,?,?,?)",(default_instance,key,legacy[0] if legacy else value,now()))
 
 
 def password_hash(password: str, salt: bytes | None=None) -> str:
@@ -174,13 +259,63 @@ def password_valid(password: str, encoded: str) -> bool:
     return hmac.compare_digest(actual,digest)
 
 
-def append_audit(db: sqlite3.Connection, runbook_id: int | None, action: str, detail: str, actor: str = "Preview User") -> None:
-    previous = db.execute("SELECT event_hash FROM audit ORDER BY id DESC LIMIT 1").fetchone()
+def instance_settings(db: sqlite3.Connection, instance_id: int) -> dict[str,str]:
+    return {r["key"]:r["value"] for r in db.execute("SELECT key,value FROM instance_settings WHERE instance_id=?",(instance_id,))}
+
+
+def mail_configuration() -> dict[str,Any]:
+    host=os.getenv("FLOWOPS_SMTP_HOST","").strip(); sender=os.getenv("FLOWOPS_MAIL_FROM","").strip(); public_url=os.getenv("FLOWOPS_PUBLIC_URL","").strip().rstrip("/")
+    return {"configured":bool(host and sender and public_url),"host":host,"port":int(os.getenv("FLOWOPS_SMTP_PORT","587")),"sender":sender,"public_url":public_url,"security":os.getenv("FLOWOPS_SMTP_SECURITY","starttls").strip().lower(),"username":os.getenv("FLOWOPS_SMTP_USERNAME","")}
+
+
+def send_mail(recipient: str, subject: str, body: str) -> None:
+    config=mail_configuration()
+    if not config["configured"]: raise RuntimeError("Email delivery is not configured")
+    message=EmailMessage();message["From"]=config["sender"];message["To"]=recipient;message["Subject"]=subject;message.set_content(body)
+    password=os.getenv("FLOWOPS_SMTP_PASSWORD",""); security=config["security"]
+    if security not in {"starttls","tls","none"}: raise RuntimeError("FLOWOPS_SMTP_SECURITY must be starttls, tls, or none")
+    client_type=smtplib.SMTP_SSL if security=="tls" else smtplib.SMTP
+    try:
+        with client_type(config["host"],config["port"],timeout=10) as client:
+            if security=="starttls": client.starttls(context=ssl.create_default_context())
+            if config["username"]: client.login(config["username"],password)
+            client.send_message(message)
+    except (OSError,smtplib.SMTPException) as exc:
+        raise RuntimeError("Email delivery failed") from exc
+
+
+def settings_cipher() -> SettingsCipher:
+    key=os.getenv("FLOWOPS_SETTINGS_ENCRYPTION_KEY","").strip()
+    if not key: raise RuntimeError("FLOWOPS_SETTINGS_ENCRYPTION_KEY is required for administrator-managed credentials")
+    try:return SettingsCipher(key)
+    except (ValueError,TypeError) as exc:raise RuntimeError("FLOWOPS_SETTINGS_ENCRYPTION_KEY is invalid") from exc
+
+
+def integration_credential(db: sqlite3.Connection, instance_id: int, provider: str) -> tuple[str,str]:
+    row=db.execute("SELECT secret_encrypted FROM integration_credentials WHERE instance_id=? AND provider=?",(instance_id,provider)).fetchone()
+    if row:
+        try:return settings_cipher().decrypt(row[0].encode()).decode(),"Encrypted FlowOps setting"
+        except (InvalidToken,RuntimeError,UnicodeDecodeError) as exc:raise RuntimeError(f"The stored {provider.title()} credential cannot be decrypted") from exc
+    variable="SERVICEOPS_TOKEN"
+    return os.getenv(variable,""),variable
+
+
+def owns_runbook(db: sqlite3.Connection, rid: int, instance_id: int) -> bool:
+    return bool(db.execute("SELECT 1 FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE r.id=? AND w.instance_id=?",(rid,instance_id)).fetchone())
+
+
+def append_audit(db: sqlite3.Connection, runbook_id: int | None, action: str, detail: str, actor: str = "Preview User", instance_id: int | None = None) -> None:
+    if instance_id is None and runbook_id is not None:
+        found=db.execute("SELECT w.instance_id FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE r.id=?",(runbook_id,)).fetchone()
+        instance_id=found[0] if found else None
+    if instance_id is None:
+        found=db.execute("SELECT id FROM instances WHERE slug=?",(DEFAULT_INSTANCE_SLUG,)).fetchone(); instance_id=found[0] if found else None
+    previous = db.execute("SELECT event_hash FROM audit WHERE instance_id=? ORDER BY id DESC LIMIT 1",(instance_id,)).fetchone()
     previous_hash = previous[0] if previous else "GENESIS"
     stamp = now()
     digest = hashlib.sha256(f"{previous_hash}|{runbook_id}|{action}|{detail}|{actor}|{stamp}".encode()).hexdigest()
-    db.execute("INSERT INTO audit(runbook_id,action,detail,actor,created_at,previous_hash,event_hash) VALUES(?,?,?,?,?,?,?)",
-               (runbook_id, action, detail, actor, stamp, previous_hash, digest))
+    db.execute("INSERT INTO audit(runbook_id,action,detail,actor,created_at,previous_hash,event_hash,instance_id) VALUES(?,?,?,?,?,?,?,?)",
+               (runbook_id, action, detail, actor, stamp, previous_hash, digest, instance_id))
 
 
 def rows(items) -> list[dict[str, Any]]:
@@ -188,6 +323,8 @@ def rows(items) -> list[dict[str, Any]]:
 
 
 def runbook_document(db: sqlite3.Connection, rid: int, user: dict[str,Any] | None=None) -> dict[str, Any] | None:
+    if user and not owns_runbook(db,rid,user["instance_id"]):
+        return None
     rb = db.execute("SELECT * FROM runbooks WHERE id=?", (rid,)).fetchone()
     if not rb:
         return None
@@ -322,6 +459,33 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(data,dict): raise ValueError("A JSON object is required")
         return data
 
+    def serviceops_directory_authenticate(self, db: sqlite3.Connection, instance_id: int, username: str, password: str) -> dict[str,Any]:
+        values=instance_settings(db,instance_id)
+        if values.get("directory_enabled","false") != "true":
+            raise RuntimeError("Corporate directory sign-in is not enabled")
+        base=values.get("serviceops_url",os.getenv("SERVICEOPS_URL","")).strip().rstrip("/")
+        if not base: raise RuntimeError("ServiceOps is not configured")
+        endpoint=(base if base.endswith("/api/v1") else f"{base}/api/v1")+"/auth/mobile/login"
+        headers={"Content-Type":"application/json","Accept":"application/json","X-ServiceOps-App-Version":"FlowOps/0.1","X-ServiceOps-App-Build":"flowops","X-ServiceOps-Platform":"web","X-ServiceOps-Device":"FlowOps server"}
+        request=urllib.request.Request(endpoint,data=json.dumps({"username":username,"password":password,"provider":"ldap"}).encode(),headers=headers,method="POST")
+        try:
+            with urllib.request.urlopen(request,timeout=8) as response:
+                if "application/json" not in response.headers.get("Content-Type",""):
+                    raise RuntimeError("ServiceOps returned a non-JSON response; use its internal cluster URL, not the Cloudflare Access URL")
+                result=json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError("Invalid username or password" if exc.code in {401,403,423} else f"ServiceOps directory authentication returned HTTP {exc.code}") from exc
+        except (urllib.error.URLError,TimeoutError,json.JSONDecodeError) as exc:
+            raise RuntimeError("ServiceOps directory authentication is unavailable") from exc
+        access=str(result.get("access_token", "")); remote=result.get("user") or {}
+        if not access or not remote.get("username"): raise RuntimeError("ServiceOps returned an incomplete directory identity")
+        logout=urllib.request.Request((base if base.endswith("/api/v1") else f"{base}/api/v1")+"/auth/mobile/logout",data=b"{}",headers={**headers,"Authorization":f"Bearer {access}"},method="POST")
+        try:
+            urllib.request.urlopen(logout,timeout=5).close()
+        except (urllib.error.URLError,TimeoutError):
+            pass
+        return remote
+
     def static(self, name: str, content_type: str):
         try: body=(STATIC/name).read_bytes()
         except FileNotFoundError: return self.send_error(404)
@@ -345,38 +509,73 @@ class Handler(BaseHTTPRequestHandler):
         if path=="/app.js": return self.static("app.js","application/javascript; charset=utf-8")
         if path=="/styles.css": return self.static("styles.css","text/css; charset=utf-8")
         if path in ("/health","/ready"): return self.send_json({"status":"ok","service":"flowops"})
+        if path=="/api/auth/sources":
+            with connect() as db:
+                instance=db.execute("SELECT id FROM instances WHERE slug=?",(DEFAULT_INSTANCE_SLUG,)).fetchone()
+                values=instance_settings(db,instance["id"]) if instance else {}
+                directory_enabled=values.get("directory_enabled","false")=="true"
+                domain=values.get("directory_domain","").strip()
+                sources=[{"id":"local","label":"Local administrator","placeholder":"Username"}]
+                if directory_enabled:
+                    label=domain or "Corporate directory"
+                    placeholder=f"jsmith or jsmith@{domain}" if domain else "jsmith"
+                    sources.insert(0,{"id":"ldap","label":label,"placeholder":placeholder})
+                return self.send_json({"data":{"sources":sources,"default":"ldap" if directory_enabled else "local"}})
         if path=="/api/events": return self.stream_events()
         with connect() as db:
             if path=="/api/auth/me":
                 user=self.current_user(db)
                 if not user: return self.send_json({"error":"Authentication required"},401)
-                settings={r["key"]:r["value"] for r in db.execute("SELECT key,value FROM settings")}
+                settings=instance_settings(db,user["instance_id"])
                 return self.send_json({"data":{"user":user,"settings":settings}})
             if path=="/api/admin/users":
-                if not self.require(db,"admin:users"): return
-                data=rows(db.execute("SELECT id,username,display_name,email,role,team,active,last_login_at,created_at FROM users ORDER BY display_name"))
+                actor=self.require(db,"admin:users")
+                if not actor: return
+                data=rows(db.execute("SELECT id,username,display_name,email,role,team,active,last_login_at,created_at FROM users WHERE instance_id=? ORDER BY display_name",(actor["instance_id"],)))
                 return self.send_json({"data":data})
             if path=="/api/admin/settings":
-                if not self.require(db,"admin:settings"): return
-                return self.send_json({"data":{r["key"]:r["value"] for r in db.execute("SELECT key,value FROM settings")}})
+                actor=self.require(db,"admin:settings")
+                if not actor: return
+                values=instance_settings(db,actor["instance_id"]);mail=mail_configuration()
+                values.update({"mail_delivery_configured":str(mail["configured"]).lower(),"mail_sender":mail["sender"],"mail_security":mail["security"],"public_url_configured":str(bool(mail["public_url"])).lower()})
+                return self.send_json({"data":values})
             if path=="/api/admin/integrations":
-                if not self.require(db,"admin:settings"): return
-                values={r["key"]:r["value"] for r in db.execute("SELECT key,value FROM settings")}
+                actor=self.require(db,"admin:settings")
+                if not actor: return
+                values=instance_settings(db,actor["instance_id"])
+                try:serviceops_token,serviceops_source=integration_credential(db,actor["instance_id"],"serviceops")
+                except RuntimeError:serviceops_token,serviceops_source="","Encrypted credential unavailable"
                 data={
-                  "serviceops":{"enabled":values.get("serviceops_enabled","true"),"url":values.get("serviceops_url",os.getenv("SERVICEOPS_URL","")),"credential_configured":bool(os.getenv("SERVICEOPS_TOKEN")),"credential_source":"SERVICEOPS_TOKEN","sync_on_live":values.get("serviceops_sync_on_live","true"),"sync_on_complete":values.get("serviceops_sync_on_complete","true"),"require_approved":values.get("serviceops_require_approved","true"),"trigger_workflow":values.get("serviceops_trigger_workflow","false"),"api_version":"v1"},
-                  "jenkins":{"enabled":values.get("jenkins_enabled","false"),"url":values.get("jenkins_url",os.getenv("JENKINS_URL","")),"credential_configured":bool(os.getenv("JENKINS_TOKEN")),"credential_source":"JENKINS_TOKEN","live_only":values.get("jenkins_live_only","true"),"auto_complete":values.get("jenkins_auto_complete","true"),"allow_parameters":values.get("jenkins_allow_parameters","true")}
+                  "serviceops":{"enabled":values.get("serviceops_enabled","true"),"url":values.get("serviceops_url",os.getenv("SERVICEOPS_URL","")),"credential_configured":bool(serviceops_token),"credential_source":serviceops_source,"credential_editable":bool(os.getenv("FLOWOPS_SETTINGS_ENCRYPTION_KEY")),"sync_on_live":values.get("serviceops_sync_on_live","true"),"sync_on_complete":values.get("serviceops_sync_on_complete","true"),"require_approved":values.get("serviceops_require_approved","true"),"trigger_workflow":values.get("serviceops_trigger_workflow","false"),"api_version":"v1","required_scopes":["tickets:read","tickets:update","workflows:execute"]}
                 }
                 return self.send_json({"data":data})
             if path=="/api/admin/workspaces":
-                if not self.require(db,"admin:settings"): return
-                data=rows(db.execute("SELECT w.*,COUNT(r.id) runbook_count FROM workspaces w LEFT JOIN runbooks r ON r.workspace_id=w.id GROUP BY w.id ORDER BY w.name"))
+                actor=self.require(db,"admin:settings")
+                if not actor: return
+                data=rows(db.execute("SELECT w.*,COUNT(r.id) runbook_count FROM workspaces w LEFT JOIN runbooks r ON r.workspace_id=w.id WHERE w.instance_id=? GROUP BY w.id ORDER BY w.name",(actor["instance_id"],)))
                 return self.send_json({"data":data})
+            if path=="/api/admin/sessions":
+                actor=self.require(db,"admin:users")
+                if not actor:return
+                data=rows(db.execute("SELECT s.id,u.display_name,u.username,s.ip_address,s.user_agent,s.created_at,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE u.instance_id=? AND s.expires_at>? ORDER BY s.created_at DESC",(actor["instance_id"],int(time.time()))))
+                return self.send_json({"data":data})
+            if path=="/api/admin/audit":
+                actor=self.require(db,"admin:access")
+                if not actor:return
+                return self.send_json({"data":rows(db.execute("SELECT id,runbook_id,action,detail,actor,created_at,event_hash FROM audit WHERE instance_id=? ORDER BY id DESC LIMIT 250",(actor["instance_id"],)))})
+            if path=="/api/admin/health":
+                actor=self.require(db,"admin:access")
+                if not actor:return
+                counts=db.execute("SELECT (SELECT COUNT(*) FROM users WHERE instance_id=? AND active=1),(SELECT COUNT(*) FROM workspaces WHERE instance_id=? AND active=1),(SELECT COUNT(*) FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE w.instance_id=?),(SELECT COUNT(*) FROM sessions s JOIN users u ON u.id=s.user_id WHERE u.instance_id=? AND s.expires_at>?)",(actor["instance_id"],actor["instance_id"],actor["instance_id"],actor["instance_id"],int(time.time()))).fetchone()
+                return self.send_json({"data":{"status":"healthy","database":db.execute("PRAGMA integrity_check").fetchone()[0],"active_users":counts[0],"workspaces":counts[1],"runbooks":counts[2],"active_sessions":counts[3],"email_configured":mail_configuration()["configured"],"credential_encryption_configured":bool(os.getenv("FLOWOPS_SETTINGS_ENCRYPTION_KEY")),"realtime":"SSE"}})
             if path=="/api/workspaces":
-                if not self.require(db,"runbooks:view"): return
-                return self.send_json({"data":rows(db.execute("SELECT id,name,description,color FROM workspaces WHERE active=1 ORDER BY name"))})
+                actor=self.require(db,"runbooks:view")
+                if not actor: return
+                return self.send_json({"data":rows(db.execute("SELECT id,name,description,color FROM workspaces WHERE active=1 AND instance_id=? ORDER BY name",(actor["instance_id"],)))})
             if path=="/api/runbooks":
-                if not self.require(db,"runbooks:view"): return
-                items=rows(db.execute("SELECT r.*,w.name workspace_name,COUNT(t.id) task_count,SUM(CASE WHEN t.status='complete' THEN 1 ELSE 0 END) done_count FROM runbooks r LEFT JOIN workspaces w ON w.id=r.workspace_id LEFT JOIN tasks t ON t.runbook_id=r.id GROUP BY r.id ORDER BY r.updated_at DESC"))
+                actor=self.require(db,"runbooks:view")
+                if not actor: return
+                items=rows(db.execute("SELECT r.*,w.name workspace_name,COUNT(t.id) task_count,SUM(CASE WHEN t.status='complete' THEN 1 ELSE 0 END) done_count FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id LEFT JOIN tasks t ON t.runbook_id=r.id WHERE w.instance_id=? GROUP BY r.id ORDER BY r.updated_at DESC",(actor["instance_id"],)))
                 return self.send_json({"data":items})
             if path.startswith("/api/runbooks/"):
                 user=self.require(db,"runbooks:view")
@@ -384,8 +583,9 @@ class Handler(BaseHTTPRequestHandler):
                 parts=path.strip("/").split("/")
                 try: rid=int(parts[2])
                 except (ValueError,IndexError): return self.send_json({"error":"Not found"},404)
+                if not owns_runbook(db,rid,user["instance_id"]): return self.send_json({"error":"Not found"},404)
                 if len(parts)==4 and parts[3]=="assignment-options":
-                    users=rows(db.execute("SELECT id,display_name,email FROM users WHERE active=1 ORDER BY display_name")); teams=rows(db.execute("SELECT id,name FROM runbook_teams WHERE runbook_id=? ORDER BY name",(rid,)))
+                    users=rows(db.execute("SELECT id,display_name,email FROM users WHERE active=1 AND instance_id=? ORDER BY display_name",(user["instance_id"],))); teams=rows(db.execute("SELECT id,name FROM runbook_teams WHERE runbook_id=? ORDER BY name",(rid,)))
                     return self.send_json({"data":{"users":users,"teams":teams}})
                 if len(parts)==4 and parts[3]=="teams":
                     teams=rows(db.execute("SELECT rt.id,rt.name,COUNT(tm.user_id) member_count FROM runbook_teams rt LEFT JOIN team_members tm ON tm.team_id=rt.id WHERE rt.runbook_id=? GROUP BY rt.id ORDER BY rt.name",(rid,)))
@@ -395,10 +595,11 @@ class Handler(BaseHTTPRequestHandler):
                 doc=runbook_document(db,rid,user)
                 return self.send_json({"data":doc} if doc else {"error":"Not found"},200 if doc else 404)
             if path=="/api/dashboard":
-                if not self.require(db,"runbooks:view"): return
-                stats=dict(db.execute("SELECT COUNT(*) runbooks, SUM(status='live') live, SUM(status='complete') complete FROM runbooks").fetchone())
-                stats["tasks"]=db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
-                stats["task_completion"]=db.execute("SELECT COALESCE(ROUND(100.0*SUM(status='complete')/NULLIF(COUNT(*),0)),0) FROM tasks").fetchone()[0]
+                actor=self.require(db,"runbooks:view")
+                if not actor: return
+                stats=dict(db.execute("SELECT COUNT(*) runbooks, SUM(r.status='live') live, SUM(r.status='complete') complete FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE w.instance_id=?",(actor["instance_id"],)).fetchone())
+                stats["tasks"]=db.execute("SELECT COUNT(*) FROM tasks t JOIN runbooks r ON r.id=t.runbook_id JOIN workspaces w ON w.id=r.workspace_id WHERE w.instance_id=?",(actor["instance_id"],)).fetchone()[0]
+                stats["task_completion"]=db.execute("SELECT COALESCE(ROUND(100.0*SUM(t.status='complete')/NULLIF(COUNT(*),0)),0) FROM tasks t JOIN runbooks r ON r.id=t.runbook_id JOIN workspaces w ON w.id=r.workspace_id WHERE w.instance_id=?",(actor["instance_id"],)).fetchone()[0]
                 return self.send_json({"data":stats})
         self.send_json({"error":"Not found"},404)
 
@@ -408,7 +609,8 @@ class Handler(BaseHTTPRequestHandler):
             user=self.current_user(db)
             if not user or "runbooks:view" not in user["permissions"]:
                 return self.send_json({"error":"Authentication required"},401)
-            version=db.execute("SELECT COALESCE(MAX(id),0) FROM audit").fetchone()[0]
+            instance_id=user["instance_id"]
+            version=db.execute("SELECT COALESCE(MAX(id),0) FROM audit WHERE instance_id=?",(instance_id,)).fetchone()[0]
         self.send_response(200); self.send_header("Content-Type","text/event-stream; charset=utf-8")
         self.send_header("Cache-Control","no-cache, no-store"); self.send_header("Connection","keep-alive")
         self.send_header("X-Accel-Buffering","no"); self.end_headers()
@@ -417,8 +619,8 @@ class Handler(BaseHTTPRequestHandler):
             for tick in range(300):
                 time.sleep(1)
                 with connect() as db:
-                    current=db.execute("SELECT COALESCE(MAX(id),0) FROM audit").fetchone()[0]
-                    events=rows(db.execute("SELECT id,runbook_id,action,detail,actor,created_at FROM audit WHERE id>? ORDER BY id LIMIT 25",(version,))) if current!=version else []
+                    current=db.execute("SELECT COALESCE(MAX(id),0) FROM audit WHERE instance_id=?",(instance_id,)).fetchone()[0]
+                    events=rows(db.execute("SELECT id,runbook_id,action,detail,actor,created_at FROM audit WHERE instance_id=? AND id>? ORDER BY id LIMIT 25",(instance_id,version))) if current!=version else []
                 if current != version:
                     for event in events:
                         event["version"]=event["id"]
@@ -434,77 +636,156 @@ class Handler(BaseHTTPRequestHandler):
         try: payload=self.body()
         except (ValueError,json.JSONDecodeError) as exc: return self.send_json({"error":str(exc)},400)
         with connect() as db:
+            if path=="/api/auth/register":
+                organization=str(payload.get("organization","" )).strip(); slug=str(payload.get("slug","")).strip().lower()
+                username=str(payload.get("username","")).strip(); display=str(payload.get("display_name","")).strip(); email=str(payload.get("email","")).strip().lower(); password=str(payload.get("password",""))
+                slug="-".join(filter(None,("".join(c if c.isalnum() else " " for c in slug).split())))
+                if not organization or len(slug)<3 or not username or not display or "@" not in email or len(password)<12:
+                    return self.send_json({"error":"Organization, a 3-character slug, username, display name, valid email, and a password of at least 12 characters are required"},400)
+                if db.execute("SELECT 1 FROM instances WHERE slug=?",(slug,)).fetchone() or db.execute("SELECT 1 FROM users WHERE username=? OR email=?",(username,email)).fetchone():
+                    return self.send_json({"error":"That organization, username, or email is already registered"},409)
+                stamp=now()
+                try:
+                    cur=db.execute("INSERT INTO instances(slug,name,created_at) VALUES(?,?,?)",(slug,organization[:160],stamp)); instance_id=cur.lastrowid
+                    user_id=db.execute("INSERT INTO users(username,display_name,email,role,team,password_hash,created_at,instance_id) VALUES(?,?,?,?,?,?,?,?)",(username,display,email,"Admin","",password_hash(password),stamp,instance_id)).lastrowid
+                    db.execute("INSERT INTO workspaces(name,description,color,created_at,instance_id) VALUES(?,?,?,?,?)",("Operations","Default workspace","#3158c7",stamp,instance_id))
+                    defaults={r["key"]:r["value"] for r in db.execute("SELECT key,value FROM instance_settings WHERE instance_id=(SELECT id FROM instances WHERE slug=?)",(DEFAULT_INSTANCE_SLUG,))}
+                    for key,value in defaults.items(): db.execute("INSERT INTO instance_settings(instance_id,key,value,updated_at) VALUES(?,?,?,?)",(instance_id,key,value,stamp))
+                    db.execute("INSERT INTO instance_settings(instance_id,key,value,updated_at) VALUES(?,?,?,?) ON CONFLICT(instance_id,key) DO UPDATE SET value=excluded.value",(instance_id,"workspace_name",organization[:160],stamp))
+                    append_audit(db,None,"instance.created",f"{organization} created",display,instance_id); db.commit()
+                except sqlite3.IntegrityError:
+                    db.rollback(); return self.send_json({"error":"That organization, username, or email is already registered"},409)
+                return self.send_json({"data":{"instance_id":instance_id,"user_id":user_id,"slug":slug}},201)
             if path=="/api/auth/login":
-                username=str(payload.get("username","")).strip(); password=str(payload.get("password",""))
-                user=db.execute("SELECT * FROM users WHERE (username=? OR email=?) AND active=1",(username,username)).fetchone()
-                if not user or not password_valid(password,user["password_hash"]):
-                    time.sleep(.2); return self.send_json({"error":"Invalid username or password"},401)
-                raw=secrets.token_urlsafe(36); csrf=secrets.token_urlsafe(24); expires=int(time.time())+SESSION_SECONDS
-                db.execute("DELETE FROM sessions WHERE expires_at<=?",(int(time.time()),)); db.execute("INSERT INTO sessions(token_hash,csrf_token,user_id,expires_at,created_at) VALUES(?,?,?,?,?)",(hashlib.sha256(raw.encode()).hexdigest(),csrf,user["id"],expires,now())); db.execute("UPDATE users SET last_login_at=? WHERE id=?",(now(),user["id"])); append_audit(db,None,"auth.login",f"{user['username']} signed in",user["display_name"]); db.commit()
+                username=str(payload.get("username","")).strip(); password=str(payload.get("password",""));source=str(payload.get("source","local")).lower()
+                instance=db.execute("SELECT id FROM instances WHERE slug=?",(DEFAULT_INSTANCE_SLUG,)).fetchone()
+                if source=="ldap":
+                    if not instance:return self.send_json({"error":"FlowOps instance is unavailable"},503)
+                    try:remote=self.serviceops_directory_authenticate(db,instance["id"],username,password)
+                    except RuntimeError as exc:time.sleep(.2);return self.send_json({"error":str(exc)},401)
+                    username=str(remote["username"]);user=db.execute("SELECT * FROM users WHERE username=? AND instance_id=? AND active=1",(username,instance["id"])).fetchone()
+                    if not user:
+                        display=str(remote.get("name") or username)[:160];db.execute("INSERT INTO users(username,display_name,email,role,team,password_hash,created_at,instance_id) VALUES(?,?,?,?,?,?,?,?)",(username,display,"","Member","",password_hash(secrets.token_urlsafe(48)),now(),instance["id"]));user=db.execute("SELECT * FROM users WHERE username=? AND instance_id=?",(username,instance["id"])).fetchone()
+                else:
+                    user=db.execute("SELECT * FROM users WHERE (username=? OR email=?) AND active=1",(username,username)).fetchone()
+                    if not user or not password_valid(password,user["password_hash"]):time.sleep(.2);return self.send_json({"error":"Invalid username or password"},401)
+                hours=max(1,min(24,int(instance_settings(db,user["instance_id"]).get("session_hours","8")))); session_seconds=hours*3600
+                raw=secrets.token_urlsafe(36); csrf=secrets.token_urlsafe(24); expires=int(time.time())+session_seconds
+                db.execute("DELETE FROM sessions WHERE expires_at<=?",(int(time.time()),)); db.execute("INSERT INTO sessions(token_hash,csrf_token,user_id,expires_at,created_at,ip_address,user_agent) VALUES(?,?,?,?,?,?,?)",(hashlib.sha256(raw.encode()).hexdigest(),csrf,user["id"],expires,now(),self.client_address[0][:64],self.headers.get("User-Agent","")[:300])); db.execute("UPDATE users SET last_login_at=? WHERE id=?",(now(),user["id"])); append_audit(db,None,"auth.login",f"{user['username']} signed in",user["display_name"],user["instance_id"]); db.commit()
                 safe={k:user[k] for k in ("id","username","display_name","email","role","team")}; safe["permissions"]=sorted(ROLE_PERMISSIONS[user["role"]]); safe["csrf_token"]=csrf
-                return self.send_json({"data":safe},headers={"Set-Cookie":f"flowops_session={raw}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_SECONDS}"})
+                return self.send_json({"data":safe},headers={"Set-Cookie":f"flowops_session={raw}; Path=/; HttpOnly; SameSite=Strict; Max-Age={session_seconds}"})
             if path=="/api/auth/logout":
                 user=self.current_user(db)
                 if user:
                     cookies={i.strip().split("=",1)[0]:i.strip().split("=",1)[1] for i in self.headers.get("Cookie","").split(";") if "=" in i}; raw=cookies.get("flowops_session","")
-                    db.execute("DELETE FROM sessions WHERE token_hash=?",(hashlib.sha256(raw.encode()).hexdigest(),)); append_audit(db,None,"auth.logout",f"{user['username']} signed out",user["display_name"]); db.commit()
+                    db.execute("DELETE FROM sessions WHERE token_hash=?",(hashlib.sha256(raw.encode()).hexdigest(),)); append_audit(db,None,"auth.logout",f"{user['username']} signed out",user["display_name"],user["instance_id"]); db.commit()
                 return self.send_json({"data":{"ok":True}},headers={"Set-Cookie":"flowops_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"})
+            if path=="/api/auth/invitations/accept":
+                raw=str(payload.get("token","")).strip();username=str(payload.get("username","")).strip();display=str(payload.get("display_name","")).strip();password=str(payload.get("password",""))
+                invite=db.execute("SELECT * FROM invitations WHERE token_hash=? AND accepted_at IS NULL AND expires_at>?",(hashlib.sha256(raw.encode()).hexdigest(),int(time.time()))).fetchone() if raw else None
+                if not invite:return self.send_json({"error":"Invitation is invalid, expired, or already used"},400)
+                if not username or not display or len(password)<12:return self.send_json({"error":"Username, display name, and a password of at least 12 characters are required"},400)
+                if db.execute("SELECT 1 FROM users WHERE username=? OR email=?",(username,invite["email"])).fetchone():return self.send_json({"error":"An account already exists for this username or email"},409)
+                try:cur=db.execute("INSERT INTO users(username,display_name,email,role,team,password_hash,created_at,instance_id) VALUES(?,?,?,?,?,?,?,?)",(username,display,invite["email"],invite["role"],"",password_hash(password),now(),invite["instance_id"]))
+                except sqlite3.IntegrityError:return self.send_json({"error":"That username already exists"},409)
+                db.execute("UPDATE invitations SET accepted_at=? WHERE id=?",(now(),invite["id"]));append_audit(db,None,"auth.invitation_accepted",f"{invite['email']} joined as {invite['role']}",display,invite["instance_id"]);db.commit()
+                return self.send_json({"data":{"ok":True,"username":username,"role":invite["role"]}},201)
+            if path=="/api/auth/password-reset/request":
+                identity=str(payload.get("identity","")).strip();user=db.execute("SELECT * FROM users WHERE (username=? OR email=?) AND active=1",(identity,identity)).fetchone()
+                response={"ok":True,"message":"If the account exists, password reset instructions have been issued"}
+                if user:
+                    raw=secrets.token_urlsafe(32);stamp=now();db.execute("UPDATE password_resets SET used_at=? WHERE user_id=? AND used_at IS NULL",(stamp,user["id"]));db.execute("INSERT INTO password_resets(user_id,token_hash,expires_at,created_at) VALUES(?,?,?,?)",(user["id"],hashlib.sha256(raw.encode()).hexdigest(),int(time.time())+1800,stamp));append_audit(db,None,"auth.password_reset_requested",user["username"],"FlowOps",user["instance_id"])
+                    preview=os.getenv("FLOWOPS_PREVIEW_TOKENS","false").lower()=="true"
+                    if preview: response["preview_token"]=raw
+                    elif mail_configuration()["configured"]:
+                        try: send_mail(user["email"],"Reset your FlowOps password",f"Hello {user['display_name']},\n\nReset your FlowOps password within 30 minutes:\n{mail_configuration()['public_url']}/?reset={urllib.parse.quote(raw)}\n\nIf you did not request this, ignore this email.")
+                        except RuntimeError: append_audit(db,None,"auth.password_reset_delivery_failed",user["username"],"FlowOps",user["instance_id"])
+                    db.commit()
+                return self.send_json({"data":response},202)
+            if path=="/api/auth/password-reset/complete":
+                raw=str(payload.get("token","")).strip();password=str(payload.get("password",""))
+                if len(password)<12:return self.send_json({"error":"Password must be at least 12 characters"},400)
+                reset=db.execute("SELECT pr.*,u.username,u.display_name,u.instance_id FROM password_resets pr JOIN users u ON u.id=pr.user_id WHERE pr.token_hash=? AND pr.used_at IS NULL AND pr.expires_at>? AND u.active=1",(hashlib.sha256(raw.encode()).hexdigest(),int(time.time()))).fetchone() if raw else None
+                if not reset:return self.send_json({"error":"Reset token is invalid, expired, or already used"},400)
+                stamp=now();db.execute("UPDATE users SET password_hash=? WHERE id=?",(password_hash(password),reset["user_id"]));db.execute("UPDATE password_resets SET used_at=? WHERE id=?",(stamp,reset["id"]));db.execute("DELETE FROM sessions WHERE user_id=?",(reset["user_id"],));append_audit(db,None,"auth.password_reset_completed",reset["username"],reset["display_name"],reset["instance_id"]);db.commit()
+                return self.send_json({"data":{"ok":True}})
             if path=="/api/admin/users":
                 actor=self.require(db,"admin:users")
                 if not actor:return
                 username=str(payload.get("username","")).strip(); display=str(payload.get("display_name","")).strip(); role=str(payload.get("role","Member")); password=str(payload.get("password", ""))
                 if not username or not display or role not in ROLE_PERMISSIONS or len(password)<12:return self.send_json({"error":"Username, display name, valid role, and password of at least 12 characters are required"},400)
-                try: db.execute("INSERT INTO users(username,display_name,email,role,team,password_hash,created_at) VALUES(?,?,?,?,?,?,?)",(username,display,str(payload.get("email",""))[:180],role,str(payload.get("team",""))[:120],password_hash(password),now()))
+                try: db.execute("INSERT INTO users(username,display_name,email,role,team,password_hash,created_at,instance_id) VALUES(?,?,?,?,?,?,?,?)",(username,display,str(payload.get("email",""))[:180],role,str(payload.get("team",""))[:120],password_hash(password),now(),actor["instance_id"]))
                 except sqlite3.IntegrityError:return self.send_json({"error":"That username already exists"},409)
-                append_audit(db,None,"admin.user_created",f"{username} as {role}",actor["display_name"]); db.commit(); return self.send_json({"data":{"ok":True}},201)
+                append_audit(db,None,"admin.user_created",f"{username} as {role}",actor["display_name"],actor["instance_id"]); db.commit(); return self.send_json({"data":{"ok":True}},201)
+            if path.startswith("/api/admin/sessions/") and path.endswith("/revoke"):
+                actor=self.require(db,"admin:users")
+                if not actor:return
+                try:sid=int(path.strip("/").split("/")[3])
+                except (ValueError,IndexError):return self.send_json({"error":"Not found"},404)
+                session=db.execute("SELECT s.id,u.username FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.id=? AND u.instance_id=?",(sid,actor["instance_id"])).fetchone()
+                if not session:return self.send_json({"error":"Session not found"},404)
+                db.execute("DELETE FROM sessions WHERE id=?",(sid,));append_audit(db,None,"admin.session_revoked",session["username"],actor["display_name"],actor["instance_id"]);db.commit()
+                return self.send_json({"data":{"ok":True}})
             if path=="/api/admin/invitations":
                 actor=self.require(db,"admin:users")
                 if not actor:return
                 email=str(payload.get("email","")).strip().lower(); role=str(payload.get("role","Member"))
                 if "@" not in email or role not in ROLE_PERMISSIONS:return self.send_json({"error":"A valid email and role are required"},400)
-                raw=secrets.token_urlsafe(28); db.execute("INSERT INTO invitations(email,role,token_hash,expires_at,created_by,created_at) VALUES(?,?,?,?,?,?)",(email,role,hashlib.sha256(raw.encode()).hexdigest(),int(time.time())+7*86400,actor["id"],now())); append_audit(db,None,"admin.user_invited",f"{email} as {role}",actor["display_name"]); db.commit()
-                return self.send_json({"data":{"email":email,"role":role,"invite_token":raw,"expires_in_days":7}},201)
+                preview=os.getenv("FLOWOPS_PREVIEW_TOKENS","false").lower()=="true";mail=mail_configuration()
+                if not preview and not mail["configured"]:return self.send_json({"error":"Email delivery is not configured. Configure server-side SMTP before inviting users."},503)
+                raw=secrets.token_urlsafe(28); db.execute("INSERT INTO invitations(email,role,token_hash,expires_at,created_by,created_at,instance_id) VALUES(?,?,?,?,?,?,?)",(email,role,hashlib.sha256(raw.encode()).hexdigest(),int(time.time())+7*86400,actor["id"],now(),actor["instance_id"])); append_audit(db,None,"admin.user_invited",f"{email} as {role}",actor["display_name"],actor["instance_id"])
+                if not preview:
+                    try: send_mail(email,"You are invited to FlowOps",f"You have been invited to FlowOps as {role}.\n\nAccept this invitation within seven days:\n{mail['public_url']}/?invite={urllib.parse.quote(raw)}\n\nIf you were not expecting this invitation, ignore this email.")
+                    except RuntimeError as exc: db.rollback();return self.send_json({"error":str(exc)},502)
+                db.commit();response={"email":email,"role":role,"expires_in_days":7,"delivery":"preview" if preview else "email"}
+                if preview:response["invite_token"]=raw
+                return self.send_json({"data":response},201)
             if path=="/api/admin/workspaces":
                 actor=self.require(db,"admin:settings")
                 if not actor:return
                 name=str(payload.get("name","")).strip()
                 if not name:return self.send_json({"error":"Workspace name is required"},400)
-                try: cur=db.execute("INSERT INTO workspaces(name,description,color,created_at) VALUES(?,?,?,?)",(name,str(payload.get("description",""))[:500],str(payload.get("color","#3158c7"))[:20],now()))
+                try: cur=db.execute("INSERT INTO workspaces(name,description,color,created_at,instance_id) VALUES(?,?,?,?,?)",(name,str(payload.get("description",""))[:500],str(payload.get("color","#3158c7"))[:20],now(),actor["instance_id"]))
                 except sqlite3.IntegrityError:return self.send_json({"error":"That workspace already exists"},409)
-                append_audit(db,None,"admin.workspace_created",name,actor["display_name"]); db.commit(); return self.send_json({"data":{"id":cur.lastrowid,"name":name}},201)
+                append_audit(db,None,"admin.workspace_created",name,actor["display_name"],actor["instance_id"]); db.commit(); return self.send_json({"data":{"id":cur.lastrowid,"name":name}},201)
             if path=="/api/admin/settings":
                 actor=self.require(db,"admin:settings")
                 if not actor:return
-                allowed={"workspace_name","timezone","require_approval","session_hours","serviceops_enabled"}
+                allowed={"workspace_name","timezone","require_approval","session_hours","serviceops_enabled","directory_enabled","directory_domain"}
                 for key,value in payload.items():
-                    if key in allowed: db.execute("INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",(key,str(value)[:160],now()))
-                append_audit(db,None,"admin.settings_updated","Workspace configuration updated",actor["display_name"]); db.commit(); return self.send_json({"data":{"ok":True}})
+                    if key in allowed: db.execute("INSERT INTO instance_settings(instance_id,key,value,updated_at) VALUES(?,?,?,?) ON CONFLICT(instance_id,key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",(actor["instance_id"],key,str(value)[:160],now()))
+                append_audit(db,None,"admin.settings_updated","Workspace configuration updated",actor["display_name"],actor["instance_id"]); db.commit(); return self.send_json({"data":{"ok":True}})
             if path in {"/api/admin/integrations","/api/admin/integrations/test"}:
                 actor=self.require(db,"admin:settings")
                 if not actor:return
                 provider=str(payload.get("provider","")).lower()
-                if provider not in {"serviceops","jenkins"}:return self.send_json({"error":"Provider must be serviceops or jenkins"},400)
+                if provider != "serviceops":return self.send_json({"error":"Provider must be serviceops"},400)
                 if path.endswith("/test"):
                     return self.test_integration(db,provider,actor)
-                allowed={
-                  "serviceops":{"enabled","url","sync_on_live","sync_on_complete","require_approved","trigger_workflow"},
-                  "jenkins":{"enabled","url","live_only","auto_complete","allow_parameters"}
-                }[provider]
-                if "secret" in payload or "token" in payload:return self.send_json({"error":"Credentials must be supplied through the server environment, never the browser"},400)
+                allowed={"enabled","url","sync_on_live","sync_on_complete","require_approved","trigger_workflow"}
+                if "secret" in payload or "token" in payload:return self.send_json({"error":"Use the one-way credential field; secrets are never returned to the browser"},400)
+                submitted=str(payload.get("credential","")).strip();revoke=payload.get("revoke_credential") is True
+                if submitted and revoke:return self.send_json({"error":"Set or revoke a credential, not both"},400)
+                if submitted:
+                    try:encrypted=settings_cipher().encrypt(submitted.encode()).decode()
+                    except RuntimeError as exc:return self.send_json({"error":str(exc)},503)
+                    db.execute("INSERT INTO integration_credentials(instance_id,provider,secret_encrypted,updated_by,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(instance_id,provider) DO UPDATE SET secret_encrypted=excluded.secret_encrypted,updated_by=excluded.updated_by,updated_at=excluded.updated_at",(actor["instance_id"],provider,encrypted,actor["id"],now()))
+                elif revoke:db.execute("DELETE FROM integration_credentials WHERE instance_id=? AND provider=?",(actor["instance_id"],provider))
                 url=str(payload.get("url","")).strip().rstrip("/")
                 if url and not (url.startswith("http://") or url.startswith("https://") or url.startswith("mock://")):return self.send_json({"error":"Connection URL must use http or https"},400)
                 for key in allowed:
                     if key in payload:
                         value=url if key=="url" else str(payload[key]).lower() if isinstance(payload[key],bool) else str(payload[key])
-                        db.execute("INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",(f"{provider}_{key}",value[:500],now()))
-                append_audit(db,None,"integration.configured",f"{provider} connection policy updated",actor["display_name"]);db.commit()
+                        db.execute("INSERT INTO instance_settings(instance_id,key,value,updated_at) VALUES(?,?,?,?) ON CONFLICT(instance_id,key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",(actor["instance_id"],f"{provider}_{key}",value[:500],now()))
+                credential_action="; credential rotated" if submitted else "; stored credential revoked" if revoke else ""
+                append_audit(db,None,"integration.configured",f"{provider} connection policy updated{credential_action}",actor["display_name"],actor["instance_id"]);db.commit()
                 return self.send_json({"data":{"ok":True,"provider":provider}})
             if path=="/api/runbooks":
                 actor=self.require(db,"runbooks:edit")
                 if not actor:return
                 name=str(payload.get("name","")).strip()
                 if not name or len(name)>160: return self.send_json({"error":"Name is required (maximum 160 characters)"},400)
-                workspace_id=int(payload.get("workspace_id") or db.execute("SELECT id FROM workspaces WHERE active=1 ORDER BY id LIMIT 1").fetchone()[0]); workspace=db.execute("SELECT 1 FROM workspaces WHERE id=? AND active=1",(workspace_id,)).fetchone()
+                workspace_id=int(payload.get("workspace_id") or db.execute("SELECT id FROM workspaces WHERE active=1 AND instance_id=? ORDER BY id LIMIT 1",(actor["instance_id"],)).fetchone()[0]); workspace=db.execute("SELECT 1 FROM workspaces WHERE id=? AND active=1 AND instance_id=?",(workspace_id,actor["instance_id"])).fetchone()
                 if not workspace:return self.send_json({"error":"Select an active workspace"},400)
                 stamp=now(); cur=db.execute("INSERT INTO runbooks(name,description,owner,scheduled_at,serviceops_ticket,workspace_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",(name,str(payload.get("description",""))[:2000],str(payload.get("owner",""))[:120],payload.get("scheduled_at") or None,str(payload.get("serviceops_ticket",""))[:40],workspace_id,stamp,stamp))
                 append_audit(db,cur.lastrowid,"runbook.created",name,actor["display_name"]); doc=runbook_document(db,cur.lastrowid); db.commit()
@@ -513,7 +794,8 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)>=3 and parts[:2]==["api","runbooks"]:
                 try: rid=int(parts[2])
                 except ValueError: return self.send_json({"error":"Not found"},404)
-                if not db.execute("SELECT 1 FROM runbooks WHERE id=?",(rid,)).fetchone(): return self.send_json({"error":"Not found"},404)
+                actor=self.current_user(db)
+                if not actor or not owns_runbook(db,rid,actor["instance_id"]): return self.send_json({"error":"Not found"},404)
                 if len(parts)==4 and parts[3]=="tasks":
                     actor=self.require(db,"runbooks:edit")
                     if not actor:return
@@ -524,7 +806,7 @@ class Handler(BaseHTTPRequestHandler):
                     if task_type not in allowed_types:return self.send_json({"error":"Invalid task type"},400)
                     duration=max(0,min(int(payload.get("duration",15)),10080)); duration=0 if task_type in {"milestone","checklist","sms","email","call"} else max(1,duration)
                     owner_user_id=int(payload["owner_user_id"]) if payload.get("owner_user_id") else None; owner_team_id=int(payload["owner_team_id"]) if payload.get("owner_team_id") else None
-                    if owner_user_id and not db.execute("SELECT 1 FROM users WHERE id=? AND active=1",(owner_user_id,)).fetchone():return self.send_json({"error":"Assigned user is invalid"},400)
+                    if owner_user_id and not db.execute("SELECT 1 FROM users WHERE id=? AND active=1 AND instance_id=?",(owner_user_id,actor["instance_id"])).fetchone():return self.send_json({"error":"Assigned user is invalid"},400)
                     if owner_team_id and not db.execute("SELECT 1 FROM runbook_teams WHERE id=? AND runbook_id=?",(owner_team_id,rid)).fetchone():return self.send_json({"error":"Assigned team is invalid"},400)
                     cur=db.execute("INSERT INTO tasks(runbook_id,title,description,stream,owner,duration,sort_order,automation_url,task_type,scheduled_offset,owner_user_id,owner_team_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(rid,title,str(payload.get("description",""))[:2000],str(payload.get("stream","General"))[:80],"",duration,order,str(payload.get("automation_url",""))[:500] or None,task_type,max(0,int(payload.get("scheduled_offset",0))),owner_user_id,owner_team_id))
                     for dep in payload.get("depends_on",[]):
@@ -539,7 +821,7 @@ class Handler(BaseHTTPRequestHandler):
                     try: cur=db.execute("INSERT INTO runbook_teams(runbook_id,name,created_at) VALUES(?,?,?)",(rid,name[:120],now()))
                     except sqlite3.IntegrityError:return self.send_json({"error":"That runbook team already exists"},409)
                     for uid in payload.get("user_ids",[]):
-                        if db.execute("SELECT 1 FROM users WHERE id=? AND active=1",(uid,)).fetchone():db.execute("INSERT OR IGNORE INTO team_members(team_id,user_id) VALUES(?,?)",(cur.lastrowid,uid))
+                        if db.execute("SELECT 1 FROM users WHERE id=? AND active=1 AND instance_id=?",(uid,actor["instance_id"])).fetchone():db.execute("INSERT OR IGNORE INTO team_members(team_id,user_id) VALUES(?,?)",(cur.lastrowid,uid))
                     append_audit(db,rid,"team.created",name,actor["display_name"]);db.commit();return self.send_json({"data":{"id":cur.lastrowid,"name":name}},201)
                 if len(parts)==4 and parts[3]=="comments":
                     actor=self.require(db,"runbooks:view")
@@ -556,6 +838,12 @@ class Handler(BaseHTTPRequestHandler):
                     current=db.execute("SELECT status FROM runbooks WHERE id=?",(rid,)).fetchone()[0]
                     valid={"draft":{"ready","cancelled"},"ready":{"live","draft","cancelled"},"live":{"paused","complete","cancelled"},"paused":{"live","cancelled"},"complete":set(),"cancelled":set()}
                     if target not in valid[current]: return self.send_json({"error":f"Cannot transition {current} to {target}"},409)
+                    try:
+                        serviceops_result=self.serviceops_lifecycle(db,rid,target)
+                    except PermissionError as exc:
+                        return self.send_json({"error":str(exc)},409)
+                    except RuntimeError as exc:
+                        return self.send_json({"error":str(exc)},502)
                     stamp=now()
                     if target=="live":
                         db.execute("UPDATE runbooks SET status=?,mode='live',actual_started_at=COALESCE(actual_started_at,?),updated_at=? WHERE id=?",(target,stamp,stamp,rid))
@@ -564,7 +852,7 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         db.execute("UPDATE runbooks SET status=?,mode=?,updated_at=? WHERE id=?",(target,"live" if target=="paused" else "plan",stamp,rid))
                     append_audit(db,rid,"runbook.transition",f"{current} → {target}",actor["display_name"]); doc=runbook_document(db,rid,actor); db.commit()
-                    return self.send_json({"data":doc})
+                    return self.send_json({"data":doc,"serviceops":serviceops_result})
                 if len(parts)==4 and parts[3]=="serviceops-sync":
                     if not self.require(db,"integrations:sync"):return
                     return self.sync_serviceops(db,rid,payload)
@@ -580,7 +868,7 @@ class Handler(BaseHTTPRequestHandler):
             with connect() as db:
                 actor=self.require(db,"admin:users")
                 if not actor:return
-                user=db.execute("SELECT * FROM users WHERE id=?",(uid,)).fetchone()
+                user=db.execute("SELECT * FROM users WHERE id=? AND instance_id=?",(uid,actor["instance_id"])).fetchone()
                 if not user:return self.send_json({"error":"User not found"},404)
                 role=str(payload.get("role",user["role"])); active=1 if payload.get("active",bool(user["active"])) else 0
                 if role not in ROLE_PERMISSIONS:return self.send_json({"error":"Invalid role"},400)
@@ -589,14 +877,14 @@ class Handler(BaseHTTPRequestHandler):
                 if password is not None and len(str(password))<12:return self.send_json({"error":"Password must be at least 12 characters"},400)
                 db.execute("UPDATE users SET display_name=?,email=?,role=?,team=?,active=? WHERE id=?",(str(payload.get("display_name",user["display_name"]))[:120],str(payload.get("email",user["email"]))[:180],role,str(payload.get("team",user["team"]))[:120],active,uid))
                 if password is not None: db.execute("UPDATE users SET password_hash=? WHERE id=?",(password_hash(str(password)),uid)); db.execute("DELETE FROM sessions WHERE user_id=?",(uid,))
-                append_audit(db,None,"admin.user_updated",f"{user['username']}: role={role}, active={bool(active)}",actor["display_name"]); db.commit(); return self.send_json({"data":{"ok":True}})
+                append_audit(db,None,"admin.user_updated",f"{user['username']}: role={role}, active={bool(active)}",actor["display_name"],actor["instance_id"]); db.commit(); return self.send_json({"data":{"ok":True}})
         if len(parts)!=3 or parts[:2] != ["api","tasks"]: return self.send_json({"error":"Not found"},404)
         try: tid=int(parts[2])
         except ValueError: return self.send_json({"error":"Not found"},404)
         with connect() as db:
             actor=self.require(db,"runbooks:execute")
             if not actor:return
-            task=db.execute("SELECT * FROM tasks WHERE id=?",(tid,)).fetchone()
+            task=db.execute("SELECT t.* FROM tasks t JOIN runbooks r ON r.id=t.runbook_id JOIN workspaces w ON w.id=r.workspace_id WHERE t.id=? AND w.instance_id=?",(tid,actor["instance_id"])).fetchone()
             if not task: return self.send_json({"error":"Not found"},404)
             runbook=db.execute("SELECT status FROM runbooks WHERE id=?",(task["runbook_id"],)).fetchone()
             if not runbook or runbook["status"]!="live":return self.send_json({"error":"Tasks can only be executed while the runbook is live"},409)
@@ -624,43 +912,91 @@ class Handler(BaseHTTPRequestHandler):
             actor=self.require(db,"admin:users")
             if not actor:return
             if uid==actor["id"]:return self.send_json({"error":"You cannot delete your own account"},409)
-            user=db.execute("SELECT username FROM users WHERE id=?",(uid,)).fetchone()
+            user=db.execute("SELECT username FROM users WHERE id=? AND instance_id=?",(uid,actor["instance_id"])).fetchone()
             if not user:return self.send_json({"error":"User not found"},404)
-            db.execute("DELETE FROM users WHERE id=?",(uid,)); append_audit(db,None,"admin.user_deleted",user["username"],actor["display_name"]); db.commit(); return self.send_json({"data":{"ok":True}})
+            db.execute("DELETE FROM users WHERE id=?",(uid,)); append_audit(db,None,"admin.user_deleted",user["username"],actor["display_name"],actor["instance_id"]); db.commit(); return self.send_json({"data":{"ok":True}})
+
+    def serviceops_api_base(self, db, instance_id):
+        row=db.execute("SELECT value FROM instance_settings WHERE instance_id=? AND key='serviceops_url'",(instance_id,)).fetchone()
+        base=(row[0] if row else os.getenv("SERVICEOPS_URL","")).rstrip("/")
+        return base if base.endswith("/api/v1") else f"{base}/api/v1"
+
+    def serviceops_request(self, db, instance_id, method, resource, body=None, idempotency_key=None):
+        base=self.serviceops_api_base(db,instance_id);token,_=integration_credential(db,instance_id,"serviceops")
+        if not base or base=="/api/v1" or not token:raise RuntimeError("Configure the ServiceOps URL and a scoped API token in Administration → Connections")
+        encoded=json.dumps(body).encode() if body is not None else None
+        headers={"Authorization":f"Bearer {token}","Accept":"application/json","X-Request-ID":str(uuid.uuid4())}
+        if encoded is not None:headers["Content-Type"]="application/json"
+        if idempotency_key:headers["Idempotency-Key"]=idempotency_key
+        request=urllib.request.Request(f"{base}/{resource.lstrip('/')}",data=encoded,method=method,headers=headers)
+        try:
+            with urllib.request.urlopen(request,timeout=8) as response:
+                document=json.load(response);request_id=response.headers.get("X-Request-ID",headers["X-Request-ID"])
+                return document.get("data",document),request_id,response.status
+        except urllib.error.HTTPError as exc:
+            try: problem=json.load(exc);detail=problem.get("detail") or problem.get("error")
+            except Exception:detail=None
+            raise RuntimeError(f"ServiceOps returned HTTP {exc.code}{': '+str(detail) if detail else ''}") from exc
+        except (urllib.error.URLError,TimeoutError) as exc:raise RuntimeError("ServiceOps is unreachable") from exc
+
+    def store_serviceops_ticket(self,db,rid,ticket,request_id):
+        db.execute("UPDATE runbooks SET serviceops_ticket=?,serviceops_type=?,serviceops_title=?,serviceops_state=?,serviceops_priority=?,serviceops_synced_at=?,serviceops_request_id=?,updated_at=? WHERE id=?",(
+          str(ticket.get("number",""))[:40],str(ticket.get("type",""))[:30],str(ticket.get("title",""))[:300],str(ticket.get("state",""))[:80],str(ticket.get("priority",""))[:20],now(),request_id,now(),rid))
+
+    def serviceops_lifecycle(self,db,rid,target):
+        rb=db.execute("SELECT r.*,w.instance_id FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE r.id=?",(rid,)).fetchone();ticket_number=str(rb["serviceops_ticket"] or "").strip()
+        settings={r["key"]:r["value"] for r in db.execute("SELECT key,value FROM instance_settings WHERE instance_id=? AND key LIKE 'serviceops_%'",(rb["instance_id"],))}
+        if not ticket_number or settings.get("serviceops_enabled","true")!="true" or target not in {"live","complete"}:return None
+        ticket,request_id,_=self.serviceops_request(db,rb["instance_id"],"GET",f"tickets/{urllib.parse.quote(ticket_number)}")
+        if target=="live" and settings.get("serviceops_require_approved","true")=="true" and ticket.get("type")=="change" and ticket.get("state") not in {"Approved","In Progress"}:
+            raise PermissionError(f"ServiceOps change {ticket_number} is {ticket.get('state','not approved')}; approval is required before Live")
+        should_update=(target=="live" and settings.get("serviceops_sync_on_live","true")=="true") or (target=="complete" and settings.get("serviceops_sync_on_complete","true")=="true")
+        if should_update:
+            desired="In Progress" if target=="live" else "Resolved"
+            ticket,request_id,_=self.serviceops_request(db,rb["instance_id"],"PATCH",f"tickets/{urllib.parse.quote(ticket_number)}",{"state":desired},f"flowops-{rid}-{target}")
+        workflow=None
+        if target=="live" and settings.get("serviceops_trigger_workflow","false")=="true":
+            workflow,_,_=self.serviceops_request(db,rb["instance_id"],"POST",f"tickets/{urllib.parse.quote(ticket_number)}/workflow-events",{},f"flowops-{rid}-workflow-live")
+        self.store_serviceops_ticket(db,rid,ticket,request_id)
+        append_audit(db,rid,"serviceops.lifecycle",f"{ticket_number} → {ticket.get('state')}","FlowOps API")
+        return {"ticket":ticket,"workflow":workflow,"request_id":request_id}
 
     def sync_serviceops(self, db, rid, payload):
-        rb=db.execute("SELECT * FROM runbooks WHERE id=?",(rid,)).fetchone(); row=db.execute("SELECT value FROM settings WHERE key='serviceops_url'").fetchone(); base=(row[0] if row else os.getenv("SERVICEOPS_URL","")).rstrip("/"); token=os.getenv("SERVICEOPS_TOKEN","")
+        rb=db.execute("SELECT r.*,w.instance_id FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE r.id=?",(rid,)).fetchone()
         ticket=str(payload.get("ticket") or rb["serviceops_ticket"] or "").strip()
-        if not base or not token: return self.send_json({"error":"Configure SERVICEOPS_URL and SERVICEOPS_TOKEN in .env"},503)
         if not ticket: return self.send_json({"error":"Link a ServiceOps ticket first"},400)
-        url=f"{base}/api/v1/tickets/{urllib.parse.quote(ticket)}"; req=urllib.request.Request(url,headers={"Authorization":f"Bearer {token}","Accept":"application/json"})
         try:
-            with urllib.request.urlopen(req,timeout=8) as response: remote=json.load(response)
-        except urllib.error.HTTPError as exc: return self.send_json({"error":f"ServiceOps returned HTTP {exc.code}"},502)
-        except (urllib.error.URLError,TimeoutError): return self.send_json({"error":"ServiceOps is unreachable"},502)
-        db.execute("UPDATE runbooks SET serviceops_ticket=?,updated_at=? WHERE id=?",(ticket,now(),rid)); append_audit(db,rid,"serviceops.synced",f"Linked {ticket}"); doc=runbook_document(db,rid); db.commit()
-        return self.send_json({"data":doc,"serviceops":remote.get("data",remote)})
+            remote,request_id,_=self.serviceops_request(db,rb["instance_id"],"GET",f"tickets/{urllib.parse.quote(ticket)}")
+        except RuntimeError as exc:return self.send_json({"error":str(exc)},502)
+        self.store_serviceops_ticket(db,rid,remote,request_id);append_audit(db,rid,"serviceops.synced",f"Linked {ticket}");doc=runbook_document(db,rid);db.commit()
+        return self.send_json({"data":doc,"serviceops":remote,"request_id":request_id})
 
     def test_integration(self, db, provider, actor):
-        values={r["key"]:r["value"] for r in db.execute("SELECT key,value FROM settings WHERE key LIKE ?",(f"{provider}_%",))}
+        values={r["key"]:r["value"] for r in db.execute("SELECT key,value FROM instance_settings WHERE instance_id=? AND key LIKE ?",(actor["instance_id"],f"{provider}_%"))}
         base=values.get(f"{provider}_url","").rstrip("/")
-        token=os.getenv("SERVICEOPS_TOKEN" if provider=="serviceops" else "JENKINS_TOKEN","")
-        if not base:return self.send_json({"error":"Configure a connection URL first"},400)
+        try:token,_=integration_credential(db,actor["instance_id"],provider)
+        except RuntimeError as exc:return self.send_json({"error":str(exc)},503)
+        if not base:return self.send_json({"error":"Configure the ServiceOps connection URL first"},400)
+        if not token:return self.send_json({"error":"Paste a ServiceOps API key, save the connection, then test again"},400)
         if base.startswith("mock://"):
-            result={"ok":True,"provider":provider,"latency_ms":12,"message":"Preview connection verified","credential_configured":bool(token)}
+            result={"ok":True,"provider":provider,"latency_ms":12,"message":"ServiceOps REST API v1 verified","credential_configured":True,"verified_scopes":["tickets:read"]}
         else:
-            endpoint=f"{base}/health" if provider=="serviceops" else f"{base}/api/json"
-            headers={"Accept":"application/json"}
-            if token:
-                if provider=="serviceops":headers["Authorization"]=f"Bearer {token}"
-                else:headers["Authorization"]="Basic "+base64.b64encode(f"{os.getenv('JENKINS_USER','flowops')}:{token}".encode()).decode()
+            endpoint=(base if base.endswith("/api/v1") else f"{base}/api/v1")+"/tickets?limit=1"
+            headers={"Accept":"application/json","Authorization":f"Bearer {token}"}
             started=time.monotonic()
             try:
-                with urllib.request.urlopen(urllib.request.Request(endpoint,headers=headers),timeout=5) as response: ok=200 <= response.status < 400
-            except urllib.error.HTTPError as exc:return self.send_json({"error":f"{provider.title()} returned HTTP {exc.code}"},502)
-            except (urllib.error.URLError,TimeoutError):return self.send_json({"error":f"{provider.title()} is unreachable"},502)
-            result={"ok":ok,"provider":provider,"latency_ms":round((time.monotonic()-started)*1000),"message":"Connection verified","credential_configured":bool(token)}
-        append_audit(db,None,"integration.tested",f"{provider}: {result['message']}",actor["display_name"]);db.commit()
+                with urllib.request.urlopen(urllib.request.Request(endpoint,headers=headers),timeout=5) as response:
+                    content_type=response.headers.get("Content-Type","")
+                    if "application/json" not in content_type:return self.send_json({"error":"ServiceOps returned HTML instead of JSON. In MicroK8s use http://serviceops.operations.svc.cluster.local, not the Cloudflare Access URL."},502)
+                    document=json.loads(response.read())
+                    if not isinstance(document.get("data"),list):return self.send_json({"error":"ServiceOps returned an incompatible REST API response"},502)
+            except urllib.error.HTTPError as exc:
+                if exc.code in {401,403}:return self.send_json({"error":"ServiceOps rejected the API key. Create an active API client with tickets:read in ServiceOps Administration → API access."},502)
+                return self.send_json({"error":f"ServiceOps returned HTTP {exc.code}"},502)
+            except (urllib.error.URLError,TimeoutError):return self.send_json({"error":"ServiceOps is unreachable from FlowOps"},502)
+            except json.JSONDecodeError:return self.send_json({"error":"ServiceOps returned invalid JSON"},502)
+            result={"ok":True,"provider":provider,"latency_ms":round((time.monotonic()-started)*1000),"message":"ServiceOps REST API v1 and tickets:read verified","credential_configured":True,"verified_scopes":["tickets:read"],"required_for_lifecycle":["tickets:update"],"required_for_workflows":["workflows:execute"]}
+        append_audit(db,None,"integration.tested",f"{provider}: {result['message']}",actor["display_name"],actor["instance_id"]);db.commit()
         return self.send_json({"data":result})
 
 
