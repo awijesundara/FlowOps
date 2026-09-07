@@ -18,15 +18,32 @@ Goal: one isolated customer team can build, assign, and execute a runbook live.
 
 | Story | Priority | Size | Status |
 |---|---:|---:|---:|
-| Customer creates an account and isolated instance | P0 | M | PARTIAL |
-| Admin invites users by email | P0 | S | PARTIAL |
+| Customer creates an account and isolated instance | P0 | M | DONE |
+| Admin invites users by email | P0 | S | DONE |
 | User logs in with email and password | P0 | S | DONE |
 | Admin assigns fixed Admin, Editor, or Member role | P0 | M | DONE |
-| Session expiry and password reset | P0 | S | PARTIAL |
+| Session expiry and password reset | P0 | S | DONE |
 
 Role acceptance: Admin may create, edit, and delete instance content; Editor may
 create and edit runbooks; Member may act only on assigned tasks. Role changes
 take effect without re-login.
+
+Identity delivery note (2026-09-07): invitation acceptance and password reset
+use hashed, expiring, single-use tokens, duplicate-account protection,
+non-enumerating reset requests, session invalidation, audit events, and the
+responsive login UI. Production mode delivers purpose-built SMTP messages and
+does not return tokens; local preview token display is explicitly gated by
+`FLOWOPS_PREVIEW_TOKENS`. Regression coverage proves invitation delivery,
+password-reset delivery, single use, and session invalidation.
+
+Instance-isolation evidence (2026-09-06): self-registration creates a dedicated
+organization, initial Admin, default workspace, tenant settings, and tenant audit
+chain. Server-side authorization scopes users, workspaces, runbooks, tasks,
+assignment options, dashboards, live events, and integration configuration to
+the authenticated instance. Existing databases migrate into the default FlowOps
+instance without discarding records. Cross-tenant read, execution, and admin
+mutation attempts return not found; regression coverage is in
+`test_customer_instance_registration_and_cross_tenant_isolation`.
 
 ### Epic 1.2 — Workspace and Runbook Structure
 
@@ -144,11 +161,18 @@ triggered actions with URL and payload template (P0/L), automatic context
 (P1/M), auto-complete on success (P1/M), and sandbox action tests (P0/M) are
 all `BACKLOG` except the fixed ServiceOps read connector, which is `PARTIAL`.
 
-Product-owner sequencing note (2026-09-06): the supplied Jenkins demonstration
+Product-owner sequencing note (2026-09-06): the supplied automation demonstration
 and explicit ServiceOps administration request authorize a bounded Phase 3
-foundation slice while Phase 1 remains active. Connection policy, server-secret
-status, and safe connection tests are `DONE`; job actions, asynchronous polling,
+foundation slice while Phase 1 remains active. Connection policy, encrypted
+credential lifecycle, and safe connection tests are `DONE`; job actions, asynchronous polling,
 and task outcome automation remain `BACKLOG` and may not be represented as done.
+
+The first-party ServiceOps REST v1 connector is now `PARTIAL`: ticket retrieval,
+server-side bearer authentication, request correlation, change approval checks,
+idempotent Live/complete state write-back, optional workflow triggering, local
+audit evidence, and ticket projection are implemented. ServiceOps API client
+creation/revocation remains owned by ServiceOps; inbound signed events and
+asynchronous delivery retry remain under Epic 3.5.
 
 ### Epic 3.2 — Custom Fields
 
@@ -229,11 +253,10 @@ compliance-grade evidence.
 
 ## Current Delivery Focus
 
-1. Finish Phase 1 Epic 1.1 P0: instance/account isolation, email login/invite,
-   fixed role model, immediate role propagation, password reset.
-2. Finish Phase 1 Epic 1.2 P0: real workspace creation and runbook ownership.
-3. Finish Phase 1 Epic 1.3 and 1.4 P0 assignment/team visibility gaps.
-4. Validate Phase 1 with accessibility and real-time load evidence.
+1. Finish Phase 1 Epic 1.3 P0: first-class stream creation and stream edits.
+2. Finish Phase 1 Epic 1.6 P0: audit every task and runbook edit, not only transitions.
+3. Validate Phase 1 with dependency/scheduling breadth and real-time load evidence.
+4. Complete the core execution UI accessibility review before Phase 1 exit.
 
 ## Guide Requirements Traceability
 
@@ -288,21 +311,24 @@ FlowOps, but remain subordinate to the phase and P0 ordering above.
 
 ### Video-derived integration requirements
 
-Source: [Cutover integrates with Jenkins](https://www.youtube.com/watch?v=sPqkWgEgBto),
+Source: supplied integration demonstration,
 reviewed from the full 5:22 transcript on 2026-09-06.
 
 | Requirement | Video evidence | Backlog mapping | Status |
 |---|---|---|---|
-| Admin configures ServiceOps/Jenkins endpoint, enablement, safety policy, and server-secret status | 4:38-5:15 stresses discovery, authentication, and least privilege | 3.1 | DONE |
+| Admin configures the ServiceOps endpoint, safety policy, and encrypted API-key lifecycle entirely in the web UI | ServiceOps API client and least-privilege requirements | 3.1 | DONE |
 | Admin tests a connection without exposing its credential to the browser | 4:38-5:15 | 3.1 | DONE |
-| Jenkins action selects an existing job and supports sets of jobs | 0:13-0:44 | 3.1 | BACKLOG |
+| ServiceOps API compatibility test validates JSON, authentication, and `tickets:read`, and explains additional lifecycle scopes | ServiceOps REST API v1 contract | 3.1 | DONE |
 | Integration tasks execute only in Live; rehearsal safely skips them | 1:28-1:39 | 3.1 | BACKLOG |
-| Job parameters map FlowOps/runbook values into the Jenkins payload | 1:11-1:24; 3:57-4:30 | 3.1, 3.2 | BACKLOG |
+| Directory sign-in delegates AD/LDAP verification to ServiceOps and displays the configured AD domain | ServiceOps login behavior | 4.4 | DONE |
 | Queued/running progress and percentage update the task in real time | 1:42-2:25 | 1.5, 3.1 | BACKLOG |
-| Jenkins success auto-completes and failure marks the task failed | 2:18-2:55 | 3.1 | BACKLOG |
+| Removed unsupported automation-provider configuration from the product surface and API | Product-owner decision 2026-09-07 | 3.1 | DONE |
 | Missing-job errors return actionable detail; operator can retry or audited-skip | 2:55-3:50 | 1.6, 3.1 | BACKLOG |
 | Only authorized executors can trigger potentially destructive external jobs | 4:38-5:03 | 1.1, 3.1 | BACKLOG |
 | ServiceOps owns approval/risk/record lifecycle; FlowOps returns execution state and evidence | Product integration decision | 3.1, 3.5 | PARTIAL |
+| Use ServiceOps REST v1 ticket, update, and workflow APIs with scoped bearer identity, request IDs, and idempotency keys | ServiceOps `docs/API_REFERENCE.md` §§1-3, 5, 7-8 | 3.1 | DONE |
+| Block a linked change from Live when ServiceOps reports it is not approved | ServiceOps lifecycle guard and FlowOps integration policy | 3.1 | DONE |
+| Persist a minimal ServiceOps ticket projection and show its state in the runbook | ServiceOps ticket document contract | 3.1, 3.2 | DONE |
 
 ### Guide-derived delivery rule
 

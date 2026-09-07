@@ -34,6 +34,7 @@ FLOWOPS_PORT=8088 python3 server.py
 - Persistent SQLite storage and responsive desktop/mobile interface
 - Server-side ServiceOps ticket lookup using a least-privilege bearer token
 - Authenticated workspaces with expiring HttpOnly sessions and CSRF protection
+- Expiring single-use invitations and password recovery with session invalidation and non-enumerating requests
 - Administrator, Runbook Manager, Operator, and Viewer privilege tiers
 - User administration, role matrix, workspace policy, and security dashboard
 - Authenticated server-sent events with automatic reconnect and sub-second UI refresh
@@ -43,7 +44,9 @@ FLOWOPS_PORT=8088 python3 server.py
 - Normal, milestone, checklist, validation, SMS, email, and call task types
 - Automatic late-task flags plus validation results and evidence commentary
 - Durable runbook timing with countdowns, overdue warnings, live elapsed clocks, planned-window progress, and completion variance
-- Administrator-managed ServiceOps and Jenkins connection policies, server-only credential status, and safe connection testing
+- Administration home for users, roles, workspaces, sessions, audit evidence, system health, email readiness, and connected systems
+- Administrator-managed ServiceOps connection policy with encrypted API-key set/rotate/revoke and compatibility testing
+- SMTP-delivered invitations and password resets with preview-only token display
 
 This is a production-shaped MVP, not a copy of Cutover's proprietary software.
 It implements common operational-orchestration concepts with original FlowOps
@@ -53,21 +56,46 @@ branding, code, information architecture, and visual design.
 
 1. In ServiceOps, create an API client whose acting user can see the relevant
    tickets. Grant only `tickets:read` for the included lookup integration.
-2. Copy `.env.example` to `.env` and set `SERVICEOPS_URL` and
-   `SERVICEOPS_TOKEN`. Do not commit `.env`.
+2. Copy `.env.example` to `.env`, generate a durable
+   `FLOWOPS_SETTINGS_ENCRYPTION_KEY`, and set `SERVICEOPS_URL`. Do not commit
+   `.env` or rotate the encryption key without migrating stored credentials.
 3. Recreate the FlowOps container and link a ServiceOps ticket number when
    creating a runbook.
 4. Use **Sync ServiceOps** in the runbook view.
 
 The bearer token stays server-side. ServiceOps' tenant, user, team, role, and
-lifecycle controls still apply. Future bidirectional updates should use the
-existing ServiceOps `tickets:update` and `workflows:execute` scopes with
-idempotency keys, and FlowOps should accept signed ServiceOps webhooks.
+lifecycle controls still apply. Bidirectional updates use the existing
+ServiceOps `tickets:update` and `workflows:execute` scopes with idempotency
+keys. Signed inbound ServiceOps webhooks remain backlog work.
 
-Admins can configure and test ServiceOps and Jenkins endpoints under
-**Administration → Integrations**. Credentials are intentionally absent from
-the browser/API configuration model: supply `SERVICEOPS_TOKEN`, or
-`JENKINS_USER` and `JENKINS_TOKEN`, to the FlowOps container environment.
+The connector uses ServiceOps REST v1 directly: `GET /api/v1/tickets/{number}`
+for governed context, `PATCH /api/v1/tickets/{number}` for idempotent Live and
+completion write-back, and optionally `POST
+/api/v1/tickets/{number}/workflow-events`. FlowOps sends an `X-Request-ID` on
+every request and an `Idempotency-Key` for state changes. Create the acting API
+client in ServiceOps with `tickets:read`, adding `tickets:update` and
+`workflows:execute` only for enabled policies.
+
+Admins configure ServiceOps under **Administration → Connections**. Create a
+named client in ServiceOps under **Administration → API access**, grant
+`tickets:read`, `tickets:update`, and optionally `workflows:execute`, then paste
+the one-time `sop_…` key into FlowOps. In MicroK8s use
+`http://serviceops.operations.svc.cluster.local`; the public Cloudflare Access
+URL is intended for browsers and returns an HTML login challenge to API calls.
+
+FlowOps can also delegate AD/LDAP password verification to ServiceOps. Enable
+it under **Administration → Platform settings → Sign-in and directory** and
+enter the AD domain shown by ServiceOps. The login page then labels the source
+with that domain and provisions successful directory users as FlowOps Members.
+They can paste, rotate, test, or revoke a scoped token there. FlowOps encrypts
+the token at rest with Fernet and never returns it through the browser API.
+`SERVICEOPS_TOKEN` and `JENKINS_TOKEN` remain supported as deployment-managed
+fallbacks. The encryption key itself remains a deployment secret.
+
+For real invitation and password-reset delivery, configure
+`FLOWOPS_PUBLIC_URL`, `FLOWOPS_SMTP_HOST`, `FLOWOPS_MAIL_FROM`, and the relevant
+SMTP port/security/credential variables. Set `FLOWOPS_PREVIEW_TOKENS=false` in
+shared environments; only local preview mode returns one-time tokens to the UI.
 
 ## API highlights
 
