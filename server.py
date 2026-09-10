@@ -504,20 +504,48 @@ def deliver_webhook_once(webhook: dict[str, Any], event: dict[str, Any]) -> tupl
     return status, last_error, 3
 
 
+def claim_new_audit_events() -> list[dict[str, Any]]:
+    """Atomically claim the next batch of unprocessed audit rows and
+    advance the shared cursor before any (slow, retryable) network I/O
+    happens. BEGIN IMMEDIATE takes SQLite's write lock immediately, so
+    when multiple FlowOps replicas share one database file (as they do in
+    Kubernetes, where this pod's local PV is mounted read/write by every
+    replica scheduled to the same node), only one replica's claim can
+    succeed per batch -- the other blocks on the write lock (up to the
+    connection's busy timeout) and then sees the cursor already advanced
+    past this batch, so it correctly claims nothing rather than
+    re-delivering the same events to the same webhooks."""
+    db = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
+    db.row_factory = sqlite3.Row
+    try:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("BEGIN IMMEDIATE")
+        cursor = db.execute("SELECT last_audit_id FROM webhook_cursor WHERE id=1").fetchone()
+        if not cursor:
+            db.execute("INSERT OR IGNORE INTO webhook_cursor(id,last_audit_id) VALUES(1,0)"); last_id = 0
+        else:
+            last_id = cursor[0]
+        events = rows(db.execute("SELECT * FROM audit WHERE id>? ORDER BY id LIMIT 50", (last_id,)))
+        if events:
+            db.execute("UPDATE webhook_cursor SET last_audit_id=?", (events[-1]["id"],))
+        db.execute("COMMIT")
+        return events
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    finally:
+        db.close()
+
+
 def webhook_dispatcher_loop() -> None:
     """Background poller (mirrors the SSE feed's own polling design): picks
     up newly committed audit rows and delivers them to every active webhook
     subscribed to that action, so delivery never blocks a request thread."""
     while True:
         try:
-            with connect() as db:
-                cursor = db.execute("SELECT last_audit_id FROM webhook_cursor WHERE id=1").fetchone()
-                if not cursor:
-                    db.execute("INSERT OR IGNORE INTO webhook_cursor(id,last_audit_id) VALUES(1,0)"); last_id = 0
-                else:
-                    last_id = cursor[0]
-                events = rows(db.execute("SELECT * FROM audit WHERE id>? ORDER BY id LIMIT 50", (last_id,)))
-                if events:
+            events = claim_new_audit_events()
+            if events:
+                with connect() as db:
                     for event in events:
                         webhooks = rows(db.execute("SELECT * FROM webhooks WHERE instance_id=? AND active=1", (event["instance_id"],)))
                         for webhook in webhooks:
@@ -527,8 +555,7 @@ def webhook_dispatcher_loop() -> None:
                                 "INSERT INTO webhook_deliveries(webhook_id,audit_id,event_type,success,status_code,error,attempts,attempted_at) VALUES(?,?,?,?,?,?,?,?)",
                                 (webhook["id"], event["id"], event["action"], 1 if status and 200<=status<300 else 0, status, error, attempts, now()),
                             )
-                    db.execute("UPDATE webhook_cursor SET last_audit_id=?", (events[-1]["id"],))
-                db.commit()
+                    db.commit()
         except Exception as exc:
             print(f"webhook dispatcher error: {exc}")
         time.sleep(2)

@@ -282,6 +282,30 @@ class FlowOpsTest(unittest.TestCase):
             self.assertIsNone(received[1]['signature'])
         finally:
             receiver.shutdown()
+    def test_concurrent_dispatcher_claims_never_double_deliver_the_same_event(self):
+        # Simulates two FlowOps replicas sharing one SQLite file (as they do
+        # in Kubernetes) both racing to claim the same freshly-created audit
+        # rows. If the claim weren't atomic, both "replicas" would see the
+        # same events and each would deliver them -- so the real assertion
+        # here is that every claimed audit id appears in exactly one
+        # thread's result, never both.
+        _,before=self.req('/api/admin/audit/export'); start_id=before['data']['events'][-1]['id']
+        for i in range(20): self.req('/api/runbooks','POST',{'name':f'Race event {i}'})
+        results=[None,None]
+        def claim(index):
+            results[index]=server.claim_new_audit_events()
+        barrier=threading.Barrier(2)
+        def synchronized_claim(index):
+            barrier.wait()
+            claim(index)
+        threads=[threading.Thread(target=synchronized_claim,args=(i,)) for i in range(2)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        ids_a={e['id'] for e in results[0] if e['id']>start_id}
+        ids_b={e['id'] for e in results[1] if e['id']>start_id}
+        self.assertEqual(ids_a & ids_b, set(), "the same audit event was claimed by both simulated replicas")
+        remaining=server.claim_new_audit_events()
+        self.assertEqual([e for e in remaining if e['id']>start_id], [])
     def test_webhook_delivers_signed_payload_to_a_real_receiver(self):
         import http.server as http_server_module
         received=[]
