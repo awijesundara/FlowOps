@@ -172,7 +172,8 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS runbook_types (
           id INTEGER PRIMARY KEY, workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
           name TEXT NOT NULL, icon TEXT NOT NULL DEFAULT '◇', color TEXT NOT NULL DEFAULT '#7557e8',
-          default_description TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+          default_description TEXT NOT NULL DEFAULT '', requires_approval INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
           UNIQUE(workspace_id, name)
         );
         CREATE TABLE IF NOT EXISTS invitations (
@@ -297,6 +298,10 @@ def init_db() -> None:
         if "folder_id" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN folder_id INTEGER REFERENCES folders(id)")
         if "runbook_type_id" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN runbook_type_id INTEGER REFERENCES runbook_types(id)")
         if "parent_runbook_id" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN parent_runbook_id INTEGER REFERENCES runbooks(id)")
+        if "approved_at" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN approved_at TEXT")
+        if "approved_by" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN approved_by TEXT")
+        type_columns={row[1] for row in db.execute("PRAGMA table_info(runbook_types)")}
+        if "requires_approval" not in type_columns: db.execute("ALTER TABLE runbook_types ADD COLUMN requires_approval INTEGER NOT NULL DEFAULT 0")
         rbteam_columns={row[1] for row in db.execute("PRAGMA table_info(runbook_teams)")}
         if "central_team_id" not in rbteam_columns: db.execute("ALTER TABLE runbook_teams ADD COLUMN central_team_id INTEGER REFERENCES central_teams(id)")
         webhook_columns={row[1] for row in db.execute("PRAGMA table_info(webhooks)")}
@@ -631,6 +636,7 @@ def runbook_document(db: sqlite3.Connection, rid: int, user: dict[str,Any] | Non
     if not rb:
         return None
     doc = dict(rb)
+    doc["runbook_type_requires_approval"] = bool(db.execute("SELECT requires_approval FROM runbook_types WHERE id=?",(doc["runbook_type_id"],)).fetchone()[0]) if doc.get("runbook_type_id") else False
     all_tasks = rows(db.execute("SELECT t.*,u.display_name owner_user_name,rt.name owner_team_name FROM tasks t LEFT JOIN users u ON u.id=t.owner_user_id LEFT JOIN runbook_teams rt ON rt.id=t.owner_team_id WHERE t.runbook_id=? ORDER BY t.sort_order,t.id", (rid,)))
     tasks=all_tasks
     if user and user.get("role")=="Member":
@@ -1363,7 +1369,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({"error":"Select an active workspace"},400)
                 icon=str(payload.get("icon","◇")).strip()[:4] or "◇"
                 color=str(payload.get("color","#7557e8")).strip()[:20] or "#7557e8"
-                try: cur=db.execute("INSERT INTO runbook_types(workspace_id,name,icon,color,default_description,created_at) VALUES(?,?,?,?,?,?)",(workspace_id,name,icon,color,str(payload.get("default_description",""))[:2000],now()))
+                requires_approval=1 if payload.get("requires_approval") else 0
+                try: cur=db.execute("INSERT INTO runbook_types(workspace_id,name,icon,color,default_description,requires_approval,created_at) VALUES(?,?,?,?,?,?,?)",(workspace_id,name,icon,color,str(payload.get("default_description",""))[:2000],requires_approval,now()))
                 except sqlite3.IntegrityError: return self.send_json({"error":"That runbook type already exists"},409)
                 append_audit(db,None,"runbook_type.created",name,actor["display_name"],actor["instance_id"]); db.commit()
                 return self.send_json({"data":{"id":cur.lastrowid,"name":name}},201)
@@ -1562,9 +1569,14 @@ class Handler(BaseHTTPRequestHandler):
                     if not actor:return
                     target=str(payload.get("status","")); allowed={"draft","ready","live","paused","complete","cancelled"}
                     if target not in allowed: return self.send_json({"error":"Invalid runbook status"},400)
-                    current=db.execute("SELECT status FROM runbooks WHERE id=?",(rid,)).fetchone()[0]
+                    runbook_row=db.execute("SELECT status,runbook_type_id,approved_at FROM runbooks WHERE id=?",(rid,)).fetchone()
+                    current=runbook_row["status"]
                     valid={"draft":{"ready","cancelled"},"ready":{"live","draft","cancelled"},"live":{"paused","complete","cancelled"},"paused":{"live","cancelled"},"complete":set(),"cancelled":set()}
                     if target not in valid[current]: return self.send_json({"error":f"Cannot transition {current} to {target}"},409)
+                    if target=="live" and runbook_row["runbook_type_id"]:
+                        rtype=db.execute("SELECT requires_approval,name FROM runbook_types WHERE id=?",(runbook_row["runbook_type_id"],)).fetchone()
+                        if rtype and rtype["requires_approval"] and not runbook_row["approved_at"]:
+                            return self.send_json({"error":f"{rtype['name']} runbooks require approval before going live"},409)
                     try:
                         serviceops_result=self.serviceops_lifecycle(db,rid,target)
                     except PermissionError as exc:
@@ -1580,6 +1592,15 @@ class Handler(BaseHTTPRequestHandler):
                         db.execute("UPDATE runbooks SET status=?,mode=?,updated_at=? WHERE id=?",(target,"live" if target=="paused" else "plan",stamp,rid))
                     append_audit(db,rid,"runbook.transition",f"{current} → {target}",actor["display_name"]); doc=runbook_document(db,rid,actor); db.commit()
                     return self.send_json({"data":doc,"serviceops":serviceops_result})
+                if len(parts)==4 and parts[3]=="approve":
+                    actor=self.require(db,"admin:access")
+                    if not actor:return
+                    runbook=db.execute("SELECT status,runbook_type_id,approved_at FROM runbooks WHERE id=?",(rid,)).fetchone()
+                    if runbook["approved_at"]: return self.send_json({"error":"This runbook is already approved"},409)
+                    stamp=now()
+                    db.execute("UPDATE runbooks SET approved_at=?,approved_by=? WHERE id=?",(stamp,actor["display_name"],rid))
+                    append_audit(db,rid,"runbook.approved",f"Approved by {actor['display_name']}",actor["display_name"]); doc=runbook_document(db,rid,actor); db.commit()
+                    return self.send_json({"data":doc})
                 if len(parts)==4 and parts[3]=="serviceops-sync":
                     if not self.require(db,"integrations:sync"):return
                     return self.sync_serviceops(db,rid,payload)
