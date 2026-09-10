@@ -169,7 +169,22 @@ extend to that layer yet.
 |---|---:|---:|---:|
 | Save runbook as reusable template | P0 | M | DONE |
 | Create runbook from saved template | P0 | S | DONE |
-| Scope template visibility by workspace | P2 | M | BACKLOG |
+| Scope template visibility by workspace | P2 | M | DONE |
+
+Scoping evidence (2026-09-10): previously any active workspace could be
+passed to `POST /api/templates/{id}/use`, letting a template created in one
+workspace get used to create a runbook in a completely different one --
+templates were only nominally workspace-owned. Fixed: "use" always creates
+in the template's *own* workspace now, silently ignoring any
+`workspace_id` override in the request rather than trusting it. `GET
+/api/templates` also accepts `?workspace_id=` to filter the list. The
+picker UI itself doesn't yet filter by the currently-selected workspace
+client-side (it lists everything the tenant can see, grouped by category),
+but the actual cross-workspace reuse the story is about is closed.
+Regression test proves a template created in one workspace is excluded
+from a `?workspace_id=` filter for a different workspace and that "use"
+lands the new runbook in the template's own workspace even when a
+different one is requested.
 
 ### Epic 2.4 — Central and Linked Teams
 
@@ -201,7 +216,7 @@ managing central teams or linking one into a runbook yet.
 | Story | Priority | Size | Status |
 |---|---:|---:|---:|
 | Import tasks from CSV | P1 | M | DONE |
-| Bulk-edit owner or timing | P2 | M | BACKLOG |
+| Bulk-edit owner or timing | P2 | M | DONE |
 
 Import tasks from CSV: `DONE`. `POST /api/runbooks/{id}/tasks-import` accepts
 a raw CSV body (`title` column required; `stream`, `duration`, `task_type`,
@@ -211,8 +226,16 @@ any streams referenced that don't already exist, and falls back an unknown
 `test_task_csv_import_creates_tasks_and_backfills_unknown_type_to_normal`
 and `test_task_csv_import_rejects_csv_missing_title_column`. Runbook detail
 view has an "Import CSV" button (Editor/Admin only, gated on
-`runbooks:edit`) that reads a local file and posts it. Bulk-edit owner or
-timing across many tasks in one action remains `BACKLOG`.
+`runbooks:edit`) that reads a local file and posts it.
+
+Bulk-edit owner or timing: `DONE`. `POST /api/runbooks/{id}/tasks-bulk-edit`
+takes a `task_ids` list plus any of `owner_user_id`/`owner_team_id`/
+`duration`/`scheduled_offset`, applies them to exactly the selected tasks
+in one UPDATE, and rejects an empty or entirely-invalid selection. A "Bulk
+edit" button in the runbook detail view lets you pick tasks by number and
+set a new duration. Covered by
+`test_bulk_edit_tasks_updates_owner_and_duration_across_selected_tasks_only`
+and `test_bulk_edit_tasks_rejects_empty_or_invalid_task_id_selection`.
 
 ### Epic 2.6 — Node Map
 
