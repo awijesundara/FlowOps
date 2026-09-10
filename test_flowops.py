@@ -170,13 +170,33 @@ class FlowOpsTest(unittest.TestCase):
         class Response:
             status=200
             headers={'X-Request-ID':'serviceops-request-42'}
+            def __init__(self,body):self.body=body
             def __enter__(self):return self
             def __exit__(self,*_):return False
-            def read(self,*_):return b'{"data":{"id":42,"number":"CHG0000042","type":"change","title":"Core release","state":"Approved","priority":"P2"}}'
-        def fake_open(request,timeout=0):captured.append(request);return Response()
+            def read(self,*_):return self.body
+        def fake_open(request,timeout=0):
+            captured.append(request)
+            if request.full_url.endswith('/ctasks'):
+                return Response(json.dumps({'data':[
+                    {'number':'CTASK0000001','title':'Freeze traffic','state':'Open','sequence':1,'assignee':'Nova Reyes'},
+                    {'number':'CTASK0000002','title':'Apply migration','state':'Open','sequence':2,'assignee':None},
+                ]}).encode())
+            return Response(b'{"data":{"id":42,"number":"CHG0000042","type":"change","title":"Core release","state":"Approved","priority":"P2"}}')
         with patch('server.urllib.request.urlopen',fake_open):code,body=self.req(f'/api/runbooks/{rid}/serviceops-sync','POST',{})
         self.assertEqual(code,200);doc=body['data'];self.assertEqual(doc['serviceops_state'],'Approved');self.assertEqual(doc['serviceops_title'],'Core release')
         self.assertEqual(captured[0].full_url,'https://serviceops.example/api/v1/tickets/CHG0000042');self.assertEqual(captured[0].get_header('Authorization'),'Bearer sop_test_only');self.assertTrue(captured[0].get_header('X-request-id'))
+        self.assertEqual(body['ctasks_imported'],2)
+        runbook=self.req(f'/api/runbooks/{rid}')[1]['data']
+        imported=[t for t in runbook['tasks'] if t['stream']=='Change tasks']
+        self.assertEqual([t['title'] for t in imported],['Freeze traffic','Apply migration'])
+        self.assertEqual(imported[1]['depends_on'],[imported[0]['id']])
+        self.assertEqual(imported[0]['owner_display'],'Nova Reyes')
+        self.assertIn('Change tasks',[s['name'] for s in runbook['streams']])
+        # syncing again must not duplicate the already-imported change tasks
+        with patch('server.urllib.request.urlopen',fake_open):code,body=self.req(f'/api/runbooks/{rid}/serviceops-sync','POST',{})
+        self.assertEqual(body['ctasks_imported'],0)
+        runbook=self.req(f'/api/runbooks/{rid}')[1]['data']
+        self.assertEqual(len([t for t in runbook['tasks'] if t['stream']=='Change tasks']),2)
     def test_serviceops_change_approval_gate_and_idempotent_live_writeback(self):
         self.req('/api/admin/integrations','POST',{'provider':'serviceops','url':'https://serviceops.example','credential':'sop_lifecycle_test','enabled':True,'require_approved':True,'sync_on_live':True})
         _,created=self.req('/api/runbooks','POST',{'name':'API-governed run','serviceops_ticket':'CHG0000043'});rid=created['data']['id'];self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})
