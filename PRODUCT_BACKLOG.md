@@ -135,8 +135,8 @@ and retrieves an audit trail with no automation dependency.
 
 | Story | Priority | Size | Status |
 |---|---:|---:|---:|
-| Save runbook as reusable template | P0 | M | BACKLOG |
-| Create runbook from saved template | P0 | S | PARTIAL |
+| Save runbook as reusable template | P0 | M | DONE |
+| Create runbook from saved template | P0 | S | DONE |
 | Scope template visibility by workspace | P2 | M | BACKLOG |
 
 ### Epic 2.4 — Central and Linked Teams

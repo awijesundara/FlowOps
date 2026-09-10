@@ -192,6 +192,26 @@ class FlowOpsTest(unittest.TestCase):
         with patch('server.urllib.request.urlopen',approved):code,body=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
         self.assertEqual(code,200);self.assertEqual(body['data']['serviceops_state'],'In Progress');self.assertEqual([r.method for r in requests],['GET','PATCH'])
         self.assertEqual(requests[1].get_header('Idempotency-key'),f'flowops-{rid}-live');self.assertEqual(json.loads(requests[1].data),{'state':'In Progress'})
+    def test_save_and_use_template_clones_streams_tasks_and_dependencies(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Template source'}); rid=created['data']['id']
+        _,first=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Prep','stream':'Setup','duration':10}); first_id=first['data']['tasks'][0]['id']
+        self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Deploy','stream':'Setup','duration':20,'depends_on':[first_id]})
+        code,saved=self.req(f'/api/runbooks/{rid}/save-as-template','POST',{'name':'Release template','category':'Release'})
+        self.assertEqual(code,201)
+        template_id=saved['data']['id']
+        _,listed=self.req('/api/templates')
+        self.assertTrue(any(t['id']==template_id and t['task_count']==2 and t['category']=='Release' for t in listed['data']))
+        code,used=self.req(f'/api/templates/{template_id}/use','POST',{'name':'From template run'})
+        self.assertEqual(code,201)
+        self.assertEqual(used['data']['name'],'From template run')
+        self.assertEqual(len(used['data']['tasks']),2)
+        self.assertEqual([s['name'] for s in used['data']['streams']],['Setup'])
+        deploy=next(t for t in used['data']['tasks'] if t['title']=='Deploy')
+        prep=next(t for t in used['data']['tasks'] if t['title']=='Prep')
+        self.assertEqual(deploy['depends_on'],[prep['id']])
+        self.assertEqual(self.req(f'/api/templates/{template_id}','DELETE')[0],200)
+        _,listed_after=self.req('/api/templates')
+        self.assertFalse(any(t['id']==template_id for t in listed_after['data']))
     def test_seed_runbook_has_backfilled_streams_on_fresh_install(self):
         _,doc=self.req('/api/runbooks/1')
         self.assertGreater(len(doc['data']['streams']),0)
