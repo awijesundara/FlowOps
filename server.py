@@ -86,7 +86,12 @@ ROLE_PERMISSIONS = {
     "Admin": {"runbooks:view","runbooks:edit","runbooks:execute","integrations:sync","admin:access","admin:users","admin:settings"},
     "Editor": {"runbooks:view","runbooks:edit","runbooks:execute","integrations:sync"},
     "Member": {"runbooks:view","runbooks:execute"},
+    "Stakeholder": {"runbooks:view"},
+    "Workspace Manager": {"runbooks:view","runbooks:edit","runbooks:execute","integrations:sync"},
+    "Folder Creator": {"runbooks:view","runbooks:execute"},
+    "Stream Editor": {"runbooks:view","runbooks:execute"},
 }
+SCOPED_ROLES = {"Workspace Manager","Folder Creator","Stream Editor"}
 TOKEN_SCOPE_PERMISSIONS = {
     "runbooks:read": {"runbooks:view"},
     "runbooks:write": {"runbooks:view","runbooks:edit","runbooks:execute"},
@@ -261,6 +266,21 @@ def init_db() -> None:
           provider TEXT NOT NULL, secret_encrypted TEXT NOT NULL,
           updated_by INTEGER REFERENCES users(id), updated_at TEXT NOT NULL,
           PRIMARY KEY(instance_id,provider)
+        );
+        CREATE TABLE IF NOT EXISTS workspace_managers (
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          PRIMARY KEY(user_id,workspace_id)
+        );
+        CREATE TABLE IF NOT EXISTS folder_creator_grants (
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          folder_id INTEGER NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
+          PRIMARY KEY(user_id,folder_id)
+        );
+        CREATE TABLE IF NOT EXISTS stream_editor_grants (
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          runbook_id INTEGER NOT NULL REFERENCES runbooks(id) ON DELETE CASCADE,
+          PRIMARY KEY(user_id,runbook_id)
         );
         """)
         db.execute("INSERT OR IGNORE INTO instances(slug,name,created_at) VALUES(?,?,?)",(DEFAULT_INSTANCE_SLUG,"FlowOps",now()))
@@ -779,6 +799,38 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error":"Invalid or missing CSRF token"},403); return None
         return user
 
+    def require_scoped_edit(self, db: sqlite3.Connection, workspace_id: int | None = None, folder_id: int | None = None, runbook_id: int | None = None) -> dict[str,Any] | None:
+        user=self.current_user(db)
+        if not user:
+            self.send_json({"error":"Authentication required"},401); return None
+        if user.get("auth_method")=="session" and self.command in {"POST","PATCH","PUT","DELETE"} and self.headers.get("X-CSRF-Token","") != user["csrf_token"]:
+            self.send_json({"error":"Invalid or missing CSRF token"},403); return None
+        role=user["role"]
+        if "runbooks:edit" in user["permissions"]:
+            if role=="Workspace Manager":
+                wsid=workspace_id
+                if wsid is None and runbook_id is not None:
+                    found=db.execute("SELECT workspace_id FROM runbooks WHERE id=?",(runbook_id,)).fetchone(); wsid=found[0] if found else None
+                if wsid is None or not db.execute("SELECT 1 FROM workspace_managers WHERE user_id=? AND workspace_id=?",(user["id"],wsid)).fetchone():
+                    self.send_json({"error":"Your Workspace Manager role is not granted for this workspace"},403); return None
+            return user
+        if role=="Folder Creator" and folder_id is not None and db.execute("SELECT 1 FROM folder_creator_grants WHERE user_id=? AND folder_id=?",(user["id"],folder_id)).fetchone():
+            return user
+        if role=="Stream Editor" and runbook_id is not None and db.execute("SELECT 1 FROM stream_editor_grants WHERE user_id=? AND runbook_id=?",(user["id"],runbook_id)).fetchone():
+            return user
+        self.send_json({"error":f"Your {role} role does not allow this action"},403); return None
+
+    def require_workspace_scoped_edit(self, db: sqlite3.Connection, runbook_id: int | None = None, workspace_id: int | None = None) -> dict[str,Any] | None:
+        user=self.require(db,"runbooks:edit")
+        if not user: return None
+        if user["role"]=="Workspace Manager":
+            wsid=workspace_id
+            if wsid is None and runbook_id is not None:
+                found=db.execute("SELECT workspace_id FROM runbooks WHERE id=?",(runbook_id,)).fetchone(); wsid=found[0] if found else None
+            if wsid is None or not db.execute("SELECT 1 FROM workspace_managers WHERE user_id=? AND workspace_id=?",(user["id"],wsid)).fetchone():
+                self.send_json({"error":"Your Workspace Manager role is not granted for this workspace"},403); return None
+        return user
+
     def body(self) -> dict[str, Any]:
         length=int(self.headers.get("Content-Length","0"))
         if length > MAX_BODY: raise ValueError("Request is too large")
@@ -878,6 +930,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not actor: return
                 data=rows(db.execute("SELECT id,username,display_name,email,role,team,active,last_login_at,created_at FROM users WHERE instance_id=? ORDER BY display_name",(actor["instance_id"],)))
                 return self.send_json({"data":data})
+            if path=="/api/admin/scoped-role-grants":
+                actor=self.require(db,"admin:users")
+                if not actor: return
+                workspace_managers=rows(db.execute("SELECT wm.user_id,u.display_name,wm.workspace_id,w.name workspace_name FROM workspace_managers wm JOIN users u ON u.id=wm.user_id JOIN workspaces w ON w.id=wm.workspace_id WHERE u.instance_id=? ORDER BY u.display_name",(actor["instance_id"],)))
+                folder_creators=rows(db.execute("SELECT fc.user_id,u.display_name,fc.folder_id,f.name folder_name FROM folder_creator_grants fc JOIN users u ON u.id=fc.user_id JOIN folders f ON f.id=fc.folder_id WHERE u.instance_id=? ORDER BY u.display_name",(actor["instance_id"],)))
+                stream_editors=rows(db.execute("SELECT se.user_id,u.display_name,se.runbook_id,r.name runbook_name FROM stream_editor_grants se JOIN users u ON u.id=se.user_id JOIN runbooks r ON r.id=se.runbook_id WHERE u.instance_id=? ORDER BY u.display_name",(actor["instance_id"],)))
+                return self.send_json({"data":{"workspace_managers":workspace_managers,"folder_creators":folder_creators,"stream_editors":stream_editors}})
             if path=="/api/admin/api-tokens":
                 actor=self.require(db,"admin:users")
                 if not actor: return
@@ -1140,6 +1199,35 @@ class Handler(BaseHTTPRequestHandler):
                 try: db.execute("INSERT INTO users(username,display_name,email,role,team,password_hash,created_at,instance_id) VALUES(?,?,?,?,?,?,?,?)",(username,display,str(payload.get("email",""))[:180],role,str(payload.get("team",""))[:120],password_hash(password),now(),actor["instance_id"]))
                 except sqlite3.IntegrityError:return self.send_json({"error":"That username already exists"},409)
                 append_audit(db,None,"admin.user_created",f"{username} as {role}",actor["display_name"],actor["instance_id"]); db.commit(); return self.send_json({"data":{"ok":True}},201)
+            if path=="/api/admin/workspace-managers":
+                actor=self.require(db,"admin:users")
+                if not actor:return
+                user_id=int(payload.get("user_id") or 0); workspace_id=int(payload.get("workspace_id") or 0)
+                target=db.execute("SELECT display_name FROM users WHERE id=? AND instance_id=?",(user_id,actor["instance_id"])).fetchone()
+                workspace=db.execute("SELECT name FROM workspaces WHERE id=? AND instance_id=?",(workspace_id,actor["instance_id"])).fetchone()
+                if not target or not workspace:return self.send_json({"error":"Invalid user or workspace"},400)
+                db.execute("INSERT OR IGNORE INTO workspace_managers(user_id,workspace_id) VALUES(?,?)",(user_id,workspace_id))
+                append_audit(db,None,"admin.workspace_manager_granted",f"{target['display_name']} → {workspace['name']}",actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"ok":True}},201)
+            if path=="/api/admin/folder-creators":
+                actor=self.require(db,"admin:users")
+                if not actor:return
+                user_id=int(payload.get("user_id") or 0); folder_id=int(payload.get("folder_id") or 0)
+                target=db.execute("SELECT display_name FROM users WHERE id=? AND instance_id=?",(user_id,actor["instance_id"])).fetchone()
+                folder=db.execute("SELECT f.name FROM folders f JOIN workspaces w ON w.id=f.workspace_id WHERE f.id=? AND w.instance_id=?",(folder_id,actor["instance_id"])).fetchone()
+                if not target or not folder:return self.send_json({"error":"Invalid user or folder"},400)
+                db.execute("INSERT OR IGNORE INTO folder_creator_grants(user_id,folder_id) VALUES(?,?)",(user_id,folder_id))
+                append_audit(db,None,"admin.folder_creator_granted",f"{target['display_name']} → {folder['name']}",actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"ok":True}},201)
+            if path=="/api/admin/stream-editors":
+                actor=self.require(db,"admin:users")
+                if not actor:return
+                user_id=int(payload.get("user_id") or 0); runbook_id=int(payload.get("runbook_id") or 0)
+                target=db.execute("SELECT display_name FROM users WHERE id=? AND instance_id=?",(user_id,actor["instance_id"])).fetchone()
+                if not target or not owns_runbook(db,runbook_id,actor["instance_id"]):return self.send_json({"error":"Invalid user or runbook"},400)
+                db.execute("INSERT OR IGNORE INTO stream_editor_grants(user_id,runbook_id) VALUES(?,?)",(user_id,runbook_id))
+                append_audit(db,runbook_id,"admin.stream_editor_granted",f"{target['display_name']}",actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"ok":True}},201)
             if path.startswith("/api/admin/sessions/") and path.endswith("/revoke"):
                 actor=self.require(db,"admin:users")
                 if not actor:return
@@ -1321,15 +1409,17 @@ class Handler(BaseHTTPRequestHandler):
                 append_audit(db,None,"central_team.member_added",team["name"],actor["display_name"],actor["instance_id"]); db.commit()
                 return self.send_json({"data":{"ok":True}},201)
             if path=="/api/runbooks":
-                actor=self.require(db,"runbooks:edit")
-                if not actor:return
+                precheck=self.current_user(db)
+                if not precheck: return self.send_json({"error":"Authentication required"},401)
                 name=str(payload.get("name","")).strip()
                 if not name or len(name)>160: return self.send_json({"error":"Name is required (maximum 160 characters)"},400)
-                workspace_id=int(payload.get("workspace_id") or db.execute("SELECT id FROM workspaces WHERE active=1 AND instance_id=? ORDER BY id LIMIT 1",(actor["instance_id"],)).fetchone()[0]); workspace=db.execute("SELECT 1 FROM workspaces WHERE id=? AND active=1 AND instance_id=?",(workspace_id,actor["instance_id"])).fetchone()
+                workspace_id=int(payload.get("workspace_id") or db.execute("SELECT id FROM workspaces WHERE active=1 AND instance_id=? ORDER BY id LIMIT 1",(precheck["instance_id"],)).fetchone()[0]); workspace=db.execute("SELECT 1 FROM workspaces WHERE id=? AND active=1 AND instance_id=?",(workspace_id,precheck["instance_id"])).fetchone()
                 if not workspace:return self.send_json({"error":"Select an active workspace"},400)
                 folder_id=int(payload["folder_id"]) if payload.get("folder_id") else None
                 if folder_id and not db.execute("SELECT 1 FROM folders WHERE id=? AND workspace_id=?",(folder_id,workspace_id)).fetchone():
                     return self.send_json({"error":"Invalid folder"},400)
+                actor=self.require_scoped_edit(db,workspace_id=workspace_id,folder_id=folder_id)
+                if not actor:return
                 runbook_type_id=int(payload["runbook_type_id"]) if payload.get("runbook_type_id") else None
                 runbook_type=db.execute("SELECT * FROM runbook_types WHERE id=? AND workspace_id=?",(runbook_type_id,workspace_id)).fetchone() if runbook_type_id else None
                 if runbook_type_id and not runbook_type:
@@ -1371,7 +1461,7 @@ class Handler(BaseHTTPRequestHandler):
                 actor=self.current_user(db)
                 if not actor or not owns_runbook(db,rid,actor["instance_id"]): return self.send_json({"error":"Not found"},404)
                 if len(parts)==4 and parts[3]=="tasks":
-                    actor=self.require(db,"runbooks:edit")
+                    actor=self.require_scoped_edit(db,runbook_id=rid)
                     if not actor:return
                     title=str(payload.get("title","")).strip()
                     if not title: return self.send_json({"error":"Task title is required"},400)
@@ -1392,7 +1482,7 @@ class Handler(BaseHTTPRequestHandler):
                     append_audit(db,rid,"task.created",title,actor["display_name"]); db.execute("UPDATE runbooks SET updated_at=? WHERE id=?",(now(),rid)); doc=runbook_document(db,rid,actor); db.commit()
                     return self.send_json({"data":doc},201)
                 if len(parts)==4 and parts[3]=="tasks-import":
-                    actor=self.require(db,"runbooks:edit")
+                    actor=self.require_scoped_edit(db,runbook_id=rid)
                     if not actor:return
                     csv_text=str(payload.get("csv",""))
                     try: parsed=parse_tasks_csv(csv_text)
@@ -1410,7 +1500,7 @@ class Handler(BaseHTTPRequestHandler):
                     append_audit(db,rid,"task.csv_imported",f"{created} tasks",actor["display_name"]); db.execute("UPDATE runbooks SET updated_at=? WHERE id=?",(now(),rid)); doc=runbook_document(db,rid,actor); db.commit()
                     return self.send_json({"data":doc,"imported":created},201)
                 if len(parts)==4 and parts[3]=="streams":
-                    actor=self.require(db,"runbooks:edit")
+                    actor=self.require_scoped_edit(db,runbook_id=rid)
                     if not actor:return
                     name=str(payload.get("name","")).strip()
                     if not name or len(name)>80:return self.send_json({"error":"Stream name is required (maximum 80 characters)"},400)
@@ -1420,7 +1510,7 @@ class Handler(BaseHTTPRequestHandler):
                     append_audit(db,rid,"stream.created",name,actor["display_name"]); doc=runbook_document(db,rid,actor); db.commit()
                     return self.send_json({"data":doc},201)
                 if len(parts)==4 and parts[3]=="teams":
-                    actor=self.require(db,"runbooks:edit")
+                    actor=self.require_workspace_scoped_edit(db,runbook_id=rid)
                     if not actor:return
                     name=str(payload.get("name","")).strip()
                     central_team_id=int(payload["central_team_id"]) if payload.get("central_team_id") else None
@@ -1470,7 +1560,7 @@ class Handler(BaseHTTPRequestHandler):
                     if not self.require(db,"integrations:sync"):return
                     return self.sync_serviceops(db,rid,payload)
                 if len(parts)==4 and parts[3]=="duplicate":
-                    actor=self.require(db,"runbooks:edit")
+                    actor=self.require_workspace_scoped_edit(db,runbook_id=rid)
                     if not actor:return
                     source=db.execute("SELECT * FROM runbooks WHERE id=?",(rid,)).fetchone()
                     stamp=now(); name=f"{source['name']} (copy)"[:160]
@@ -1488,7 +1578,7 @@ class Handler(BaseHTTPRequestHandler):
                     append_audit(db,new_rid,"runbook.duplicated",f"Duplicated from {source['name']}",actor["display_name"]); doc=runbook_document(db,new_rid,actor); db.commit()
                     return self.send_json({"data":doc},201)
                 if len(parts)==4 and parts[3]=="save-as-template":
-                    actor=self.require(db,"runbooks:edit")
+                    actor=self.require_workspace_scoped_edit(db,runbook_id=rid)
                     if not actor:return
                     name=str(payload.get("name","")).strip()
                     if not name or len(name)>160: return self.send_json({"error":"Template name is required (maximum 160 characters)"},400)
@@ -1506,7 +1596,7 @@ class Handler(BaseHTTPRequestHandler):
                     append_audit(db,rid,"template.saved",name,actor["display_name"]); db.commit()
                     return self.send_json({"data":{"id":template_id,"name":name}},201)
                 if len(parts)==4 and parts[3]=="archive":
-                    actor=self.require(db,"runbooks:edit")
+                    actor=self.require_workspace_scoped_edit(db,runbook_id=rid)
                     if not actor:return
                     status=db.execute("SELECT status,archived FROM runbooks WHERE id=?",(rid,)).fetchone()
                     if status["status"]!="complete": return self.send_json({"error":"Only a complete runbook can be archived"},409)
@@ -1540,7 +1630,7 @@ class Handler(BaseHTTPRequestHandler):
             try: rid=int(parts[2])
             except ValueError: return self.send_json({"error":"Not found"},404)
             with connect() as db:
-                actor=self.require(db,"runbooks:edit")
+                actor=self.require_workspace_scoped_edit(db,runbook_id=rid)
                 if not actor:return
                 runbook=db.execute("SELECT r.* FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE r.id=? AND w.instance_id=?",(rid,actor["instance_id"])).fetchone()
                 if not runbook: return self.send_json({"error":"Not found"},404)
@@ -1575,10 +1665,12 @@ class Handler(BaseHTTPRequestHandler):
             try: sid=int(parts[2])
             except ValueError: return self.send_json({"error":"Not found"},404)
             with connect() as db:
-                actor=self.require(db,"runbooks:edit")
-                if not actor:return
-                stream=db.execute("SELECT s.* FROM streams s JOIN runbooks r ON r.id=s.runbook_id JOIN workspaces w ON w.id=r.workspace_id WHERE s.id=? AND w.instance_id=?",(sid,actor["instance_id"])).fetchone()
+                precheck=self.current_user(db)
+                if not precheck: return self.send_json({"error":"Authentication required"},401)
+                stream=db.execute("SELECT s.* FROM streams s JOIN runbooks r ON r.id=s.runbook_id JOIN workspaces w ON w.id=r.workspace_id WHERE s.id=? AND w.instance_id=?",(sid,precheck["instance_id"])).fetchone()
                 if not stream: return self.send_json({"error":"Not found"},404)
+                actor=self.require_scoped_edit(db,runbook_id=stream["runbook_id"])
+                if not actor:return
                 name=str(payload.get("name","")).strip()
                 if not name or len(name)>80:return self.send_json({"error":"Stream name is required (maximum 80 characters)"},400)
                 if name!=stream["name"] and db.execute("SELECT 1 FROM streams WHERE runbook_id=? AND name=?",(stream["runbook_id"],name)).fetchone():
@@ -1592,10 +1684,12 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError: return self.send_json({"error":"Not found"},404)
         if "status" not in payload:
             with connect() as db:
-                actor=self.require(db,"runbooks:edit")
-                if not actor:return
-                task=db.execute("SELECT t.* FROM tasks t JOIN runbooks r ON r.id=t.runbook_id JOIN workspaces w ON w.id=r.workspace_id WHERE t.id=? AND w.instance_id=?",(tid,actor["instance_id"])).fetchone()
+                precheck=self.current_user(db)
+                if not precheck: return self.send_json({"error":"Authentication required"},401)
+                task=db.execute("SELECT t.* FROM tasks t JOIN runbooks r ON r.id=t.runbook_id JOIN workspaces w ON w.id=r.workspace_id WHERE t.id=? AND w.instance_id=?",(tid,precheck["instance_id"])).fetchone()
                 if not task: return self.send_json({"error":"Not found"},404)
+                actor=self.require_scoped_edit(db,runbook_id=task["runbook_id"])
+                if not actor:return
                 editable={"title":str,"description":str,"stream":str,"duration":int,"automation_url":str}
                 changes=[]; sets=[]; values=[]
                 for field,caster in editable.items():
@@ -1655,14 +1749,44 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path=urllib.parse.urlparse(self.path).path; parts=path.strip("/").split("/")
+        if len(parts)==5 and parts[:3]==["api","admin","workspace-managers"]:
+            with connect() as db:
+                actor=self.require(db,"admin:users")
+                if not actor:return
+                try: user_id,workspace_id=int(parts[3]),int(parts[4])
+                except ValueError: return self.send_json({"error":"Not found"},404)
+                db.execute("DELETE FROM workspace_managers WHERE user_id=? AND workspace_id=? AND EXISTS(SELECT 1 FROM workspaces w WHERE w.id=? AND w.instance_id=?)",(user_id,workspace_id,workspace_id,actor["instance_id"]))
+                append_audit(db,None,"admin.workspace_manager_revoked",f"user {user_id} × workspace {workspace_id}",actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"ok":True}})
+        if len(parts)==5 and parts[:3]==["api","admin","folder-creators"]:
+            with connect() as db:
+                actor=self.require(db,"admin:users")
+                if not actor:return
+                try: user_id,folder_id=int(parts[3]),int(parts[4])
+                except ValueError: return self.send_json({"error":"Not found"},404)
+                db.execute("DELETE FROM folder_creator_grants WHERE user_id=? AND folder_id=? AND EXISTS(SELECT 1 FROM folders f JOIN workspaces w ON w.id=f.workspace_id WHERE f.id=? AND w.instance_id=?)",(user_id,folder_id,folder_id,actor["instance_id"]))
+                append_audit(db,None,"admin.folder_creator_revoked",f"user {user_id} × folder {folder_id}",actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"ok":True}})
+        if len(parts)==5 and parts[:3]==["api","admin","stream-editors"]:
+            with connect() as db:
+                actor=self.require(db,"admin:users")
+                if not actor:return
+                try: user_id,runbook_id=int(parts[3]),int(parts[4])
+                except ValueError: return self.send_json({"error":"Not found"},404)
+                if not owns_runbook(db,runbook_id,actor["instance_id"]):return self.send_json({"error":"Not found"},404)
+                db.execute("DELETE FROM stream_editor_grants WHERE user_id=? AND runbook_id=?",(user_id,runbook_id))
+                append_audit(db,runbook_id,"admin.stream_editor_revoked",f"user {user_id}",actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"ok":True}})
         if len(parts)==3 and parts[:2]==["api","streams"]:
             try: sid=int(parts[2])
             except ValueError: return self.send_json({"error":"Not found"},404)
             with connect() as db:
-                actor=self.require(db,"runbooks:edit")
-                if not actor:return
-                stream=db.execute("SELECT s.* FROM streams s JOIN runbooks r ON r.id=s.runbook_id JOIN workspaces w ON w.id=r.workspace_id WHERE s.id=? AND w.instance_id=?",(sid,actor["instance_id"])).fetchone()
+                precheck=self.current_user(db)
+                if not precheck: return self.send_json({"error":"Authentication required"},401)
+                stream=db.execute("SELECT s.* FROM streams s JOIN runbooks r ON r.id=s.runbook_id JOIN workspaces w ON w.id=r.workspace_id WHERE s.id=? AND w.instance_id=?",(sid,precheck["instance_id"])).fetchone()
                 if not stream: return self.send_json({"error":"Not found"},404)
+                actor=self.require_scoped_edit(db,runbook_id=stream["runbook_id"])
+                if not actor:return
                 in_use=db.execute("SELECT COUNT(*) FROM tasks WHERE runbook_id=? AND stream=?",(stream["runbook_id"],stream["name"])).fetchone()[0]
                 if in_use: return self.send_json({"error":"Move or remove this stream's tasks before deleting it"},409)
                 db.execute("DELETE FROM streams WHERE id=?",(sid,)); append_audit(db,stream["runbook_id"],"stream.deleted",stream["name"],actor["display_name"]); doc=runbook_document(db,stream["runbook_id"],actor); db.commit()
