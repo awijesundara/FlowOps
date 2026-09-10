@@ -143,9 +143,22 @@ and retrieves an audit trail with no automation dependency.
 
 | Story | Priority | Size | Status |
 |---|---:|---:|---:|
-| Workspace central teams | P0 | M | BACKLOG |
-| Link central team into runbook | P0 | M | BACKLOG |
-| Central membership changes propagate | P1 | M | BACKLOG |
+| Workspace central teams | P0 | M | DONE (API), no admin UI yet |
+| Link central team into runbook | P0 | M | DONE (API), no runbook UI yet |
+| Central membership changes propagate | P1 | M | DONE |
+
+Propagation evidence (2026-09-10): a runbook team linked to a central team
+resolves membership live via `team_member_user_ids()` (direct
+`team_members` UNION the linked central team's current
+`central_team_members`) on every read, rather than copying members at link
+time. Regression test adds a member to a central team *after* linking it
+into a live runbook and asserts the runbook team's member list and count
+update immediately with no re-link step, that a user whose only membership
+is via the central team can act on tasks assigned to that team, and that
+removing them from the central team removes that permission immediately.
+Central-team CRUD and membership management currently exist only as API
+endpoints (`/api/central-teams`, `.../members`); there is no admin UI for
+managing central teams or linking one into a runbook yet.
 
 ### Epic 2.5 — CSV and Bulk Management
 

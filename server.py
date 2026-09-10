@@ -174,10 +174,19 @@ def init_db() -> None:
         );
         CREATE TABLE IF NOT EXISTS runbook_teams (
           id INTEGER PRIMARY KEY, runbook_id INTEGER NOT NULL REFERENCES runbooks(id) ON DELETE CASCADE,
-          name TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(runbook_id,name)
+          name TEXT NOT NULL, created_at TEXT NOT NULL, central_team_id INTEGER, UNIQUE(runbook_id,name)
         );
         CREATE TABLE IF NOT EXISTS team_members (
           team_id INTEGER NOT NULL REFERENCES runbook_teams(id) ON DELETE CASCADE,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          PRIMARY KEY(team_id,user_id)
+        );
+        CREATE TABLE IF NOT EXISTS central_teams (
+          id INTEGER PRIMARY KEY, workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(workspace_id,name)
+        );
+        CREATE TABLE IF NOT EXISTS central_team_members (
+          team_id INTEGER NOT NULL REFERENCES central_teams(id) ON DELETE CASCADE,
           user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           PRIMARY KEY(team_id,user_id)
         );
@@ -226,6 +235,8 @@ def init_db() -> None:
         if "archived" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
         if "folder_id" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN folder_id INTEGER REFERENCES folders(id)")
         if "runbook_type_id" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN runbook_type_id INTEGER REFERENCES runbook_types(id)")
+        rbteam_columns={row[1] for row in db.execute("PRAGMA table_info(runbook_teams)")}
+        if "central_team_id" not in rbteam_columns: db.execute("ALTER TABLE runbook_teams ADD COLUMN central_team_id INTEGER REFERENCES central_teams(id)")
         for column,definition in {
           "serviceops_type":"TEXT","serviceops_title":"TEXT","serviceops_state":"TEXT",
           "serviceops_priority":"TEXT","serviceops_synced_at":"TEXT","serviceops_request_id":"TEXT"
@@ -343,6 +354,18 @@ def integration_credential(db: sqlite3.Connection, instance_id: int, provider: s
     return "","Not configured in FlowOps"
 
 
+def team_member_user_ids(db: sqlite3.Connection, team_id: int) -> set[int]:
+    """A runbook team's effective roster: its own direct members plus,
+    when linked to a central team, that central team's current members --
+    resolved live on every call so central membership changes propagate
+    to every runbook the team is linked into without any copy/sync step."""
+    ids={row[0] for row in db.execute("SELECT user_id FROM team_members WHERE team_id=?",(team_id,))}
+    central_team_id=db.execute("SELECT central_team_id FROM runbook_teams WHERE id=?",(team_id,)).fetchone()
+    if central_team_id and central_team_id[0]:
+        ids|={row[0] for row in db.execute("SELECT user_id FROM central_team_members WHERE team_id=?",(central_team_id[0],))}
+    return ids
+
+
 def owns_runbook(db: sqlite3.Connection, rid: int, instance_id: int) -> bool:
     return bool(db.execute("SELECT 1 FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE r.id=? AND w.instance_id=?",(rid,instance_id)).fetchone())
 
@@ -376,6 +399,7 @@ def runbook_document(db: sqlite3.Connection, rid: int, user: dict[str,Any] | Non
     tasks=all_tasks
     if user and user.get("role")=="Member":
         team_ids={row[0] for row in db.execute("SELECT team_id FROM team_members WHERE user_id=?",(user["id"],))}
+        team_ids|={row[0] for row in db.execute("SELECT rt.id FROM runbook_teams rt JOIN central_team_members ctm ON ctm.team_id=rt.central_team_id WHERE rt.runbook_id=? AND ctm.user_id=?",(rid,user["id"]))}
         tasks=[t for t in all_tasks if t["owner_user_id"]==user["id"] or t["owner_team_id"] in team_ids]
     deps = rows(db.execute("SELECT d.task_id,d.depends_on_id FROM dependencies d JOIN tasks t ON t.id=d.task_id WHERE t.runbook_id=?", (rid,)))
     dep_map: dict[int,list[int]] = {}
@@ -412,7 +436,7 @@ def runbook_document(db: sqlite3.Connection, rid: int, user: dict[str,Any] | Non
             except ValueError: pass
     doc["tasks"] = tasks
     doc["comments"] = rows(db.execute("SELECT * FROM comments WHERE runbook_id=? ORDER BY id DESC", (rid,)))
-    doc["teams"] = rows(db.execute("SELECT rt.id,rt.name,COUNT(tm.user_id) member_count FROM runbook_teams rt LEFT JOIN team_members tm ON tm.team_id=rt.id WHERE rt.runbook_id=? GROUP BY rt.id ORDER BY rt.name",(rid,)))
+    doc["teams"] = [dict(t, member_count=len(team_member_user_ids(db, t["id"]))) for t in rows(db.execute("SELECT rt.id,rt.name,rt.central_team_id,ct.name central_team_name FROM runbook_teams rt LEFT JOIN central_teams ct ON ct.id=rt.central_team_id WHERE rt.runbook_id=? ORDER BY rt.name",(rid,)))]
     doc["streams"] = rows(db.execute("SELECT s.id,s.name,s.sort_order,COUNT(t.id) task_count FROM streams s LEFT JOIN tasks t ON t.runbook_id=s.runbook_id AND t.stream=s.name WHERE s.runbook_id=? GROUP BY s.id ORDER BY s.sort_order,s.name",(rid,)))
     doc["audit"] = rows(db.execute("SELECT * FROM audit WHERE runbook_id=? ORDER BY id DESC LIMIT 100", (rid,)))
     done = sum(t["status"] == "complete" for t in tasks)
@@ -644,6 +668,14 @@ class Handler(BaseHTTPRequestHandler):
                 if not actor: return
                 items=rows(db.execute("SELECT rt.*,COUNT(r.id) runbook_count FROM runbook_types rt JOIN workspaces w ON w.id=rt.workspace_id LEFT JOIN runbooks r ON r.runbook_type_id=rt.id WHERE w.instance_id=? GROUP BY rt.id ORDER BY rt.name",(actor["instance_id"],)))
                 return self.send_json({"data":items})
+            if path=="/api/central-teams":
+                actor=self.require(db,"runbooks:view")
+                if not actor: return
+                teams=rows(db.execute("SELECT ct.* FROM central_teams ct JOIN workspaces w ON w.id=ct.workspace_id WHERE w.instance_id=? ORDER BY ct.name",(actor["instance_id"],)))
+                for team in teams:
+                    team["members"]=rows(db.execute("SELECT u.id,u.display_name,u.email FROM users u JOIN central_team_members ctm ON ctm.user_id=u.id WHERE ctm.team_id=? ORDER BY u.display_name",(team["id"],)))
+                    team["linked_runbooks"]=db.execute("SELECT COUNT(*) FROM runbook_teams WHERE central_team_id=?",(team["id"],)).fetchone()[0]
+                return self.send_json({"data":teams})
             if path=="/api/templates":
                 actor=self.require(db,"runbooks:view")
                 if not actor: return
@@ -671,8 +703,11 @@ class Handler(BaseHTTPRequestHandler):
                     users=rows(db.execute("SELECT id,display_name,email FROM users WHERE active=1 AND instance_id=? ORDER BY display_name",(user["instance_id"],))); teams=rows(db.execute("SELECT id,name FROM runbook_teams WHERE runbook_id=? ORDER BY name",(rid,)))
                     return self.send_json({"data":{"users":users,"teams":teams}})
                 if len(parts)==4 and parts[3]=="teams":
-                    teams=rows(db.execute("SELECT rt.id,rt.name,COUNT(tm.user_id) member_count FROM runbook_teams rt LEFT JOIN team_members tm ON tm.team_id=rt.id WHERE rt.runbook_id=? GROUP BY rt.id ORDER BY rt.name",(rid,)))
-                    for team in teams: team["members"]=rows(db.execute("SELECT u.id,u.display_name,u.email FROM users u JOIN team_members tm ON tm.user_id=u.id WHERE tm.team_id=? ORDER BY u.display_name",(team["id"],)))
+                    teams=rows(db.execute("SELECT rt.id,rt.name,rt.central_team_id FROM runbook_teams rt WHERE rt.runbook_id=? ORDER BY rt.name",(rid,)))
+                    for team in teams:
+                        member_ids=team_member_user_ids(db, team["id"])
+                        team["members"]=rows(db.execute(f"SELECT id,display_name,email FROM users WHERE id IN ({','.join('?'*len(member_ids)) or 'NULL'}) ORDER BY display_name",tuple(member_ids))) if member_ids else []
+                        team["member_count"]=len(member_ids)
                     return self.send_json({"data":teams})
                 if len(parts)!=3:return self.send_json({"error":"Not found"},404)
                 doc=runbook_document(db,rid,user)
@@ -890,6 +925,32 @@ class Handler(BaseHTTPRequestHandler):
                 except sqlite3.IntegrityError: return self.send_json({"error":"That runbook type already exists"},409)
                 append_audit(db,None,"runbook_type.created",name,actor["display_name"],actor["instance_id"]); db.commit()
                 return self.send_json({"data":{"id":cur.lastrowid,"name":name}},201)
+            if path=="/api/central-teams":
+                actor=self.require(db,"admin:users")
+                if not actor:return
+                name=str(payload.get("name","")).strip()
+                if not name or len(name)>120: return self.send_json({"error":"Team name is required (maximum 120 characters)"},400)
+                workspace_id=int(payload.get("workspace_id") or db.execute("SELECT id FROM workspaces WHERE active=1 AND instance_id=? ORDER BY id LIMIT 1",(actor["instance_id"],)).fetchone()[0])
+                if not db.execute("SELECT 1 FROM workspaces WHERE id=? AND active=1 AND instance_id=?",(workspace_id,actor["instance_id"])).fetchone():
+                    return self.send_json({"error":"Select an active workspace"},400)
+                try: cur=db.execute("INSERT INTO central_teams(workspace_id,name,created_at) VALUES(?,?,?)",(workspace_id,name,now()))
+                except sqlite3.IntegrityError: return self.send_json({"error":"That central team already exists"},409)
+                append_audit(db,None,"central_team.created",name,actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"id":cur.lastrowid,"name":name}},201)
+            parts_central=path.strip("/").split("/")
+            if len(parts_central)==4 and parts_central[:2]==["api","central-teams"] and parts_central[3]=="members":
+                actor=self.require(db,"admin:users")
+                if not actor:return
+                try: central_team_id=int(parts_central[2])
+                except ValueError: return self.send_json({"error":"Not found"},404)
+                team=db.execute("SELECT ct.* FROM central_teams ct JOIN workspaces w ON w.id=ct.workspace_id WHERE ct.id=? AND w.instance_id=?",(central_team_id,actor["instance_id"])).fetchone()
+                if not team: return self.send_json({"error":"Not found"},404)
+                user_id=int(payload.get("user_id",0))
+                if not db.execute("SELECT 1 FROM users WHERE id=? AND active=1 AND instance_id=?",(user_id,actor["instance_id"])).fetchone():
+                    return self.send_json({"error":"User is invalid"},400)
+                db.execute("INSERT OR IGNORE INTO central_team_members(team_id,user_id) VALUES(?,?)",(central_team_id,user_id))
+                append_audit(db,None,"central_team.member_added",team["name"],actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"ok":True}},201)
             if path=="/api/runbooks":
                 actor=self.require(db,"runbooks:edit")
                 if not actor:return
@@ -975,12 +1036,19 @@ class Handler(BaseHTTPRequestHandler):
                     actor=self.require(db,"runbooks:edit")
                     if not actor:return
                     name=str(payload.get("name","")).strip()
+                    central_team_id=int(payload["central_team_id"]) if payload.get("central_team_id") else None
+                    central_team=None
+                    if central_team_id:
+                        central_team=db.execute("SELECT ct.* FROM central_teams ct JOIN workspaces w ON w.id=ct.workspace_id WHERE ct.id=? AND w.instance_id=?",(central_team_id,actor["instance_id"])).fetchone()
+                        if not central_team: return self.send_json({"error":"Invalid central team"},400)
+                        name=central_team["name"]
                     if not name:return self.send_json({"error":"Team name is required"},400)
-                    try: cur=db.execute("INSERT INTO runbook_teams(runbook_id,name,created_at) VALUES(?,?,?)",(rid,name[:120],now()))
+                    try: cur=db.execute("INSERT INTO runbook_teams(runbook_id,name,central_team_id,created_at) VALUES(?,?,?,?)",(rid,name[:120],central_team_id,now()))
                     except sqlite3.IntegrityError:return self.send_json({"error":"That runbook team already exists"},409)
-                    for uid in payload.get("user_ids",[]):
-                        if db.execute("SELECT 1 FROM users WHERE id=? AND active=1 AND instance_id=?",(uid,actor["instance_id"])).fetchone():db.execute("INSERT OR IGNORE INTO team_members(team_id,user_id) VALUES(?,?)",(cur.lastrowid,uid))
-                    append_audit(db,rid,"team.created",name,actor["display_name"]);db.commit();return self.send_json({"data":{"id":cur.lastrowid,"name":name}},201)
+                    if not central_team_id:
+                        for uid in payload.get("user_ids",[]):
+                            if db.execute("SELECT 1 FROM users WHERE id=? AND active=1 AND instance_id=?",(uid,actor["instance_id"])).fetchone():db.execute("INSERT OR IGNORE INTO team_members(team_id,user_id) VALUES(?,?)",(cur.lastrowid,uid))
+                    append_audit(db,rid,"team.created" if not central_team_id else "team.linked",name,actor["display_name"]);db.commit();return self.send_json({"data":{"id":cur.lastrowid,"name":name}},201)
                 if len(parts)==4 and parts[3]=="comments":
                     actor=self.require(db,"runbooks:view")
                     if not actor:return
@@ -1169,7 +1237,7 @@ class Handler(BaseHTTPRequestHandler):
             runbook=db.execute("SELECT status FROM runbooks WHERE id=?",(task["runbook_id"],)).fetchone()
             if not runbook or runbook["status"]!="live":return self.send_json({"error":"Tasks can only be executed while the runbook is live"},409)
             if actor["role"]=="Member":
-                assigned=task["owner_user_id"]==actor["id"] or (task["owner_team_id"] and db.execute("SELECT 1 FROM team_members WHERE team_id=? AND user_id=?",(task["owner_team_id"],actor["id"])).fetchone())
+                assigned=task["owner_user_id"]==actor["id"] or (task["owner_team_id"] and actor["id"] in team_member_user_ids(db, task["owner_team_id"]))
                 if not assigned:return self.send_json({"error":"Members may only act on tasks assigned to them or their team"},403)
             target=str(payload.get("status","")); valid={"pending":{"running","skipped","blocked"},"running":{"complete","failed","blocked","pending"},"blocked":{"running","pending","skipped"},"failed":{"running","skipped"},"complete":set(),"skipped":set()}
             if task["task_type"] in {"milestone","checklist","sms","email"}:valid["pending"].add("complete")
@@ -1230,6 +1298,29 @@ class Handler(BaseHTTPRequestHandler):
                 if db.execute("SELECT COUNT(*) FROM runbooks WHERE runbook_type_id=?",(type_id,)).fetchone()[0]:
                     return self.send_json({"error":"Reassign this type's runbooks before deleting it"},409)
                 db.execute("DELETE FROM runbook_types WHERE id=?",(type_id,)); append_audit(db,None,"runbook_type.deleted",rtype["name"],actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"ok":True}})
+        if len(parts)==5 and parts[:2]==["api","central-teams"] and parts[3]=="members":
+            try: central_team_id=int(parts[2]); user_id=int(parts[4])
+            except ValueError: return self.send_json({"error":"Not found"},404)
+            with connect() as db:
+                actor=self.require(db,"admin:users")
+                if not actor:return
+                team=db.execute("SELECT ct.* FROM central_teams ct JOIN workspaces w ON w.id=ct.workspace_id WHERE ct.id=? AND w.instance_id=?",(central_team_id,actor["instance_id"])).fetchone()
+                if not team: return self.send_json({"error":"Not found"},404)
+                db.execute("DELETE FROM central_team_members WHERE team_id=? AND user_id=?",(central_team_id,user_id))
+                append_audit(db,None,"central_team.member_removed",team["name"],actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"ok":True}})
+        if len(parts)==3 and parts[:2]==["api","central-teams"]:
+            try: central_team_id=int(parts[2])
+            except ValueError: return self.send_json({"error":"Not found"},404)
+            with connect() as db:
+                actor=self.require(db,"admin:users")
+                if not actor:return
+                team=db.execute("SELECT ct.* FROM central_teams ct JOIN workspaces w ON w.id=ct.workspace_id WHERE ct.id=? AND w.instance_id=?",(central_team_id,actor["instance_id"])).fetchone()
+                if not team: return self.send_json({"error":"Not found"},404)
+                if db.execute("SELECT COUNT(*) FROM runbook_teams WHERE central_team_id=?",(central_team_id,)).fetchone()[0]:
+                    return self.send_json({"error":"Unlink this team from every runbook before deleting it"},409)
+                db.execute("DELETE FROM central_teams WHERE id=?",(central_team_id,)); append_audit(db,None,"central_team.deleted",team["name"],actor["display_name"],actor["instance_id"]); db.commit()
                 return self.send_json({"data":{"ok":True}})
         if len(parts)!=4 or parts[:3]!=["api","admin","users"]:return self.send_json({"error":"Not found"},404)
         try:uid=int(parts[3])
