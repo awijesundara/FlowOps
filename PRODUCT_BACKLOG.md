@@ -211,9 +211,20 @@ are `BACKLOG`. ServiceOps remains the first-party complementary connector.
 
 ### Epic 3.4 — Public REST API
 
-External runbook creation (P0/L), status queries (P0/M), task updates (P1/M),
-documented sandbox API (P0/M), and scoped revocable tokens (P0/M) are `BACKLOG`.
-Current browser endpoints are internal and do not satisfy this epic.
+Scoped revocable tokens (P0/M): `DONE`. Administrators create named
+`api_tokens` (`fo_…`, shown once, `runbooks:read`/`runbooks:write` scopes,
+revocable any time) under Administration → API tokens. `current_user()`
+resolves `Authorization: Bearer fo_…` the same way it resolves a session
+cookie, so every existing runbook/task endpoint -- not a hand-picked subset
+-- already satisfies external runbook creation (P0/L), status queries
+(P0/M), and task updates (P1/M) once authenticated this way; token requests
+are correctly exempt from the CSRF header (CSRF is a cookie/browser-session
+concern only). Documented sandbox API (P0/M): `DONE` as a README section
+with curl examples; a dedicated interactive API explorer remains open.
+Regression test creates a read-scoped and a write-scoped token, proves the
+read token gets 403 on a write call, proves a write token can create a
+runbook and transition it without any CSRF header, proves an invalid token
+gets 401, and proves revocation takes effect on the next request.
 
 ### Epic 3.5 — Outbound Webhooks
 

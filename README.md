@@ -112,6 +112,29 @@ shared environments; only local preview mode returns one-time tokens to the UI.
 | `POST /api/runbooks/{id}/serviceops-sync` | Retrieve linked ticket |
 | `GET /api/events` | Authenticated real-time workspace event stream |
 
+### Public API access
+
+Every endpoint above also accepts a scoped bearer token instead of a browser
+session, for external automation (CI pipelines, scripts, other services).
+
+1. Sign in as an Administrator, go to **Administration → API tokens → New
+   token**, and choose one or more scopes: `runbooks:read` (list/view only)
+   or `runbooks:write` (create, edit, and transition runbooks and tasks).
+2. Copy the returned `fo_…` token immediately -- it is shown exactly once and
+   cannot be retrieved again. Revoke it from the same screen at any time;
+   revocation takes effect on the next request.
+3. Call the API with `Authorization: Bearer fo_…` instead of a session
+   cookie. Bearer-token requests are exempt from the CSRF header requirement
+   (CSRF only applies to cookie-based browser sessions), so no
+   `X-CSRF-Token` is needed.
+
+```bash
+curl -H "Authorization: Bearer fo_..." https://your-flowops-host/api/runbooks
+
+curl -X POST -H "Authorization: Bearer fo_..." -H "Content-Type: application/json" \
+  -d '{"name":"Automated release"}' https://your-flowops-host/api/runbooks
+```
+
 ## Product roadmap
 
 The next production phases are authentication/RBAC and tenant isolation,

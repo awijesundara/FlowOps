@@ -84,6 +84,10 @@ ROLE_PERMISSIONS = {
     "Editor": {"runbooks:view","runbooks:edit","runbooks:execute","integrations:sync"},
     "Member": {"runbooks:view","runbooks:execute"},
 }
+TOKEN_SCOPE_PERMISSIONS = {
+    "runbooks:read": {"runbooks:view"},
+    "runbooks:write": {"runbooks:view","runbooks:edit","runbooks:execute"},
+}
 
 
 def now() -> str:
@@ -189,6 +193,12 @@ def init_db() -> None:
           team_id INTEGER NOT NULL REFERENCES central_teams(id) ON DELETE CASCADE,
           user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           PRIMARY KEY(team_id,user_id)
+        );
+        CREATE TABLE IF NOT EXISTS api_tokens (
+          id INTEGER PRIMARY KEY, instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, scopes_json TEXT NOT NULL DEFAULT '[]',
+          created_by INTEGER REFERENCES users(id), created_at TEXT NOT NULL,
+          last_used_at TEXT, revoked_at TEXT
         );
         CREATE TABLE IF NOT EXISTS instances (
           id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -516,6 +526,17 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(body)
 
     def current_user(self, db: sqlite3.Connection) -> dict[str,Any] | None:
+        auth_header=self.headers.get("Authorization","")
+        if auth_header.startswith("Bearer fo_"):
+            raw=auth_header[len("Bearer "):].strip()
+            digest=hashlib.sha256(raw.encode()).hexdigest()
+            row=db.execute("SELECT * FROM api_tokens WHERE token_hash=? AND revoked_at IS NULL",(digest,)).fetchone()
+            if not row: return None
+            db.execute("UPDATE api_tokens SET last_used_at=? WHERE id=?",(now(),row["id"]))
+            scopes=json.loads(row["scopes_json"] or "[]")
+            permissions=set()
+            for scope in scopes: permissions|=TOKEN_SCOPE_PERMISSIONS.get(scope,set())
+            return {"id":None,"username":f"api:{row['name']}","display_name":f"API token: {row['name']}","role":"ApiToken","instance_id":row["instance_id"],"permissions":sorted(permissions),"csrf_token":None,"auth_method":"token"}
         cookies={}
         for item in self.headers.get("Cookie","").split(";"):
             if "=" in item:
@@ -525,7 +546,7 @@ class Handler(BaseHTTPRequestHandler):
         digest=hashlib.sha256(token.encode()).hexdigest()
         row=db.execute("SELECT u.*,s.csrf_token,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>? AND u.active=1",(digest,int(time.time()))).fetchone()
         if not row: return None
-        user=dict(row); user["permissions"]=sorted(ROLE_PERMISSIONS.get(user["role"],set())); user.pop("password_hash",None)
+        user=dict(row); user["permissions"]=sorted(ROLE_PERMISSIONS.get(user["role"],set())); user.pop("password_hash",None); user["auth_method"]="session"
         return user
 
     def require(self, db: sqlite3.Connection, permission: str) -> dict[str,Any] | None:
@@ -534,7 +555,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error":"Authentication required"},401); return None
         if permission not in user["permissions"]:
             self.send_json({"error":f"Your {user['role']} role does not allow this action"},403); return None
-        if self.command in {"POST","PATCH","PUT","DELETE"} and self.headers.get("X-CSRF-Token","") != user["csrf_token"]:
+        if user.get("auth_method")=="session" and self.command in {"POST","PATCH","PUT","DELETE"} and self.headers.get("X-CSRF-Token","") != user["csrf_token"]:
             self.send_json({"error":"Invalid or missing CSRF token"},403); return None
         return user
 
@@ -619,6 +640,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not actor: return
                 data=rows(db.execute("SELECT id,username,display_name,email,role,team,active,last_login_at,created_at FROM users WHERE instance_id=? ORDER BY display_name",(actor["instance_id"],)))
                 return self.send_json({"data":data})
+            if path=="/api/admin/api-tokens":
+                actor=self.require(db,"admin:users")
+                if not actor: return
+                items=rows(db.execute("SELECT id,name,scopes_json,created_at,last_used_at,revoked_at FROM api_tokens WHERE instance_id=? ORDER BY created_at DESC",(actor["instance_id"],)))
+                for item in items: item["scopes"]=json.loads(item.pop("scopes_json") or "[]")
+                return self.send_json({"data":items})
             if path=="/api/admin/settings":
                 actor=self.require(db,"admin:settings")
                 if not actor: return
@@ -844,6 +871,26 @@ class Handler(BaseHTTPRequestHandler):
                 if not session:return self.send_json({"error":"Session not found"},404)
                 db.execute("DELETE FROM sessions WHERE id=?",(sid,));append_audit(db,None,"admin.session_revoked",session["username"],actor["display_name"],actor["instance_id"]);db.commit()
                 return self.send_json({"data":{"ok":True}})
+            if path.startswith("/api/admin/api-tokens/") and path.endswith("/revoke"):
+                actor=self.require(db,"admin:users")
+                if not actor:return
+                try: token_id=int(path.strip("/").split("/")[3])
+                except (ValueError,IndexError): return self.send_json({"error":"Not found"},404)
+                token_row=db.execute("SELECT id,name FROM api_tokens WHERE id=? AND instance_id=? AND revoked_at IS NULL",(token_id,actor["instance_id"])).fetchone()
+                if not token_row: return self.send_json({"error":"Not found"},404)
+                db.execute("UPDATE api_tokens SET revoked_at=? WHERE id=?",(now(),token_id)); append_audit(db,None,"api_token.revoked",token_row["name"],actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"ok":True}})
+            if path=="/api/admin/api-tokens":
+                actor=self.require(db,"admin:users")
+                if not actor:return
+                name=str(payload.get("name","")).strip()
+                if not name or len(name)>120: return self.send_json({"error":"Token name is required (maximum 120 characters)"},400)
+                scopes=[s for s in payload.get("scopes",[]) if s in TOKEN_SCOPE_PERMISSIONS]
+                if not scopes: return self.send_json({"error":"Select at least one scope"},400)
+                raw=f"fo_{secrets.token_urlsafe(32)}"; digest=hashlib.sha256(raw.encode()).hexdigest()
+                cur=db.execute("INSERT INTO api_tokens(instance_id,name,token_hash,scopes_json,created_by,created_at) VALUES(?,?,?,?,?,?)",(actor["instance_id"],name,digest,json.dumps(scopes),actor["id"],now()))
+                append_audit(db,None,"api_token.created",f"{name}: {', '.join(scopes)}",actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"id":cur.lastrowid,"name":name,"token":raw,"scopes":scopes}},201)
             if path=="/api/admin/invitations":
                 actor=self.require(db,"admin:users")
                 if not actor:return

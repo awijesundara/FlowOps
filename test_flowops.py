@@ -192,6 +192,34 @@ class FlowOpsTest(unittest.TestCase):
         with patch('server.urllib.request.urlopen',approved):code,body=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
         self.assertEqual(code,200);self.assertEqual(body['data']['serviceops_state'],'In Progress');self.assertEqual([r.method for r in requests],['GET','PATCH'])
         self.assertEqual(requests[1].get_header('Idempotency-key'),f'flowops-{rid}-live');self.assertEqual(json.loads(requests[1].data),{'state':'In Progress'})
+    def test_api_token_scopes_grant_bearer_access_without_csrf(self):
+        code,readToken=self.req('/api/admin/api-tokens','POST',{'name':'CI reader','scopes':['runbooks:read']})
+        self.assertEqual(code,201)
+        self.assertTrue(readToken['data']['token'].startswith('fo_'))
+        code,writeToken=self.req('/api/admin/api-tokens','POST',{'name':'CI writer','scopes':['runbooks:write']})
+        self.assertEqual(code,201)
+        self.assertEqual(self.req('/api/admin/api-tokens','POST',{'name':'No scopes','scopes':[]})[0],400)
+        def bearer_req(path,method,token,body=None):
+            data=json.dumps(body).encode() if body is not None else None
+            request=urllib.request.Request(self.base+path,data=data,method=method,headers={'Content-Type':'application/json','Authorization':f'Bearer {token}'})
+            try:
+                with urllib.request.urlopen(request) as res:return res.status,json.load(res)
+            except urllib.error.HTTPError as err:return err.code,json.load(err)
+        read_token=readToken['data']['token']; write_token=writeToken['data']['token']
+        self.assertEqual(bearer_req('/api/runbooks','GET',read_token)[0],200)
+        self.assertEqual(bearer_req('/api/runbooks','POST',read_token,{'name':'Blocked by scope'})[0],403)
+        code,created=bearer_req('/api/runbooks','POST',write_token,{'name':'Created via API token'})
+        self.assertEqual(code,201)
+        rid=created['data']['id']
+        code,transitioned=bearer_req(f'/api/runbooks/{rid}/transition','POST',write_token,{'status':'ready'})
+        self.assertEqual(code,200)
+        self.assertEqual(bearer_req('/api/runbooks','GET','fo_not-a-real-token')[0],401)
+        _,listed=self.req('/api/admin/api-tokens')
+        names={t['name']:t for t in listed['data']}
+        self.assertEqual(sorted(names['CI reader']['scopes']),['runbooks:read'])
+        token_id=names['CI reader']['id']
+        self.assertEqual(self.req(f'/api/admin/api-tokens/{token_id}/revoke','POST',{})[0],200)
+        self.assertEqual(bearer_req('/api/runbooks','GET',read_token)[0],401)
     def test_central_team_membership_propagates_live_to_linked_runbooks(self):
         _,users=self.req('/api/admin/users'); operator_id=next(u['id'] for u in users['data'] if u['username']=='operator')
         admin_id=next(u['id'] for u in users['data'] if u['username']=='admin')
