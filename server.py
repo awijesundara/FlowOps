@@ -773,6 +773,16 @@ class Handler(BaseHTTPRequestHandler):
     def static(self, name: str, content_type: str):
         try: body=(STATIC/name).read_bytes()
         except FileNotFoundError: return self.send_error(404)
+        if name=="index.html":
+            # Cache-Control alone only governs *future* requests -- it can't
+            # invalidate a copy a browser (or an intermediate cache) already
+            # stored under the old header before this fix shipped. Versioning
+            # the asset URL itself, the same way ServiceOps does
+            # (?v={{app_version}}), means every deploy references a URL no
+            # cache anywhere has ever seen, so nothing to invalidate is ever
+            # needed -- the browser has no choice but to fetch fresh.
+            body=body.replace(b'href="/styles.css"', f'href="/styles.css?v={VERSION}"'.encode())
+            body=body.replace(b'src="/app.js"', f'src="/app.js?v={VERSION}"'.encode())
         self.send_response(200); self.send_header("Content-Type",content_type); self.send_header("Content-Length",str(len(body)))
         # no-store, not no-cache: no-cache still permits a cache (browser or,
         # critically, Cloudflare's edge in front of this app) to serve a
