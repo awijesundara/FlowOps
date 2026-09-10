@@ -467,6 +467,25 @@ class FlowOpsTest(unittest.TestCase):
         _,created=self.req('/api/runbooks','POST',{'name':'Bulk edit empty target'}); rid=created['data']['id']
         code,body=self.req(f'/api/runbooks/{rid}/tasks-bulk-edit','POST',{'task_ids':[999999],'duration':10})
         self.assertEqual(code,400)
+    def test_runbook_type_approval_gate_blocks_live_until_approved(self):
+        _,ws=self.req('/api/workspaces'); workspace_id=ws['data'][0]['id']
+        code,rtype=self.req('/api/runbook-types','POST',{'name':'High-risk change','workspace_id':workspace_id,'requires_approval':True})
+        self.assertEqual(code,201); type_id=rtype['data']['id']
+        _,created=self.req('/api/runbooks','POST',{'name':'Needs approval','workspace_id':workspace_id,'runbook_type_id':type_id}); rid=created['data']['id']
+        self.assertEqual(self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Step'})[0],201)
+        self.assertEqual(self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})[0],200)
+        code,blocked=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        self.assertEqual(code,409); self.assertIn('approval',blocked['error'])
+        code,approved=self.req(f'/api/runbooks/{rid}/approve','POST',{})
+        self.assertEqual(code,200); self.assertIsNotNone(approved['data']['approved_at'])
+        self.assertEqual(self.req(f'/api/runbooks/{rid}/approve','POST',{})[0],409)
+        code,live=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        self.assertEqual(code,200,live); self.assertEqual(live['data']['status'],'live')
+    def test_runbook_without_approval_required_type_transitions_freely(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'No approval needed'}); rid=created['data']['id']
+        self.assertEqual(self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Step'})[0],201)
+        self.assertEqual(self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})[0],200)
+        self.assertEqual(self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})[0],200)
     def test_seed_runbook_has_backfilled_streams_on_fresh_install(self):
         _,doc=self.req('/api/runbooks/1')
         self.assertGreater(len(doc['data']['streams']),0)

@@ -160,8 +160,23 @@ extend to that layer yet.
 |---|---:|---:|---:|
 | Workspace folders | P0 | S | DONE |
 | Custom runbook types with name, icon, and color | P1 | M | DONE |
-| Approval flow attached to runbook type | P1 | L | BACKLOG |
+| Approval flow attached to runbook type | P1 | L | DONE |
 | Creator selects a runbook type and inherits defaults | P0 | S | DONE |
+
+Approval flow evidence (2026-09-10): `runbook_types.requires_approval`
+(set at type-creation time, "New runbook type" admin action) gates the
+`ready → live` transition specifically -- `POST /api/runbooks/{id}/transition`
+checking `target=='live'` returns 409 ("... runbooks require approval
+before going live") if the runbook's type requires approval and
+`runbooks.approved_at` is still null, checked against the *type at
+transition time* (not cached at creation), so changing a type's
+requirement takes effect immediately for every runbook of that type.
+`POST /api/runbooks/{id}/approve` (`admin:access` only) stamps
+`approved_at`/`approved_by` once and 409s on a second approval attempt.
+Runbook types without `requires_approval` are completely unaffected --
+covered by a dedicated regression test alongside the gate itself. The
+runbook detail view shows a status chip ("Approval required" / "✓
+Approved by ...") and an Approve button for admins on gated types.
 
 ### Epic 2.3 — Templates
 
