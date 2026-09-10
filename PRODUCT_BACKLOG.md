@@ -175,9 +175,13 @@ extend to that layer yet.
 
 | Story | Priority | Size | Status |
 |---|---:|---:|---:|
-| Workspace central teams | P0 | M | DONE (API), no admin UI yet |
-| Link central team into runbook | P0 | M | DONE (API), no runbook UI yet |
+| Workspace central teams | P0 | M | DONE |
+| Link central team into runbook | P0 | M | DONE |
 | Central membership changes propagate | P1 | M | DONE |
+
+UI evidence (2026-09-10): `Administration → Central teams` creates/deletes
+central teams and adds/removes members; the runbook detail view has a
+"Link central team" action under a new "Linked runbooks" concept card.
 
 Propagation evidence (2026-09-10): a runbook team linked to a central team
 resolves membership live via `team_member_user_ids()` (direct
@@ -245,7 +249,7 @@ asynchronous delivery retry remain under Epic 3.5.
 ### Epic 3.2 — Custom Fields
 
 Typed, scoped custom-field definitions (P0/M) and values on tasks/runbooks
-(P1/S): `DONE` (API), no admin/runbook UI yet. `custom_field_definitions`
+(P1/S): `DONE`. `custom_field_definitions`
 are workspace- and entity-type-scoped (`runbook` or `task`), typed
 (text/number/date/boolean/select with a bounded option list), and unique
 per workspace+entity_type+name. `PATCH /api/runbooks/{id}` and
@@ -258,9 +262,10 @@ closed rather than trusting client-supplied IDs). Every runbook and task in
 field name. Regression test covers definition creation/duplicate
 rejection/invalid type, setting a value from each side (runbook and task),
 an invalid select option being silently rejected rather than stored, and
-deleting a definition cascading its values away. No UI exists yet for
-defining fields or entering their values -- API only, same disclosed gap
-as Epic 2.4's central teams.
+deleting a definition cascading its values away.
+`Administration → Custom fields` defines fields (entity type, name, type,
+options); the runbook detail view shows a "Custom fields" card with an
+"Edit" action to set values, resolved by name for readability.
 
 ### Epic 3.3 — Predefined Integrations
 
@@ -322,7 +327,7 @@ Exit: runbooks trigger external work and external systems safely drive runbooks.
 ### Epic 4.1 — Linked Runbooks
 
 Primary/secondary runbook linking (P0/L) and aggregate parent status (P0/L):
-`DONE` (API), no UI yet. `PATCH /api/runbooks/{id}` accepts
+`DONE`. `PATCH /api/runbooks/{id}` accepts
 `parent_runbook_id`, rejects self-parenting and a two-hop cycle (linking a
 runbook's own parent back to itself as a child), and is workspace-scoped.
 `runbook_document()` resolves `parent_runbook` (id/name/status) on a child
@@ -332,8 +337,10 @@ not per-child averaged) and `aggregate_status` (complete only if every
 child is complete; live if any child is live; cancelled if any child is
 cancelled; otherwise in_progress). Regression test links two children with
 real tasks under one parent, executes a task in one child, and confirms
-the parent's aggregate progress/status reflect it. No admin/runbook UI for
-linking exists yet -- API only, same disclosed pattern as Epics 2.4/3.2.
+the parent's aggregate progress/status reflect it. The runbook detail view
+has a "Linked runbooks" card ("Set parent" action) that shows the parent
+when this runbook is a child, or the linked children with live aggregate
+progress/status when it's a parent.
 
 ### Epic 4.2 — Dashboards and Reporting
 
