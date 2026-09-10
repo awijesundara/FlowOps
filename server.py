@@ -669,12 +669,19 @@ def runbook_document(db: sqlite3.Connection, rid: int, user: dict[str,Any] | Non
     runbook_live = rb["mode"] == "live" or bool(rb["actual_started_at"])
     for task in tasks:
         task["late"] = False
-        if runbook_live and rb["scheduled_at"] and task["status"] not in {"complete","skipped"} and not task["blocked"]:
+        task["delay_minutes"] = 0
+        if rb["scheduled_at"] and not task["blocked"]:
             try:
                 scheduled=datetime.fromisoformat(rb["scheduled_at"])
                 if scheduled.tzinfo is None: scheduled=scheduled.replace(tzinfo=timezone.utc)
                 offset = earliest_start(task["id"])
-                task["late"] = datetime.now(timezone.utc).timestamp() > scheduled.timestamp() + (offset+task["duration"])*60
+                deadline = scheduled.timestamp() + (offset+task["duration"])*60
+                if runbook_live and task["status"] not in {"complete","skipped"}:
+                    task["late"] = datetime.now(timezone.utc).timestamp() > deadline
+                elif task["status"]=="complete" and task["completed_at"]:
+                    completed=datetime.fromisoformat(task["completed_at"])
+                    if completed.tzinfo is None: completed=completed.replace(tzinfo=timezone.utc)
+                    task["delay_minutes"] = max(0, round((completed.timestamp()-deadline)/60))
             except ValueError: pass
     doc["tasks"] = tasks
     doc["comments"] = rows(db.execute("SELECT * FROM comments WHERE runbook_id=? ORDER BY id DESC", (rid,)))
@@ -1085,6 +1092,25 @@ class Handler(BaseHTTPRequestHandler):
                 if len(parts)!=3:return self.send_json({"error":"Not found"},404)
                 doc=runbook_document(db,rid,user)
                 return self.send_json({"data":doc} if doc else {"error":"Not found"},200 if doc else 404)
+            if path in ("/api/reports/delay","/api/reports/delay.csv"):
+                actor=self.require(db,"runbooks:view")
+                if not actor: return
+                runbook_ids=[row[0] for row in db.execute("SELECT r.id FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE w.instance_id=? AND r.archived=0",(actor["instance_id"],))]
+                report_rows=[]
+                for rbid in runbook_ids:
+                    doc=runbook_document(db,rbid,None)
+                    if not doc: continue
+                    for task in doc["tasks"]:
+                        if task["late"] or task["delay_minutes"]>0:
+                            report_rows.append({"runbook":doc["name"],"task":task["title"],"stream":task["stream"],"owner":task["owner_display"],"status":task["status"],"delay_minutes":task["delay_minutes"] if task["status"]=="complete" else "in progress","scheduled_at":doc["scheduled_at"] or ""})
+                if path=="/api/reports/delay.csv":
+                    buf=io.StringIO(); writer=csv.DictWriter(buf,fieldnames=["runbook","task","stream","owner","status","delay_minutes","scheduled_at"]); writer.writeheader()
+                    for row in report_rows: writer.writerow(row)
+                    body=buf.getvalue().encode()
+                    self.send_response(200); self.send_header("Content-Type","text/csv; charset=utf-8")
+                    self.send_header("Content-Disposition",'attachment; filename="flowops-delay-report.csv"')
+                    self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body); return
+                return self.send_json({"data":report_rows,"generated_at":now()})
             if path=="/api/dashboard":
                 actor=self.require(db,"runbooks:view")
                 if not actor: return
