@@ -32,6 +32,7 @@ FLOWOPS_PORT=8088 python3 server.py
 - Draft, ready, live, paused, complete, and cancelled lifecycle
 - Templates, progress reporting, and hash-chained audit events
 - Persistent SQLite storage and responsive desktop/mobile interface
+- Semantic-versioned releases (`VERSION` file, same convention as ServiceOps), shown in the sidebar and login screen
 - Server-side ServiceOps ticket lookup using a least-privilege bearer token
 - Authenticated workspaces with expiring HttpOnly sessions and CSRF protection
 - Expiring single-use invitations and password recovery with session invalidation and non-enumerating requests
