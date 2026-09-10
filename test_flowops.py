@@ -202,6 +202,17 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(self.req(f'/api/tasks/{first_id}','PATCH',{'status':'running'})[0],200)
         self.assertEqual(self.req(f'/api/tasks/{first_id}','PATCH',{'status':'complete'})[0],200)
         self.assertEqual(self.req(f'/api/tasks/{second_id}','PATCH',{'status':'running'})[0],200)
+    def test_task_can_depend_on_multiple_predecessors(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Fan-in release'}); rid=created['data']['id']
+        _,a=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Migrate database','duration':5}); a_id=a['data']['tasks'][0]['id']
+        _,b=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Sync configuration','duration':5}); b_id=b['data']['tasks'][1]['id']
+        _,c=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Deploy release','depends_on':[a_id,b_id]}); c_id=c['data']['tasks'][2]['id']
+        self.assertEqual(sorted(c['data']['tasks'][2]['depends_on']),sorted([a_id,b_id]))
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'});self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        self.req(f'/api/tasks/{a_id}','PATCH',{'status':'running'});self.req(f'/api/tasks/{a_id}','PATCH',{'status':'complete'})
+        self.assertEqual(self.req(f'/api/tasks/{c_id}','PATCH',{'status':'running'})[0],409)
+        self.req(f'/api/tasks/{b_id}','PATCH',{'status':'running'});self.req(f'/api/tasks/{b_id}','PATCH',{'status':'complete'})
+        self.assertEqual(self.req(f'/api/tasks/{c_id}','PATCH',{'status':'running'})[0],200)
     def test_runbook_lifecycle_rejects_invalid_jump(self):
         _,created=self.req('/api/runbooks','POST',{'name':'Lifecycle'}); rid=created['data']['id']
         self.assertEqual(self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})[0],409)
