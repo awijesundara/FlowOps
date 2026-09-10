@@ -624,5 +624,90 @@ class FlowOpsTest(unittest.TestCase):
             body=res.read().decode()
         self.assertIn('title,stream,owner,duration',body.splitlines()[0])
         self.assertIn('Exportable task,Ops,,20',body)
+    def _as_new_user(self,username,role,password='ScopedRole!12345'):
+        code,created=self.req('/api/admin/users','POST',{'username':username,'display_name':username,'role':role,'password':password})
+        self.assertEqual(code,201,created)
+        admin_opener,admin_csrf=self.opener,self.csrf
+        self.__class__.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()));self.__class__.csrf=''
+        _,login=self.req('/api/auth/login','POST',{'username':username,'password':password})
+        self.__class__.csrf=login['data']['csrf_token']
+        return admin_opener,admin_csrf,login['data']['id'] if 'id' in login['data'] else login['data'].get('user',{}).get('id')
+    def test_stakeholder_role_is_global_read_only(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Stakeholder visibility target'})
+        admin_opener,admin_csrf,_=self._as_new_user('stakeholder1','Stakeholder')
+        try:
+            code,runbooks=self.req('/api/runbooks'); self.assertEqual(code,200)
+            self.assertIn(created['data']['id'],[r['id'] for r in runbooks['data']])
+            self.assertEqual(self.req('/api/runbooks','POST',{'name':'Should be denied'})[0],403)
+            self.assertEqual(self.req(f"/api/runbooks/{created['data']['id']}/tasks",'POST',{'title':'x'})[0],403)
+        finally:
+            self.__class__.opener,self.__class__.csrf=admin_opener,admin_csrf
+    def test_workspace_manager_is_scoped_to_granted_workspace_only(self):
+        _,ws=self.req('/api/workspaces'); other_workspace_id=None
+        code,created_ws=self.req('/api/admin/workspaces')
+        target_workspace_id=ws['data'][0]['id']
+        admin_opener,admin_csrf,user_id=self._as_new_user('wsmanager1','Workspace Manager')
+        self.__class__.opener,self.__class__.csrf=admin_opener,admin_csrf
+        code,created_user=self.req('/api/admin/users'); user_id=[u for u in created_user['data'] if u['username']=='wsmanager1'][0]['id']
+        try:
+            managed_opener=None
+            self.__class__.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()));self.__class__.csrf=''
+            _,login=self.req('/api/auth/login','POST',{'username':'wsmanager1','password':'ScopedRole!12345'});self.__class__.csrf=login['data']['csrf_token']
+            code,denied=self.req('/api/runbooks','POST',{'name':'Denied before grant','workspace_id':target_workspace_id})
+            self.assertEqual(code,403)
+        finally:
+            self.__class__.opener,self.__class__.csrf=admin_opener,admin_csrf
+        self.assertEqual(self.req('/api/admin/workspace-managers','POST',{'user_id':user_id,'workspace_id':target_workspace_id})[0],201)
+        try:
+            self.__class__.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()));self.__class__.csrf=''
+            _,login=self.req('/api/auth/login','POST',{'username':'wsmanager1','password':'ScopedRole!12345'});self.__class__.csrf=login['data']['csrf_token']
+            code,allowed=self.req('/api/runbooks','POST',{'name':'Allowed after grant','workspace_id':target_workspace_id})
+            self.assertEqual(code,201,allowed)
+        finally:
+            self.__class__.opener,self.__class__.csrf=admin_opener,admin_csrf
+        self.assertEqual(self.req(f'/api/admin/workspace-managers/{user_id}/{target_workspace_id}','DELETE')[0],200)
+    def test_folder_creator_can_only_create_runbooks_in_granted_folder(self):
+        _,ws=self.req('/api/workspaces'); workspace_id=ws['data'][0]['id']
+        _,folder=self.req('/api/folders','POST',{'name':'Change windows','workspace_id':workspace_id})
+        folder_id=folder['data']['id']
+        admin_opener,admin_csrf,_=self._as_new_user('foldercreator1','Folder Creator')
+        self.__class__.opener,self.__class__.csrf=admin_opener,admin_csrf
+        code,users=self.req('/api/admin/users'); user_id=[u for u in users['data'] if u['username']=='foldercreator1'][0]['id']
+        try:
+            self.__class__.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()));self.__class__.csrf=''
+            _,login=self.req('/api/auth/login','POST',{'username':'foldercreator1','password':'ScopedRole!12345'});self.__class__.csrf=login['data']['csrf_token']
+            self.assertEqual(self.req('/api/runbooks','POST',{'name':'No folder, denied'})[0],403)
+        finally:
+            self.__class__.opener,self.__class__.csrf=admin_opener,admin_csrf
+        self.assertEqual(self.req('/api/admin/folder-creators','POST',{'user_id':user_id,'folder_id':folder_id})[0],201)
+        try:
+            self.__class__.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()));self.__class__.csrf=''
+            _,login=self.req('/api/auth/login','POST',{'username':'foldercreator1','password':'ScopedRole!12345'});self.__class__.csrf=login['data']['csrf_token']
+            code,created=self.req('/api/runbooks','POST',{'name':'Granted folder create','workspace_id':workspace_id,'folder_id':folder_id})
+            self.assertEqual(code,201,created)
+        finally:
+            self.__class__.opener,self.__class__.csrf=admin_opener,admin_csrf
+    def test_stream_editor_can_edit_tasks_but_not_runbook_fields(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Stream editor target'}); rid=created['data']['id']
+        _,task=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Editable task'}); tid=task['data']['tasks'][0]['id']
+        admin_opener,admin_csrf,_=self._as_new_user('streameditor1','Stream Editor')
+        self.__class__.opener,self.__class__.csrf=admin_opener,admin_csrf
+        code,users=self.req('/api/admin/users'); user_id=[u for u in users['data'] if u['username']=='streameditor1'][0]['id']
+        try:
+            self.__class__.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()));self.__class__.csrf=''
+            _,login=self.req('/api/auth/login','POST',{'username':'streameditor1','password':'ScopedRole!12345'});self.__class__.csrf=login['data']['csrf_token']
+            self.assertEqual(self.req(f'/api/tasks/{tid}','PATCH',{'title':'Denied before grant'})[0],403)
+        finally:
+            self.__class__.opener,self.__class__.csrf=admin_opener,admin_csrf
+        self.assertEqual(self.req('/api/admin/stream-editors','POST',{'user_id':user_id,'runbook_id':rid})[0],201)
+        try:
+            self.__class__.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()));self.__class__.csrf=''
+            _,login=self.req('/api/auth/login','POST',{'username':'streameditor1','password':'ScopedRole!12345'});self.__class__.csrf=login['data']['csrf_token']
+            code,edited=self.req(f'/api/tasks/{tid}','PATCH',{'title':'Edited by stream editor'})
+            self.assertEqual(code,200,edited)
+            self.assertEqual(edited['data']['tasks'][0]['title'],'Edited by stream editor')
+            self.assertEqual(self.req(f'/api/runbooks/{rid}','PATCH',{'name':'Should stay denied'})[0],403)
+        finally:
+            self.__class__.opener,self.__class__.csrf=admin_opener,admin_csrf
 
 if __name__=='__main__': unittest.main()

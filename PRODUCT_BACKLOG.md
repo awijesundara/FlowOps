@@ -117,10 +117,42 @@ and retrieves an audit trail with no automation dependency.
 
 | Story | Priority | Size | Status |
 |---|---:|---:|---:|
-| Workspace Manager, Stakeholder, and Member scoped roles | P0 | L | BACKLOG |
-| Folder-scoped Runbook Creator | P0 | M | BACKLOG |
-| Stream Editor rights | P1 | M | BACKLOG |
-| Global Stakeholder read-only visibility | P1 | M | BACKLOG |
+| Workspace Manager, Stakeholder, and Member scoped roles | P0 | L | PARTIAL |
+| Folder-scoped Runbook Creator | P0 | M | DONE |
+| Stream Editor rights | P1 | M | DONE |
+| Global Stakeholder read-only visibility | P1 | M | DONE |
+
+Four new roles exist alongside Admin/Editor/Member: `Stakeholder` (global,
+instance-wide read-only — `{"runbooks:view"}`, no edit or execute, closing
+"Global Stakeholder read-only visibility" fully), `Workspace Manager`
+(Editor-equivalent rights, but narrowed at authorization time to only the
+workspaces they're explicitly granted via `workspace_managers`), `Folder
+Creator` (view/execute only, plus the specific right to create a runbook
+inside a folder they're granted via `folder_creator_grants` — denied
+without a grant even with a valid folder_id), and `Stream Editor`
+(view/execute only, plus the right to create/edit/delete streams and edit
+tasks — not runbook fields — within a runbook they're granted via
+`stream_editor_grants`). `POST/GET/DELETE /api/admin/{workspace-managers,
+folder-creators,stream-editors}` manage grants; `Administration → Scoped
+roles` is the admin UI for granting and revoking them. Scoping is enforced
+via two new authorization helpers (`require_scoped_edit` narrows to
+Folder Creator/Stream Editor grants or full `runbooks:edit`;
+`require_workspace_scoped_edit` narrows a `Workspace Manager` to their
+granted workspace) applied at task/stream create-edit-delete and at
+runbook create/duplicate/save-as-template/archive/teams/field-edit.
+Regression tests create a real user of each new role, log in as them, and
+assert both the pre-grant 403 and the post-grant 200/201 — not just that
+the role string exists.
+
+`PARTIAL`, not `DONE`, because the existing `Member` role remains
+instance-wide by design (a Member still sees every runbook they're on a
+team for across the whole instance, not scoped to a workspace) — genuinely
+re-scoping `Member` itself was judged out of proportion to redo in this
+pass given its blast radius, so it's left unchanged rather than risk an
+authorization regression. Workspace structural setup — creating folders,
+runbook types, and templates themselves (as opposed to runbooks within
+them) — also remains Admin/Editor only; `Workspace Manager` does not
+extend to that layer yet.
 
 ### Epic 2.2 — Folders and Runbook Types
 
