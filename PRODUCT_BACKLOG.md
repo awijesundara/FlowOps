@@ -221,8 +221,19 @@ as Epic 2.4's central teams.
 
 ### Epic 3.3 — Predefined Integrations
 
-Slack (P1/M), Microsoft Teams (P1/M), and ServiceNow change tracking (P2/L)
-are `BACKLOG`. ServiceOps remains the first-party complementary connector.
+Slack (P1/M) and Microsoft Teams (P1/M): `DONE`, built on Epic 3.5's
+webhook infrastructure rather than as separate connectors. A webhook now
+carries a `provider` (`generic`/`slack`/`teams`); `webhook_payload()`
+formats the same underlying audit event into Slack's plain `{"text":...}`
+message shape or a Teams `MessageCard`, and delivery correctly skips
+FlowOps' own HMAC signature header for both -- Slack/Teams incoming
+webhooks authenticate via the secrecy of the destination URL itself, not a
+verifiable signature, so signing them would be meaningless overhead, not
+extra security. Regression test posts to a real local receiver for each
+provider and asserts the provider-specific shape and the absence of a
+signature header. ServiceNow change tracking (P2/L) remains `BACKLOG`.
+ServiceOps remains the first-party complementary connector for the deeper,
+scoped REST integration Epic 3.1 already covers.
 
 ### Epic 3.4 — Public REST API
 

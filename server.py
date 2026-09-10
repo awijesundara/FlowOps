@@ -211,6 +211,7 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS webhooks (
           id INTEGER PRIMARY KEY, instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
           name TEXT NOT NULL, url TEXT NOT NULL, secret TEXT NOT NULL,
+          provider TEXT NOT NULL DEFAULT 'generic' CHECK(provider IN ('generic','slack','teams')),
           events_json TEXT NOT NULL DEFAULT '["*"]', active INTEGER NOT NULL DEFAULT 1,
           created_by INTEGER REFERENCES users(id), created_at TEXT NOT NULL
         );
@@ -275,6 +276,8 @@ def init_db() -> None:
         if "runbook_type_id" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN runbook_type_id INTEGER REFERENCES runbook_types(id)")
         rbteam_columns={row[1] for row in db.execute("PRAGMA table_info(runbook_teams)")}
         if "central_team_id" not in rbteam_columns: db.execute("ALTER TABLE runbook_teams ADD COLUMN central_team_id INTEGER REFERENCES central_teams(id)")
+        webhook_columns={row[1] for row in db.execute("PRAGMA table_info(webhooks)")}
+        if "provider" not in webhook_columns: db.execute("ALTER TABLE webhooks ADD COLUMN provider TEXT NOT NULL DEFAULT 'generic'")
         for column,definition in {
           "serviceops_type":"TEXT","serviceops_title":"TEXT","serviceops_state":"TEXT",
           "serviceops_priority":"TEXT","serviceops_synced_at":"TEXT","serviceops_request_id":"TEXT"
@@ -456,22 +459,39 @@ def webhook_matches(events_json: str, action: str) -> bool:
     return any(p == "*" or p == action for p in patterns) if isinstance(patterns, list) else False
 
 
-def deliver_webhook_once(webhook: dict[str, Any], event: dict[str, Any]) -> tuple[int | None, str | None, int]:
-    """Sign and POST one audit event to one webhook, retrying up to 3 times
-    with a short fixed backoff on network failure or a non-2xx response."""
-    payload = {
+def webhook_payload(provider: str, event: dict[str, Any]) -> dict[str, Any]:
+    """Slack and Microsoft Teams incoming webhooks each expect their own
+    simple message shape and authenticate via the secrecy of the URL
+    itself, not a signature header -- unlike FlowOps' own generic webhook,
+    which is a portable signed JSON envelope any receiver can verify."""
+    summary = f"{event['action']}: {event['detail']}" if event["detail"] else event["action"]
+    if provider == "slack":
+        return {"text": f"*FlowOps* — {summary}\n_by {event['actor']}_"}
+    if provider == "teams":
+        return {"@type": "MessageCard", "@context": "http://schema.org/extensions", "summary": "FlowOps event",
+                "title": "FlowOps", "text": summary, "sections": [{"facts": [{"name": "Actor", "value": event["actor"]}]}]}
+    return {
         "event": event["action"], "id": event["id"], "runbook_id": event["runbook_id"],
         "detail": event["detail"], "actor": event["actor"], "created_at": event["created_at"],
     }
+
+
+def deliver_webhook_once(webhook: dict[str, Any], event: dict[str, Any]) -> tuple[int | None, str | None, int]:
+    """POST one audit event to one webhook, retrying up to 3 times with a
+    short fixed backoff on network failure or a non-2xx response. Generic
+    webhooks are HMAC-signed; Slack/Teams webhooks are not (their own
+    incoming-webhook URLs are the secret, per each provider's own model)."""
+    provider = webhook.get("provider", "generic")
+    payload = webhook_payload(provider, event)
     body = json.dumps(payload, sort_keys=True).encode()
-    signature = hmac.new(webhook["secret"].encode(), body, hashlib.sha256).hexdigest()
+    headers = {"Content-Type": "application/json"}
+    if provider == "generic":
+        signature = hmac.new(webhook["secret"].encode(), body, hashlib.sha256).hexdigest()
+        headers["X-FlowOps-Signature"] = f"sha256={signature}"
+        headers["X-FlowOps-Event"] = event["action"]
     last_error = None; status = None
     for attempt in range(1, 4):
-        request = urllib.request.Request(webhook["url"], data=body, method="POST", headers={
-            "Content-Type": "application/json",
-            "X-FlowOps-Signature": f"sha256={signature}",
-            "X-FlowOps-Event": event["action"],
-        })
+        request = urllib.request.Request(webhook["url"], data=body, method="POST", headers=headers)
         try:
             with urllib.request.urlopen(request, timeout=8) as response:
                 return response.status, None, attempt
@@ -766,7 +786,7 @@ class Handler(BaseHTTPRequestHandler):
             if path=="/api/admin/webhooks":
                 actor=self.require(db,"admin:users")
                 if not actor: return
-                items=rows(db.execute("SELECT id,name,url,events_json,active,created_at FROM webhooks WHERE instance_id=? ORDER BY created_at DESC",(actor["instance_id"],)))
+                items=rows(db.execute("SELECT id,name,url,provider,events_json,active,created_at FROM webhooks WHERE instance_id=? ORDER BY created_at DESC",(actor["instance_id"],)))
                 for item in items:
                     item["events"]=json.loads(item.pop("events_json") or "[]")
                     recent=rows(db.execute("SELECT success,status_code,error,attempted_at FROM webhook_deliveries WHERE webhook_id=? ORDER BY id DESC LIMIT 5",(item["id"],)))
@@ -1035,10 +1055,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not (url.startswith("https://") or url.startswith("http://")) or len(url)>500:
                     return self.send_json({"error":"A valid http(s) URL is required"},400)
                 events=[e for e in payload.get("events",["*"]) if isinstance(e,str)][:20] or ["*"]
+                provider=str(payload.get("provider","generic"))
+                if provider not in {"generic","slack","teams"}: return self.send_json({"error":"provider must be generic, slack, or teams"},400)
                 secret=secrets.token_urlsafe(32)
-                cur=db.execute("INSERT INTO webhooks(instance_id,name,url,secret,events_json,created_by,created_at) VALUES(?,?,?,?,?,?,?)",(actor["instance_id"],name,url,secret,json.dumps(events),actor["id"],now()))
-                append_audit(db,None,"webhook.created",f"{name}: {url}",actor["display_name"],actor["instance_id"]); db.commit()
-                return self.send_json({"data":{"id":cur.lastrowid,"name":name,"secret":secret}},201)
+                cur=db.execute("INSERT INTO webhooks(instance_id,name,url,secret,provider,events_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",(actor["instance_id"],name,url,secret,provider,json.dumps(events),actor["id"],now()))
+                append_audit(db,None,"webhook.created",f"{name} ({provider}): {url}",actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"id":cur.lastrowid,"name":name,"provider":provider,"secret":secret if provider=="generic" else None}},201)
             if path.startswith("/api/admin/webhooks/") and path.endswith("/test"):
                 actor=self.require(db,"admin:users")
                 if not actor:return

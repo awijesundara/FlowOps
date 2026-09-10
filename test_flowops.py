@@ -218,6 +218,36 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(self.req(f'/api/custom-fields/{text_field_id}','DELETE')[0],200)
         _,afterDelete=self.req(f'/api/runbooks/{rid}')
         self.assertNotIn('Change ticket',afterDelete['data']['custom_fields'])
+    def test_slack_and_teams_webhooks_use_provider_shaped_payloads_without_signing(self):
+        import http.server as http_server_module
+        received=[]
+        class Receiver(http_server_module.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length=int(self.headers.get('Content-Length','0'))
+                received.append({'body':self.rfile.read(length),'signature':self.headers.get('X-FlowOps-Signature')})
+                self.send_response(200); self.end_headers()
+            def log_message(self,*a): pass
+        receiver=http_server_module.HTTPServer(('127.0.0.1',0),Receiver)
+        receiver_port=receiver.server_port
+        threading.Thread(target=receiver.serve_forever,daemon=True).start()
+        try:
+            code,slackHook=self.req('/api/admin/webhooks','POST',{'name':'Slack channel','url':f'http://127.0.0.1:{receiver_port}/slack','provider':'slack','events':['*']})
+            self.assertEqual(code,201)
+            self.assertIsNone(slackHook['data']['secret'])
+            code,teamsHook=self.req('/api/admin/webhooks','POST',{'name':'Teams channel','url':f'http://127.0.0.1:{receiver_port}/teams','provider':'teams','events':['*']})
+            self.assertEqual(code,201)
+            self.assertEqual(self.req('/api/admin/webhooks','POST',{'name':'Bad provider','url':f'http://127.0.0.1:{receiver_port}/x','provider':'discord'})[0],400)
+            self.req(f"/api/admin/webhooks/{slackHook['data']['id']}/test",'POST',{})
+            self.req(f"/api/admin/webhooks/{teamsHook['data']['id']}/test",'POST',{})
+            self.assertEqual(len(received),2)
+            slack_payload=json.loads(received[0]['body'])
+            self.assertIn('text',slack_payload)
+            self.assertIsNone(received[0]['signature'])
+            teams_payload=json.loads(received[1]['body'])
+            self.assertEqual(teams_payload['@type'],'MessageCard')
+            self.assertIsNone(received[1]['signature'])
+        finally:
+            receiver.shutdown()
     def test_webhook_delivers_signed_payload_to_a_real_receiver(self):
         import http.server as http_server_module
         received=[]
