@@ -192,6 +192,39 @@ class FlowOpsTest(unittest.TestCase):
         with patch('server.urllib.request.urlopen',approved):code,body=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
         self.assertEqual(code,200);self.assertEqual(body['data']['serviceops_state'],'In Progress');self.assertEqual([r.method for r in requests],['GET','PATCH'])
         self.assertEqual(requests[1].get_header('Idempotency-key'),f'flowops-{rid}-live');self.assertEqual(json.loads(requests[1].data),{'state':'In Progress'})
+    def test_webhook_delivers_signed_payload_to_a_real_receiver(self):
+        import http.server as http_server_module
+        received=[]
+        class Receiver(http_server_module.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length=int(self.headers.get('Content-Length','0'))
+                received.append({'body':self.rfile.read(length),'signature':self.headers.get('X-FlowOps-Signature',''),'event':self.headers.get('X-FlowOps-Event','')})
+                self.send_response(200); self.end_headers()
+            def log_message(self,*a): pass
+        receiver=http_server_module.HTTPServer(('127.0.0.1',0),Receiver)
+        receiver_port=receiver.server_port
+        threading.Thread(target=receiver.serve_forever,daemon=True).start()
+        try:
+            code,created=self.req('/api/admin/webhooks','POST',{'name':'Test receiver','url':f'http://127.0.0.1:{receiver_port}/hook','events':['*']})
+            self.assertEqual(code,201)
+            self.assertTrue(created['data']['secret'])
+            webhook_id=created['data']['id']
+            code,tested=self.req(f'/api/admin/webhooks/{webhook_id}/test','POST',{})
+            self.assertEqual(code,200)
+            self.assertEqual(len(received),1)
+            payload=json.loads(received[0]['body'])
+            self.assertEqual(payload['event'],'webhook.test')
+            expected_signature='sha256='+__import__('hmac').new(created['data']['secret'].encode(),received[0]['body'],__import__('hashlib').sha256).hexdigest()
+            self.assertEqual(received[0]['signature'],expected_signature)
+            _,listed=self.req('/api/admin/webhooks')
+            entry=next(w for w in listed['data'] if w['id']==webhook_id)
+            self.assertEqual(entry['recent_deliveries'][0]['success'],1)
+            self.assertEqual(self.req('/api/admin/webhooks','POST',{'name':'Bad url','url':'not-a-url'})[0],400)
+            self.assertEqual(self.req(f'/api/admin/webhooks/{webhook_id}','DELETE')[0],200)
+            _,listedAfter=self.req('/api/admin/webhooks')
+            self.assertFalse(any(w['id']==webhook_id for w in listedAfter['data']))
+        finally:
+            receiver.shutdown()
     def test_api_token_scopes_grant_bearer_access_without_csrf(self):
         code,readToken=self.req('/api/admin/api-tokens','POST',{'name':'CI reader','scopes':['runbooks:read']})
         self.assertEqual(code,201)
