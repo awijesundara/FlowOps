@@ -33,6 +33,11 @@ class FlowOpsTest(unittest.TestCase):
         except urllib.error.HTTPError as err:return err.code,json.load(err)
     def test_health_and_seed(self):
         self.assertEqual(self.req('/health')[0],200); code,body=self.req('/api/runbooks'); self.assertEqual(code,200); self.assertTrue(body['data'])
+    def test_serviceops_sync_browser_action_uses_csrf_aware_api_helper(self):
+        source=(server.STATIC/'app.js').read_text()
+        function=source.split('async function syncServiceOps()',1)[1].split('function openModal',1)[0]
+        self.assertIn("await api(`/api/runbooks/${state.current.id}/serviceops-sync`",function)
+        self.assertNotIn('await fetch(',function)
     def test_customer_instance_registration_and_cross_tenant_isolation(self):
         _,original=self.req('/api/runbooks','POST',{'name':'Default tenant private runbook'});original_runbook=original['data']['id']
         _,original_doc=self.req(f'/api/runbooks/{original_runbook}/tasks','POST',{'title':'Private task'});original_task=original_doc['data']['tasks'][0]['id']
@@ -116,6 +121,21 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(captured[0].get_header('Authorization'),f'Bearer {secret}')
         self.assertEqual(self.req('/api/admin/integrations','POST',{'provider':'serviceops','revoke_credential':True})[0],200)
         _,connections=self.req('/api/admin/integrations');self.assertFalse(connections['data']['serviceops']['credential_configured'])
+    def test_connection_test_uses_current_unsaved_form_key_without_persisting_it(self):
+        captured=[]
+        class Response:
+            status=200
+            headers={'Content-Type':'application/json'}
+            def read(self):return b'{"data":[]}'
+            def __enter__(self):return self
+            def __exit__(self,*_):return False
+        def fake_open(request,timeout=0):captured.append(request);return Response()
+        candidate='sop_newly_pasted_browser_key'
+        with patch('server.urllib.request.urlopen',fake_open):
+            code,result=self.req('/api/admin/integrations/test','POST',{'provider':'serviceops','url':'https://serviceops.example','credential':candidate})
+        self.assertEqual(code,200);self.assertTrue(result['data']['tested_unsaved_credential'])
+        self.assertEqual(captured[0].get_header('Authorization'),f'Bearer {candidate}')
+        with server.connect() as db:self.assertFalse(db.execute("SELECT 1 FROM integration_credentials WHERE provider='serviceops'").fetchone())
     def test_login_sources_use_local_administrator_and_configured_directory_domain(self):
         _,sources=self.req('/api/auth/sources');self.assertEqual(sources['data']['sources'],[{'id':'local','label':'Local administrator','placeholder':'Username'}])
         self.req('/api/admin/settings','POST',{'directory_enabled':'true','directory_domain':'corp.example.com'})
@@ -144,7 +164,7 @@ class FlowOpsTest(unittest.TestCase):
                 if value is None:os.environ.pop(key,None)
                 else:os.environ[key]=value
     def test_serviceops_v1_ticket_sync_uses_scoped_bearer_and_stores_projection(self):
-        self.req('/api/admin/integrations','POST',{'provider':'serviceops','url':'https://serviceops.example','enabled':True})
+        self.req('/api/admin/integrations','POST',{'provider':'serviceops','url':'https://serviceops.example','credential':'sop_test_only','enabled':True})
         _,created=self.req('/api/runbooks','POST',{'name':'Governed change','serviceops_ticket':'CHG0000042'});rid=created['data']['id']
         captured=[]
         class Response:
@@ -154,16 +174,11 @@ class FlowOpsTest(unittest.TestCase):
             def __exit__(self,*_):return False
             def read(self,*_):return b'{"data":{"id":42,"number":"CHG0000042","type":"change","title":"Core release","state":"Approved","priority":"P2"}}'
         def fake_open(request,timeout=0):captured.append(request);return Response()
-        old=os.environ.get('SERVICEOPS_TOKEN');os.environ['SERVICEOPS_TOKEN']='sop_test_only'
-        try:
-            with patch('server.urllib.request.urlopen',fake_open):code,body=self.req(f'/api/runbooks/{rid}/serviceops-sync','POST',{})
-        finally:
-            if old is None:os.environ.pop('SERVICEOPS_TOKEN',None)
-            else:os.environ['SERVICEOPS_TOKEN']=old
+        with patch('server.urllib.request.urlopen',fake_open):code,body=self.req(f'/api/runbooks/{rid}/serviceops-sync','POST',{})
         self.assertEqual(code,200);doc=body['data'];self.assertEqual(doc['serviceops_state'],'Approved');self.assertEqual(doc['serviceops_title'],'Core release')
         self.assertEqual(captured[0].full_url,'https://serviceops.example/api/v1/tickets/CHG0000042');self.assertEqual(captured[0].get_header('Authorization'),'Bearer sop_test_only');self.assertTrue(captured[0].get_header('X-request-id'))
     def test_serviceops_change_approval_gate_and_idempotent_live_writeback(self):
-        self.req('/api/admin/integrations','POST',{'provider':'serviceops','url':'https://serviceops.example','enabled':True,'require_approved':True,'sync_on_live':True})
+        self.req('/api/admin/integrations','POST',{'provider':'serviceops','url':'https://serviceops.example','credential':'sop_lifecycle_test','enabled':True,'require_approved':True,'sync_on_live':True})
         _,created=self.req('/api/runbooks','POST',{'name':'API-governed run','serviceops_ticket':'CHG0000043'});rid=created['data']['id'];self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})
         requests=[]
         class Response:
@@ -174,12 +189,7 @@ class FlowOpsTest(unittest.TestCase):
             def __exit__(self,*_):return False
             def read(self,*_):return json.dumps({'data':{'number':'CHG0000043','type':'change','title':'Payments release','state':self.state,'priority':'P1'}}).encode()
         def approved(request,timeout=0):requests.append(request);return Response('In Progress' if request.method=='PATCH' else 'Approved')
-        old=os.environ.get('SERVICEOPS_TOKEN');os.environ['SERVICEOPS_TOKEN']='sop_lifecycle_test'
-        try:
-            with patch('server.urllib.request.urlopen',approved):code,body=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
-        finally:
-            if old is None:os.environ.pop('SERVICEOPS_TOKEN',None)
-            else:os.environ['SERVICEOPS_TOKEN']=old
+        with patch('server.urllib.request.urlopen',approved):code,body=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
         self.assertEqual(code,200);self.assertEqual(body['data']['serviceops_state'],'In Progress');self.assertEqual([r.method for r in requests],['GET','PATCH'])
         self.assertEqual(requests[1].get_header('Idempotency-key'),f'flowops-{rid}-live');self.assertEqual(json.loads(requests[1].data),{'state':'In Progress'})
     def test_full_execution_and_dependency_gate(self):
@@ -215,6 +225,21 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(self.req(f'/api/tasks/{tid}','PATCH',{'status':'running'})[0],200)
         self.assertEqual(self.req(f'/api/tasks/{tid}','PATCH',{'status':'complete'})[0],400)
         code,done=self.req(f'/api/tasks/{tid}','PATCH',{'status':'complete','validation_result':'Pass','validation_comment':'Recovery checks passed'});self.assertEqual(code,200);self.assertEqual(done['data']['tasks'][0]['validation_result'],'Pass')
+    def test_blocked_task_is_not_flagged_late_and_downstream_uses_chain_offset(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Chained lateness','scheduled_at':'2020-01-01T00:00'});rid=created['data']['id']
+        _,first=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Step one','duration':30});first_id=first['data']['tasks'][0]['id']
+        _,second=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Step two','duration':30,'depends_on':[first_id]});second_id=second['data']['tasks'][1]['id']
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'});self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        doc=self.req(f'/api/runbooks/{rid}')[1]['data']
+        by_id={t['id']:t for t in doc['tasks']}
+        self.assertTrue(by_id[first_id]['late'])
+        self.assertTrue(by_id[second_id]['blocked'])
+        self.assertFalse(by_id[second_id]['late'])
+        self.req(f'/api/tasks/{first_id}','PATCH',{'status':'running'});self.req(f'/api/tasks/{first_id}','PATCH',{'status':'complete'})
+        doc=self.req(f'/api/runbooks/{rid}')[1]['data']
+        by_id={t['id']:t for t in doc['tasks']}
+        self.assertFalse(by_id[second_id]['blocked'])
+        self.assertTrue(by_id[second_id]['late'])
     def test_operator_privilege_boundaries(self):
         opener=self.opener; csrf=self.csrf
         self.__class__.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())); self.__class__.csrf=''

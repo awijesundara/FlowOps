@@ -319,6 +319,8 @@ reviewed from the full 5:22 transcript on 2026-09-06.
 | Admin configures the ServiceOps endpoint, safety policy, and encrypted API-key lifecycle entirely in the web UI | ServiceOps API client and least-privilege requirements | 3.1 | DONE |
 | Admin tests a connection without exposing its credential to the browser | 4:38-5:15 | 3.1 | DONE |
 | ServiceOps API compatibility test validates JSON, authentication, and `tickets:read`, and explains additional lifecycle scopes | ServiceOps REST API v1 contract | 3.1 | DONE |
+| Test Connection validates the URL and API key currently entered in the browser before saving, rather than silently testing a stale deployment fallback | ServiceOps administrator workflow regression 2026-09-10 | 3.1 | DONE |
+| Browser-triggered ServiceOps synchronization uses the authenticated CSRF-aware API client and refreshes the runbook projection without a page reload | ServiceOps runbook synchronization regression 2026-09-10 | 3.1 | DONE |
 | Integration tasks execute only in Live; rehearsal safely skips them | 1:28-1:39 | 3.1 | BACKLOG |
 | Directory sign-in delegates AD/LDAP verification to ServiceOps and displays the configured AD domain | ServiceOps login behavior | 4.4 | DONE |
 | Queued/running progress and percentage update the task in real time | 1:42-2:25 | 1.5, 3.1 | BACKLOG |

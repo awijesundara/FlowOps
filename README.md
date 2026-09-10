@@ -88,9 +88,10 @@ it under **Administration → Platform settings → Sign-in and directory** and
 enter the AD domain shown by ServiceOps. The login page then labels the source
 with that domain and provisions successful directory users as FlowOps Members.
 They can paste, rotate, test, or revoke a scoped token there. FlowOps encrypts
-the token at rest with Fernet and never returns it through the browser API.
-`SERVICEOPS_TOKEN` and `JENKINS_TOKEN` remain supported as deployment-managed
-fallbacks. The encryption key itself remains a deployment secret.
+the token at rest and never returns it through the browser API. There is no
+deployment-token fallback: the web-managed credential is the sole ServiceOps
+API identity, so a revoked environment secret cannot appear healthy. The
+encryption key itself remains a deployment secret.
 
 For real invitation and password-reset delivery, configure
 `FLOWOPS_PUBLIC_URL`, `FLOWOPS_SMTP_HOST`, `FLOWOPS_MAIL_FROM`, and the relevant
