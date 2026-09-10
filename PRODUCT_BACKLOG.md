@@ -252,9 +252,24 @@ compliance-grade evidence.
 | Structured API/background-job logging and error tracking | P0 | BACKLOG |
 | Database backup and point-in-time recovery | P0 | BACKLOG |
 | Public API rate limiting | P1 | BACKLOG |
-| Core execution UI accessibility review | P1 | NEXT |
+| Core execution UI accessibility review | P1 | PARTIAL |
 | Internationalization scaffolding | P2 | BACKLOG |
 | FlowOps platform disaster-recovery plan | P1 | BACKLOG |
+
+Accessibility review evidence (2026-09-10): this pass was a manual code review
+of `static/index.html`/`app.js` (no headless-browser/axe-core tooling was
+available in this environment, so this is not a full automated WCAG 2.2 AA
+scan). Confirmed already-compliant: form labels are real `<label>` elements
+(not placeholder-only), status is always conveyed as text via `chip()` (not
+color alone), and modal dialogs use native `<dialog>`/`.showModal()`, which
+gives built-in focus trapping and Escape-to-close. Found and fixed two real
+gaps: the three modal close buttons (×) and the sign-out button were
+icon-only with no accessible name (`aria-label` added to all four); the new
+stream rename/delete control was mouse-only (dblclick, no keyboard path) --
+replaced with a separate, independently focusable "✎" button per stream.
+Not done: color-contrast measurement, screen-reader walkthrough, keyboard-only
+full-app traversal, and zoom/reflow testing all require actual browser
+rendering and remain open.
 
 ## Suggested Team Shape
 
