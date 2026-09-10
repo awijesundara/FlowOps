@@ -4,6 +4,7 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY server.py /app/server.py
+COPY VERSION /app/VERSION
 COPY static /app/static
 RUN mkdir -p /data && useradd --system --uid 10001 flowops && chown -R flowops:flowops /data /app
 USER flowops

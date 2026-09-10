@@ -73,6 +73,7 @@ class SettingsCipher:
             raise InvalidToken("credential authentication failed")
         return self._crypt(authenticated[19:], authenticated[3:19], decrypt=True)
 
+VERSION = (Path(__file__).with_name("VERSION").read_text().strip() if Path(__file__).with_name("VERSION").exists() else "0.0.0")
 DB_PATH = os.getenv("FLOWOPS_DB", str(Path(__file__).with_name("flowops.db")))
 STATIC = Path(__file__).with_name("static")
 MAX_BODY = 1_000_000
@@ -539,7 +540,7 @@ class Handler(BaseHTTPRequestHandler):
         if path=="/": return self.static("index.html","text/html; charset=utf-8")
         if path=="/app.js": return self.static("app.js","application/javascript; charset=utf-8")
         if path=="/styles.css": return self.static("styles.css","text/css; charset=utf-8")
-        if path in ("/health","/ready"): return self.send_json({"status":"ok","service":"flowops"})
+        if path in ("/health","/ready"): return self.send_json({"status":"ok","service":"flowops","version":VERSION})
         if path=="/api/auth/sources":
             with connect() as db:
                 instance=db.execute("SELECT id FROM instances WHERE slug=?",(DEFAULT_INSTANCE_SLUG,)).fetchone()
@@ -598,7 +599,7 @@ class Handler(BaseHTTPRequestHandler):
                 actor=self.require(db,"admin:access")
                 if not actor:return
                 counts=db.execute("SELECT (SELECT COUNT(*) FROM users WHERE instance_id=? AND active=1),(SELECT COUNT(*) FROM workspaces WHERE instance_id=? AND active=1),(SELECT COUNT(*) FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE w.instance_id=?),(SELECT COUNT(*) FROM sessions s JOIN users u ON u.id=s.user_id WHERE u.instance_id=? AND s.expires_at>?)",(actor["instance_id"],actor["instance_id"],actor["instance_id"],actor["instance_id"],int(time.time()))).fetchone()
-                return self.send_json({"data":{"status":"healthy","database":db.execute("PRAGMA integrity_check").fetchone()[0],"active_users":counts[0],"workspaces":counts[1],"runbooks":counts[2],"active_sessions":counts[3],"email_configured":mail_configuration()["configured"],"credential_encryption_configured":bool(os.getenv("FLOWOPS_SETTINGS_ENCRYPTION_KEY")),"realtime":"SSE"}})
+                return self.send_json({"data":{"status":"healthy","version":VERSION,"database":db.execute("PRAGMA integrity_check").fetchone()[0],"active_users":counts[0],"workspaces":counts[1],"runbooks":counts[2],"active_sessions":counts[3],"email_configured":mail_configuration()["configured"],"credential_encryption_configured":bool(os.getenv("FLOWOPS_SETTINGS_ENCRYPTION_KEY")),"realtime":"SSE"}})
             if path=="/api/workspaces":
                 actor=self.require(db,"runbooks:view")
                 if not actor: return
