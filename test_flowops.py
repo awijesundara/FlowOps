@@ -486,6 +486,23 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Step'})[0],201)
         self.assertEqual(self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})[0],200)
         self.assertEqual(self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})[0],200)
+    def test_delay_report_includes_completed_late_tasks_and_currently_late_tasks(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Delay report source','scheduled_at':'2020-01-01T00:00'}); rid=created['data']['id']
+        _,late_done=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Finished late','duration':5})
+        _,still_late=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Still running late','duration':5})
+        done_id=late_done['data']['tasks'][0]['id']; still_id=still_late['data']['tasks'][1]['id']
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'}); self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        self.req(f'/api/tasks/{done_id}','PATCH',{'status':'running'}); self.req(f'/api/tasks/{done_id}','PATCH',{'status':'complete'})
+        code,report=self.req('/api/reports/delay')
+        self.assertEqual(code,200)
+        by_task={r['task']:r for r in report['data'] if r['runbook']=='Delay report source'}
+        self.assertIn('Finished late',by_task); self.assertIsInstance(by_task['Finished late']['delay_minutes'],int); self.assertGreaterEqual(by_task['Finished late']['delay_minutes'],0)
+        self.assertIn('Still running late',by_task); self.assertEqual(by_task['Still running late']['delay_minutes'],'in progress')
+        request=urllib.request.Request(f'{self.base}/api/reports/delay.csv',headers={'X-CSRF-Token':self.csrf})
+        with self.opener.open(request) as res:
+            self.assertEqual(res.status,200); self.assertIn('text/csv',res.headers['Content-Type'])
+            csv_body=res.read().decode()
+        self.assertIn('Finished late',csv_body)
     def test_seed_runbook_has_backfilled_streams_on_fresh_install(self):
         _,doc=self.req('/api/runbooks/1')
         self.assertGreater(len(doc['data']['streams']),0)

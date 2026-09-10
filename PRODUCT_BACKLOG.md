@@ -382,16 +382,34 @@ progress/status when it's a parent.
 
 ### Epic 4.2 — Dashboards and Reporting
 
-Configurable multi-runbook dashboard (P0/L): `PARTIAL`. Post-event timing and
-delay report (P1/M): `BACKLOG`. CSV export (P1/S): `DONE` at the
-per-runbook task level — `GET /api/runbooks/{id}/tasks.csv` returns every
-task's title, stream, owner, duration, type, schedule offset, live
-status/timestamps, and lateness as a downloadable CSV (reusing the same
-lateness calculation as the live view, not a separate/divergent one), wired
-to an "Export CSV" button in the runbook detail view. Covered by
+Configurable multi-runbook dashboard (P0/L): `PARTIAL`. CSV export (P1/S):
+`DONE` at the per-runbook task level — `GET /api/runbooks/{id}/tasks.csv`
+returns every task's title, stream, owner, duration, type, schedule
+offset, live status/timestamps, and lateness as a downloadable CSV
+(reusing the same lateness calculation as the live view, not a
+separate/divergent one), wired to an "Export CSV" button in the runbook
+detail view. Covered by
 `test_task_csv_export_returns_downloadable_csv_with_current_task_state`.
-A cross-runbook multi-workspace delay report and PDF export remain
-`BACKLOG`.
+
+Post-event timing and delay report (P1/M): `DONE`. `GET /api/reports/delay`
+walks every non-archived runbook in the tenant and returns every task that
+is either currently past its scheduled deadline (a live, incomplete task)
+or finished late (a completed task whose `completed_at` is after its
+computed deadline) -- the deadline itself reuses `runbook_document()`'s
+existing dependency-chain-aware `earliest_start()` calculation, not a
+separate approximation. `GET /api/reports/delay.csv` is the same data as a
+downloadable CSV. PDF export (P1/S): `DONE` via a dedicated print
+stylesheet (`Delay report` under Analytics, "Print / Save as PDF" button
+triggering `window.print()`) that hides the sidebar/header and prints only
+the active view -- every browser's native print dialog offers "Save as
+PDF," so this needed no PDF-generation library (this app is intentionally
+stdlib-only). Covered by
+`test_delay_report_includes_completed_late_tasks_and_currently_late_tasks`,
+verified end-to-end against a real container (both a still-late and a
+finished-late task correctly appear in both the JSON and CSV forms).
+A genuinely *configurable* (filterable/scheduled-email) multi-runbook
+dashboard remains `PARTIAL` -- this closes the reporting/export half of
+the epic, not the interactive-dashboard-builder half.
 
 ### Epic 4.3 — Compliance Audit
 
