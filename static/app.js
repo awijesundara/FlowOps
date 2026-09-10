@@ -161,4 +161,6 @@ const reportShow=show;show=function(view){reportShow(view);if(view==='analytics'
 $('#printDelayReport').onclick=()=>window.print();
 $('#exportDelayReportCsv').onclick=()=>window.open('/api/reports/delay.csv','_blank');
 const printStyles=`@media print{aside,header,.header-actions,#toast{display:none!important}.view{display:none!important}.view.active{display:block!important;padding:0!important}}`;document.head.append(Object.assign(document.createElement('style'),{textContent:printStyles}));
+async function purgeAuditRetention(){if(!confirm('Purge audit events older than the configured retention period? This cannot be undone -- export first if you need a copy.'))return;try{const result=await api('/api/admin/audit/purge',{method:'POST',body:'{}'});toast(`Purged ${result.purged} event${result.purged===1?'':'s'}`);loadAdminPanel('audit')}catch(e){toast(e.message,true)}}
+const retentionLoadAdminPanel=loadAdminPanel;loadAdminPanel=async function(name){await retentionLoadAdminPanel(name);if(name==='audit'&&!$('#purgeAuditRetention')){const head=$('#auditAdmin .panelhead');if(head){const btn=document.createElement('button');btn.className='secondary danger';btn.id='purgeAuditRetention';btn.textContent='🗑 Purge by retention';btn.onclick=purgeAuditRetention;head.append(btn)}}};
 boot();

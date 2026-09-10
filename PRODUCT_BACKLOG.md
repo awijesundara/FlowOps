@@ -423,7 +423,24 @@ recipient can re-serialize `data.events` the same way
 (`json.dumps(events, sort_keys=True, separators=(',',':'))`) and confirm
 the export matches `data.checksum`. The export action is itself audited.
 Regression test recomputes the checksum independently and confirms it
-matches. Configurable retention (P1/M): `BACKLOG`.
+matches.
+
+Configurable retention (P1/M): `DONE`. `audit_retention_days` (Platform
+settings, 0 = keep forever) gates `POST /api/admin/audit/purge`
+(`admin:access` only), which deletes events older than the retention
+window and records a checkpoint (`audit_retention_checkpoint` instance
+setting) so the checksummed export's hash-chain walk starts from that
+checkpoint instead of assuming the very first surviving row is the
+original genesis -- a purge is an intentional, audited break in the
+chain's history, not tamper, and the export correctly keeps verifying as
+`chain_verified: true` for everything since the last purge. The purge
+itself is audited (`audit.retention_purged`) and requires a retention
+period to be configured first (400 on an unset/zero retention). "Purge by
+retention" is an action under Administration → Audit. Regression test
+backdates the oldest audit row past the retention window, purges, and
+confirms both that the row is gone and that the export's chain
+verification still passes afterward -- proving the checkpoint mechanism
+works, not just that deletion happened.
 
 ### Epic 4.4 — Security Hardening
 

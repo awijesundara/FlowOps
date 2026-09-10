@@ -20,7 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1000,7 +1000,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not actor:return
                 events=rows(db.execute("SELECT id,runbook_id,action,detail,actor,created_at,previous_hash,event_hash FROM audit WHERE instance_id=? ORDER BY id ASC",(actor["instance_id"],)))
                 chain_verified=True
-                previous="GENESIS"
+                previous=instance_settings(db,actor["instance_id"]).get("audit_retention_checkpoint","GENESIS")
                 for event in events:
                     if event["previous_hash"]!=previous: chain_verified=False; break
                     expected=hashlib.sha256(f"{previous}|{event['runbook_id']}|{event['action']}|{event['detail']}|{event['actor']}|{event['created_at']}".encode()).hexdigest()
@@ -1343,10 +1343,25 @@ class Handler(BaseHTTPRequestHandler):
             if path=="/api/admin/settings":
                 actor=self.require(db,"admin:settings")
                 if not actor:return
-                allowed={"workspace_name","timezone","require_approval","session_hours","serviceops_enabled","directory_enabled","directory_domain"}
+                allowed={"workspace_name","timezone","require_approval","session_hours","serviceops_enabled","directory_enabled","directory_domain","audit_retention_days"}
                 for key,value in payload.items():
                     if key in allowed: db.execute("INSERT INTO instance_settings(instance_id,key,value,updated_at) VALUES(?,?,?,?) ON CONFLICT(instance_id,key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",(actor["instance_id"],key,str(value)[:160],now()))
                 append_audit(db,None,"admin.settings_updated","Workspace configuration updated",actor["display_name"],actor["instance_id"]); db.commit(); return self.send_json({"data":{"ok":True}})
+            if path=="/api/admin/audit/purge":
+                actor=self.require(db,"admin:access")
+                if not actor:return
+                retention_days=int(instance_settings(db,actor["instance_id"]).get("audit_retention_days","0") or "0")
+                if retention_days<=0: return self.send_json({"error":"Set a retention period in Platform settings before purging"},400)
+                cutoff=(datetime.now(timezone.utc)-timedelta(days=retention_days)).isoformat(timespec="seconds")
+                to_purge=rows(db.execute("SELECT id,event_hash FROM audit WHERE instance_id=? AND created_at<? ORDER BY id ASC",(actor["instance_id"],cutoff)))
+                if not to_purge: return self.send_json({"data":{"purged":0}})
+                remaining_after=db.execute("SELECT previous_hash FROM audit WHERE instance_id=? AND created_at>=? ORDER BY id ASC LIMIT 1",(actor["instance_id"],cutoff)).fetchone()
+                checkpoint=remaining_after["previous_hash"] if remaining_after else "GENESIS"
+                purge_ids=[e["id"] for e in to_purge]
+                db.execute(f"DELETE FROM audit WHERE id IN ({','.join('?'*len(purge_ids))})",purge_ids)
+                db.execute("INSERT INTO instance_settings(instance_id,key,value,updated_at) VALUES(?,?,?,?) ON CONFLICT(instance_id,key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",(actor["instance_id"],"audit_retention_checkpoint",checkpoint,now()))
+                append_audit(db,None,"audit.retention_purged",f"Purged {len(purge_ids)} events older than {retention_days} days",actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"purged":len(purge_ids)}})
             if path in {"/api/admin/integrations","/api/admin/integrations/test"}:
                 actor=self.require(db,"admin:settings")
                 if not actor:return

@@ -202,6 +202,21 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(exported['data']['checksum'],recomputed)
         _,recent=self.req('/api/admin/audit')
         self.assertTrue(any(e['action']=='audit.exported' for e in recent['data']))
+    def test_configurable_audit_retention_purges_old_events_and_keeps_chain_verifiable(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Retention prefix check'})
+        with server.connect() as db:
+            instance_id=db.execute("SELECT id FROM instances WHERE slug='flowops'").fetchone()[0]
+            oldest_id=db.execute("SELECT MIN(id) FROM audit WHERE instance_id=?",(instance_id,)).fetchone()[0]
+            old_stamp=(__import__('datetime').datetime.now(__import__('datetime').timezone.utc)-__import__('datetime').timedelta(days=400)).isoformat(timespec='seconds')
+            db.execute("UPDATE audit SET created_at=? WHERE id=?",(old_stamp,oldest_id)); db.commit()
+        self.assertEqual(self.req('/api/admin/audit/purge','POST',{})[0],400)
+        self.assertEqual(self.req('/api/admin/settings','POST',{'audit_retention_days':'365'})[0],200)
+        code,purged=self.req('/api/admin/audit/purge','POST',{})
+        self.assertEqual(code,200); self.assertGreaterEqual(purged['data']['purged'],1)
+        with server.connect() as db:
+            self.assertIsNone(db.execute("SELECT 1 FROM audit WHERE id=?",(oldest_id,)).fetchone())
+        code,exported=self.req('/api/admin/audit/export')
+        self.assertEqual(code,200); self.assertTrue(exported['data']['chain_verified'])
     def test_linked_runbooks_aggregate_child_status_and_progress(self):
         _,parent=self.req('/api/runbooks','POST',{'name':'Parent migration'}); parent_id=parent['data']['id']
         _,childA=self.req('/api/runbooks','POST',{'name':'Wave A'}); child_a_id=childA['data']['id']
