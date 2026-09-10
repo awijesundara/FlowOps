@@ -192,6 +192,30 @@ class FlowOpsTest(unittest.TestCase):
         with patch('server.urllib.request.urlopen',approved):code,body=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
         self.assertEqual(code,200);self.assertEqual(body['data']['serviceops_state'],'In Progress');self.assertEqual([r.method for r in requests],['GET','PATCH'])
         self.assertEqual(requests[1].get_header('Idempotency-key'),f'flowops-{rid}-live');self.assertEqual(json.loads(requests[1].data),{'state':'In Progress'})
+    def test_linked_runbooks_aggregate_child_status_and_progress(self):
+        _,parent=self.req('/api/runbooks','POST',{'name':'Parent migration'}); parent_id=parent['data']['id']
+        _,childA=self.req('/api/runbooks','POST',{'name':'Wave A'}); child_a_id=childA['data']['id']
+        _,childB=self.req('/api/runbooks','POST',{'name':'Wave B'}); child_b_id=childB['data']['id']
+        self.req(f'/api/runbooks/{child_a_id}/tasks','POST',{'title':'Step 1'})
+        self.req(f'/api/runbooks/{child_a_id}/tasks','POST',{'title':'Step 2'})
+        self.req(f'/api/runbooks/{child_b_id}/tasks','POST',{'title':'Step 1'})
+        code,linkedA=self.req(f'/api/runbooks/{child_a_id}','PATCH',{'parent_runbook_id':parent_id})
+        self.assertEqual(code,200)
+        self.assertEqual(linkedA['data']['parent_runbook']['name'],'Parent migration')
+        self.req(f'/api/runbooks/{child_b_id}','PATCH',{'parent_runbook_id':parent_id})
+        self.assertEqual(self.req(f'/api/runbooks/{parent_id}','PATCH',{'parent_runbook_id':child_a_id})[0],400)
+        self.assertEqual(self.req(f'/api/runbooks/{child_a_id}','PATCH',{'parent_runbook_id':child_a_id})[0],400)
+        _,parentDoc=self.req(f'/api/runbooks/{parent_id}')
+        self.assertEqual(len(parentDoc['data']['child_runbooks']),2)
+        self.assertEqual(parentDoc['data']['aggregate_progress'],0)
+        self.assertEqual(parentDoc['data']['aggregate_status'],'in_progress')
+        _,childADoc=self.req(f'/api/runbooks/{child_a_id}')
+        task_id=childADoc['data']['tasks'][0]['id']
+        self.req(f'/api/runbooks/{child_a_id}/transition','POST',{'status':'ready'});self.req(f'/api/runbooks/{child_a_id}/transition','POST',{'status':'live'})
+        self.req(f'/api/tasks/{task_id}','PATCH',{'status':'running'});self.req(f'/api/tasks/{task_id}','PATCH',{'status':'complete'})
+        _,parentAfter=self.req(f'/api/runbooks/{parent_id}')
+        self.assertEqual(parentAfter['data']['aggregate_progress'],round(1*100/3))
+        self.assertEqual(parentAfter['data']['aggregate_status'],'live')
     def test_custom_fields_typed_definitions_and_values_on_runbooks_and_tasks(self):
         code,textField=self.req('/api/custom-fields','POST',{'name':'Change ticket','entity_type':'runbook','field_type':'text'})
         self.assertEqual(code,201); text_field_id=textField['data']['id']

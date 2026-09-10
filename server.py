@@ -274,6 +274,7 @@ def init_db() -> None:
         if "archived" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
         if "folder_id" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN folder_id INTEGER REFERENCES folders(id)")
         if "runbook_type_id" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN runbook_type_id INTEGER REFERENCES runbook_types(id)")
+        if "parent_runbook_id" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN parent_runbook_id INTEGER REFERENCES runbooks(id)")
         rbteam_columns={row[1] for row in db.execute("PRAGMA table_info(runbook_teams)")}
         if "central_team_id" not in rbteam_columns: db.execute("ALTER TABLE runbook_teams ADD COLUMN central_team_id INTEGER REFERENCES central_teams(id)")
         webhook_columns={row[1] for row in db.execute("PRAGMA table_info(webhooks)")}
@@ -585,6 +586,18 @@ def runbook_document(db: sqlite3.Connection, rid: int, user: dict[str,Any] | Non
     doc["streams"] = rows(db.execute("SELECT s.id,s.name,s.sort_order,COUNT(t.id) task_count FROM streams s LEFT JOIN tasks t ON t.runbook_id=s.runbook_id AND t.stream=s.name WHERE s.runbook_id=? GROUP BY s.id ORDER BY s.sort_order,s.name",(rid,)))
     doc["custom_fields"] = custom_field_values_for(db, doc["workspace_id"], "runbook", rid)
     for task in tasks: task["custom_fields"] = custom_field_values_for(db, doc["workspace_id"], "task", task["id"])
+    doc["parent_runbook"] = rows(db.execute("SELECT id,name,status FROM runbooks WHERE id=?", (doc["parent_runbook_id"],)))[0] if doc.get("parent_runbook_id") else None
+    children = rows(db.execute(
+        "SELECT r.id,r.name,r.status,COUNT(t.id) task_count,SUM(CASE WHEN t.status='complete' THEN 1 ELSE 0 END) done_count "
+        "FROM runbooks r LEFT JOIN tasks t ON t.runbook_id=r.id WHERE r.parent_runbook_id=? GROUP BY r.id ORDER BY r.name", (rid,)
+    ))
+    for child in children: child["progress"] = round(child["done_count"] * 100 / child["task_count"]) if child["task_count"] else 0
+    doc["child_runbooks"] = children
+    if children:
+        total_tasks = sum(c["task_count"] for c in children)
+        total_done = sum(c["done_count"] or 0 for c in children)
+        doc["aggregate_progress"] = round(total_done * 100 / total_tasks) if total_tasks else 0
+        doc["aggregate_status"] = "complete" if all(c["status"] == "complete" for c in children) else "cancelled" if any(c["status"] == "cancelled" for c in children) else "live" if any(c["status"] == "live" for c in children) else "in_progress"
     doc["audit"] = rows(db.execute("SELECT * FROM audit WHERE runbook_id=? ORDER BY id DESC LIMIT 100", (rid,)))
     done = sum(t["status"] == "complete" for t in tasks)
     doc["progress"] = round(done * 100 / len(tasks)) if tasks else 0
@@ -1415,6 +1428,14 @@ class Handler(BaseHTTPRequestHandler):
                 if "scheduled_at" in payload:
                     value=payload["scheduled_at"] or None
                     if value!=runbook["scheduled_at"]: changes.append("scheduled_at changed"); sets.append("scheduled_at=?"); values.append(value)
+                if "parent_runbook_id" in payload:
+                    parent_id=int(payload["parent_runbook_id"]) if payload.get("parent_runbook_id") else None
+                    if parent_id==rid: return self.send_json({"error":"A runbook cannot be its own parent"},400)
+                    if parent_id:
+                        parent=db.execute("SELECT id,parent_runbook_id FROM runbooks WHERE id=? AND workspace_id=?",(parent_id,runbook["workspace_id"])).fetchone()
+                        if not parent: return self.send_json({"error":"Invalid parent runbook"},400)
+                        if parent["parent_runbook_id"]==rid: return self.send_json({"error":"That runbook is already a child of this one"},400)
+                    if parent_id!=runbook["parent_runbook_id"]: changes.append("parent_runbook_id changed"); sets.append("parent_runbook_id=?"); values.append(parent_id)
                 field_changes=apply_custom_field_values(db,runbook["workspace_id"],"runbook",rid,payload.get("custom_fields",{})) if isinstance(payload.get("custom_fields"),dict) else []
                 if not changes and not field_changes: return self.send_json({"data":runbook_document(db,rid,actor)})
                 if changes:
