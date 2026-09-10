@@ -114,6 +114,11 @@ def init_db() -> None:
           status TEXT NOT NULL DEFAULT 'pending', sort_order INTEGER NOT NULL DEFAULT 0,
           started_at TEXT, completed_at TEXT, automation_url TEXT
         );
+        CREATE TABLE IF NOT EXISTS streams (
+          id INTEGER PRIMARY KEY, runbook_id INTEGER NOT NULL REFERENCES runbooks(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, sort_order INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+          UNIQUE(runbook_id, name)
+        );
         CREATE TABLE IF NOT EXISTS dependencies (
           task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
           depends_on_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -190,6 +195,7 @@ def init_db() -> None:
         if "workspace_id" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN workspace_id INTEGER REFERENCES workspaces(id)")
         if "actual_started_at" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN actual_started_at TEXT")
         if "actual_completed_at" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN actual_completed_at TEXT")
+        if "archived" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
         for column,definition in {
           "serviceops_type":"TEXT","serviceops_title":"TEXT","serviceops_state":"TEXT",
           "serviceops_priority":"TEXT","serviceops_synced_at":"TEXT","serviceops_request_id":"TEXT"
@@ -206,6 +212,13 @@ def init_db() -> None:
         session_columns={row[1] for row in db.execute("PRAGMA table_info(sessions)")}
         for column,definition in {"ip_address":"TEXT NOT NULL DEFAULT ''","user_agent":"TEXT NOT NULL DEFAULT ''"}.items():
             if column not in session_columns:db.execute(f"ALTER TABLE sessions ADD COLUMN {column} {definition}")
+        for rid, stream, pos in db.execute(
+            "SELECT runbook_id, stream, MIN(sort_order) FROM tasks GROUP BY runbook_id, stream ORDER BY runbook_id, MIN(sort_order)"
+        ).fetchall():
+            db.execute(
+                "INSERT OR IGNORE INTO streams(runbook_id,name,sort_order,created_at) VALUES(?,?,?,?)",
+                (rid, stream, pos, now()),
+            )
         db.execute("UPDATE users SET role='Admin' WHERE role='Administrator'")
         db.execute("UPDATE users SET role='Editor' WHERE role='Runbook Manager'")
         db.execute("UPDATE users SET role='Member' WHERE role IN ('Operator','Viewer')")
@@ -369,6 +382,7 @@ def runbook_document(db: sqlite3.Connection, rid: int, user: dict[str,Any] | Non
     doc["tasks"] = tasks
     doc["comments"] = rows(db.execute("SELECT * FROM comments WHERE runbook_id=? ORDER BY id DESC", (rid,)))
     doc["teams"] = rows(db.execute("SELECT rt.id,rt.name,COUNT(tm.user_id) member_count FROM runbook_teams rt LEFT JOIN team_members tm ON tm.team_id=rt.id WHERE rt.runbook_id=? GROUP BY rt.id ORDER BY rt.name",(rid,)))
+    doc["streams"] = rows(db.execute("SELECT s.id,s.name,s.sort_order,COUNT(t.id) task_count FROM streams s LEFT JOIN tasks t ON t.runbook_id=s.runbook_id AND t.stream=s.name WHERE s.runbook_id=? GROUP BY s.id ORDER BY s.sort_order,s.name",(rid,)))
     doc["audit"] = rows(db.execute("SELECT * FROM audit WHERE runbook_id=? ORDER BY id DESC LIMIT 100", (rid,)))
     done = sum(t["status"] == "complete" for t in tasks)
     doc["progress"] = round(done * 100 / len(tasks)) if tasks else 0
@@ -592,7 +606,9 @@ class Handler(BaseHTTPRequestHandler):
             if path=="/api/runbooks":
                 actor=self.require(db,"runbooks:view")
                 if not actor: return
-                items=rows(db.execute("SELECT r.*,w.name workspace_name,COUNT(t.id) task_count,SUM(CASE WHEN t.status='complete' THEN 1 ELSE 0 END) done_count FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id LEFT JOIN tasks t ON t.runbook_id=r.id WHERE w.instance_id=? GROUP BY r.id ORDER BY r.updated_at DESC",(actor["instance_id"],)))
+                include_archived=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("include_archived",["0"])[0]=="1"
+                archived_clause="" if include_archived else "AND r.archived=0"
+                items=rows(db.execute(f"SELECT r.*,w.name workspace_name,COUNT(t.id) task_count,SUM(CASE WHEN t.status='complete' THEN 1 ELSE 0 END) done_count FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id LEFT JOIN tasks t ON t.runbook_id=r.id WHERE w.instance_id=? {archived_clause} GROUP BY r.id ORDER BY r.updated_at DESC",(actor["instance_id"],)))
                 return self.send_json({"data":items})
             if path.startswith("/api/runbooks/"):
                 user=self.require(db,"runbooks:view")
@@ -825,10 +841,24 @@ class Handler(BaseHTTPRequestHandler):
                     owner_user_id=int(payload["owner_user_id"]) if payload.get("owner_user_id") else None; owner_team_id=int(payload["owner_team_id"]) if payload.get("owner_team_id") else None
                     if owner_user_id and not db.execute("SELECT 1 FROM users WHERE id=? AND active=1 AND instance_id=?",(owner_user_id,actor["instance_id"])).fetchone():return self.send_json({"error":"Assigned user is invalid"},400)
                     if owner_team_id and not db.execute("SELECT 1 FROM runbook_teams WHERE id=? AND runbook_id=?",(owner_team_id,rid)).fetchone():return self.send_json({"error":"Assigned team is invalid"},400)
-                    cur=db.execute("INSERT INTO tasks(runbook_id,title,description,stream,owner,duration,sort_order,automation_url,task_type,scheduled_offset,owner_user_id,owner_team_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(rid,title,str(payload.get("description",""))[:2000],str(payload.get("stream","General"))[:80],"",duration,order,str(payload.get("automation_url",""))[:500] or None,task_type,max(0,int(payload.get("scheduled_offset",0))),owner_user_id,owner_team_id))
+                    stream=str(payload.get("stream","General")).strip()[:80] or "General"
+                    if not db.execute("SELECT 1 FROM streams WHERE runbook_id=? AND name=?",(rid,stream)).fetchone():
+                        stream_order=db.execute("SELECT COALESCE(MAX(sort_order),-1)+1 FROM streams WHERE runbook_id=?",(rid,)).fetchone()[0]
+                        db.execute("INSERT INTO streams(runbook_id,name,sort_order,created_at) VALUES(?,?,?,?)",(rid,stream,stream_order,now()))
+                    cur=db.execute("INSERT INTO tasks(runbook_id,title,description,stream,owner,duration,sort_order,automation_url,task_type,scheduled_offset,owner_user_id,owner_team_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(rid,title,str(payload.get("description",""))[:2000],stream,"",duration,order,str(payload.get("automation_url",""))[:500] or None,task_type,max(0,int(payload.get("scheduled_offset",0))),owner_user_id,owner_team_id))
                     for dep in payload.get("depends_on",[]):
                         if db.execute("SELECT 1 FROM tasks WHERE id=? AND runbook_id=?",(dep,rid)).fetchone(): db.execute("INSERT OR IGNORE INTO dependencies VALUES(?,?)",(cur.lastrowid,dep))
                     append_audit(db,rid,"task.created",title,actor["display_name"]); db.execute("UPDATE runbooks SET updated_at=? WHERE id=?",(now(),rid)); doc=runbook_document(db,rid,actor); db.commit()
+                    return self.send_json({"data":doc},201)
+                if len(parts)==4 and parts[3]=="streams":
+                    actor=self.require(db,"runbooks:edit")
+                    if not actor:return
+                    name=str(payload.get("name","")).strip()
+                    if not name or len(name)>80:return self.send_json({"error":"Stream name is required (maximum 80 characters)"},400)
+                    order=db.execute("SELECT COALESCE(MAX(sort_order),-1)+1 FROM streams WHERE runbook_id=?",(rid,)).fetchone()[0]
+                    try: cur=db.execute("INSERT INTO streams(runbook_id,name,sort_order,created_at) VALUES(?,?,?,?)",(rid,name,order,now()))
+                    except sqlite3.IntegrityError:return self.send_json({"error":"That stream already exists"},409)
+                    append_audit(db,rid,"stream.created",name,actor["display_name"]); doc=runbook_document(db,rid,actor); db.commit()
                     return self.send_json({"data":doc},201)
                 if len(parts)==4 and parts[3]=="teams":
                     actor=self.require(db,"runbooks:edit")
@@ -873,6 +903,33 @@ class Handler(BaseHTTPRequestHandler):
                 if len(parts)==4 and parts[3]=="serviceops-sync":
                     if not self.require(db,"integrations:sync"):return
                     return self.sync_serviceops(db,rid,payload)
+                if len(parts)==4 and parts[3]=="duplicate":
+                    actor=self.require(db,"runbooks:edit")
+                    if not actor:return
+                    source=db.execute("SELECT * FROM runbooks WHERE id=?",(rid,)).fetchone()
+                    stamp=now(); name=f"{source['name']} (copy)"[:160]
+                    cur=db.execute("INSERT INTO runbooks(name,description,owner,workspace_id,created_at,updated_at) VALUES(?,?,?,?,?,?)",(name,source["description"],source["owner"],source["workspace_id"],stamp,stamp))
+                    new_rid=cur.lastrowid
+                    for s in db.execute("SELECT name,sort_order FROM streams WHERE runbook_id=? ORDER BY sort_order",(rid,)):
+                        db.execute("INSERT INTO streams(runbook_id,name,sort_order,created_at) VALUES(?,?,?,?)",(new_rid,s["name"],s["sort_order"],stamp))
+                    id_map={}
+                    for t in db.execute("SELECT * FROM tasks WHERE runbook_id=? ORDER BY sort_order",(rid,)):
+                        new_tid=db.execute("INSERT INTO tasks(runbook_id,title,description,stream,owner,duration,sort_order,automation_url,task_type,scheduled_offset,owner_user_id,owner_team_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(new_rid,t["title"],t["description"],t["stream"],t["owner"],t["duration"],t["sort_order"],t["automation_url"],t["task_type"],t["scheduled_offset"],t["owner_user_id"],t["owner_team_id"])).lastrowid
+                        id_map[t["id"]]=new_tid
+                    for dep in db.execute("SELECT d.task_id,d.depends_on_id FROM dependencies d JOIN tasks t ON t.id=d.task_id WHERE t.runbook_id=?",(rid,)):
+                        if dep["task_id"] in id_map and dep["depends_on_id"] in id_map:
+                            db.execute("INSERT INTO dependencies VALUES(?,?)",(id_map[dep["task_id"]],id_map[dep["depends_on_id"]]))
+                    append_audit(db,new_rid,"runbook.duplicated",f"Duplicated from {source['name']}",actor["display_name"]); doc=runbook_document(db,new_rid,actor); db.commit()
+                    return self.send_json({"data":doc},201)
+                if len(parts)==4 and parts[3]=="archive":
+                    actor=self.require(db,"runbooks:edit")
+                    if not actor:return
+                    status=db.execute("SELECT status,archived FROM runbooks WHERE id=?",(rid,)).fetchone()
+                    if status["status"]!="complete": return self.send_json({"error":"Only a complete runbook can be archived"},409)
+                    if status["archived"]: return self.send_json({"data":runbook_document(db,rid,actor)})
+                    db.execute("UPDATE runbooks SET archived=1,updated_at=? WHERE id=?",(now(),rid))
+                    append_audit(db,rid,"runbook.archived","Archived",actor["display_name"]); doc=runbook_document(db,rid,actor); db.commit()
+                    return self.send_json({"data":doc})
         self.send_json({"error":"Not found"},404)
 
     def do_PATCH(self):
@@ -895,9 +952,86 @@ class Handler(BaseHTTPRequestHandler):
                 db.execute("UPDATE users SET display_name=?,email=?,role=?,team=?,active=? WHERE id=?",(str(payload.get("display_name",user["display_name"]))[:120],str(payload.get("email",user["email"]))[:180],role,str(payload.get("team",user["team"]))[:120],active,uid))
                 if password is not None: db.execute("UPDATE users SET password_hash=? WHERE id=?",(password_hash(str(password)),uid)); db.execute("DELETE FROM sessions WHERE user_id=?",(uid,))
                 append_audit(db,None,"admin.user_updated",f"{user['username']}: role={role}, active={bool(active)}",actor["display_name"],actor["instance_id"]); db.commit(); return self.send_json({"data":{"ok":True}})
+        if len(parts)==3 and parts[:2]==["api","runbooks"]:
+            try: rid=int(parts[2])
+            except ValueError: return self.send_json({"error":"Not found"},404)
+            with connect() as db:
+                actor=self.require(db,"runbooks:edit")
+                if not actor:return
+                runbook=db.execute("SELECT r.* FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE r.id=? AND w.instance_id=?",(rid,actor["instance_id"])).fetchone()
+                if not runbook: return self.send_json({"error":"Not found"},404)
+                if runbook["status"] in {"complete","cancelled"}: return self.send_json({"error":f"Cannot edit a {runbook['status']} runbook"},409)
+                editable={"name":160,"description":2000,"owner":120,"serviceops_ticket":40}
+                changes=[]; sets=[]; values=[]
+                for field,limit in editable.items():
+                    if field not in payload: continue
+                    value=str(payload[field]).strip()[:limit]
+                    if field=="name" and not value: return self.send_json({"error":"Name is required"},400)
+                    if value==runbook[field]: continue
+                    changes.append(f"{field}: {runbook[field]!r} → {value!r}"); sets.append(f"{field}=?"); values.append(value)
+                if "scheduled_at" in payload:
+                    value=payload["scheduled_at"] or None
+                    if value!=runbook["scheduled_at"]: changes.append("scheduled_at changed"); sets.append("scheduled_at=?"); values.append(value)
+                if not changes: return self.send_json({"data":runbook_document(db,rid,actor)})
+                sets.append("updated_at=?"); values.append(now()); values.append(rid)
+                db.execute(f"UPDATE runbooks SET {','.join(sets)} WHERE id=?",values)
+                append_audit(db,rid,"runbook.edited","; ".join(changes),actor["display_name"]); doc=runbook_document(db,rid,actor); db.commit()
+                return self.send_json({"data":doc})
+        if len(parts)==3 and parts[:2]==["api","streams"]:
+            try: sid=int(parts[2])
+            except ValueError: return self.send_json({"error":"Not found"},404)
+            with connect() as db:
+                actor=self.require(db,"runbooks:edit")
+                if not actor:return
+                stream=db.execute("SELECT s.* FROM streams s JOIN runbooks r ON r.id=s.runbook_id JOIN workspaces w ON w.id=r.workspace_id WHERE s.id=? AND w.instance_id=?",(sid,actor["instance_id"])).fetchone()
+                if not stream: return self.send_json({"error":"Not found"},404)
+                name=str(payload.get("name","")).strip()
+                if not name or len(name)>80:return self.send_json({"error":"Stream name is required (maximum 80 characters)"},400)
+                if name!=stream["name"] and db.execute("SELECT 1 FROM streams WHERE runbook_id=? AND name=?",(stream["runbook_id"],name)).fetchone():
+                    return self.send_json({"error":"That stream already exists"},409)
+                db.execute("UPDATE tasks SET stream=? WHERE runbook_id=? AND stream=?",(name,stream["runbook_id"],stream["name"]))
+                db.execute("UPDATE streams SET name=? WHERE id=?",(name,sid))
+                append_audit(db,stream["runbook_id"],"stream.renamed",f"{stream['name']} → {name}",actor["display_name"]); doc=runbook_document(db,stream["runbook_id"],actor); db.commit()
+                return self.send_json({"data":doc})
         if len(parts)!=3 or parts[:2] != ["api","tasks"]: return self.send_json({"error":"Not found"},404)
         try: tid=int(parts[2])
         except ValueError: return self.send_json({"error":"Not found"},404)
+        if "status" not in payload:
+            with connect() as db:
+                actor=self.require(db,"runbooks:edit")
+                if not actor:return
+                task=db.execute("SELECT t.* FROM tasks t JOIN runbooks r ON r.id=t.runbook_id JOIN workspaces w ON w.id=r.workspace_id WHERE t.id=? AND w.instance_id=?",(tid,actor["instance_id"])).fetchone()
+                if not task: return self.send_json({"error":"Not found"},404)
+                editable={"title":str,"description":str,"stream":str,"duration":int,"automation_url":str}
+                changes=[]; sets=[]; values=[]
+                for field,caster in editable.items():
+                    if field not in payload: continue
+                    if field=="title" and not str(payload["title"]).strip(): return self.send_json({"error":"Task title is required"},400)
+                    value=caster(payload[field]) if caster is not str else str(payload[field]).strip()
+                    if field in {"title","description","automation_url"}: value=value[:2000 if field=="description" else 500 if field=="automation_url" else 160]
+                    if field=="stream": value=value[:80] or "General"
+                    if field=="duration": value=max(0,min(int(value),10080))
+                    if value==task[field]: continue
+                    changes.append(f"{field}: {task[field]!r} → {value!r}"); sets.append(f"{field}=?"); values.append(value)
+                if "owner_user_id" in payload:
+                    owner_user_id=int(payload["owner_user_id"]) if payload.get("owner_user_id") else None
+                    if owner_user_id and not db.execute("SELECT 1 FROM users WHERE id=? AND active=1 AND instance_id=?",(owner_user_id,actor["instance_id"])).fetchone():return self.send_json({"error":"Assigned user is invalid"},400)
+                    if owner_user_id!=task["owner_user_id"]: changes.append("owner_user_id changed"); sets.append("owner_user_id=?"); values.append(owner_user_id)
+                if "owner_team_id" in payload:
+                    owner_team_id=int(payload["owner_team_id"]) if payload.get("owner_team_id") else None
+                    if owner_team_id and not db.execute("SELECT 1 FROM runbook_teams WHERE id=? AND runbook_id=?",(owner_team_id,task["runbook_id"])).fetchone():return self.send_json({"error":"Assigned team is invalid"},400)
+                    if owner_team_id!=task["owner_team_id"]: changes.append("owner_team_id changed"); sets.append("owner_team_id=?"); values.append(owner_team_id)
+                if "stream" in payload and payload["stream"]:
+                    stream_name=str(payload["stream"]).strip()[:80]
+                    if not db.execute("SELECT 1 FROM streams WHERE runbook_id=? AND name=?",(task["runbook_id"],stream_name)).fetchone():
+                        order=db.execute("SELECT COALESCE(MAX(sort_order),-1)+1 FROM streams WHERE runbook_id=?",(task["runbook_id"],)).fetchone()[0]
+                        db.execute("INSERT INTO streams(runbook_id,name,sort_order,created_at) VALUES(?,?,?,?)",(task["runbook_id"],stream_name,order,now()))
+                if not changes: doc=runbook_document(db,task["runbook_id"],actor); return self.send_json({"data":doc})
+                values.append(tid)
+                db.execute(f"UPDATE tasks SET {','.join(sets)} WHERE id=?",values)
+                append_audit(db,task["runbook_id"],"task.edited",f"{task['title']}: "+"; ".join(changes),actor["display_name"])
+                db.execute("UPDATE runbooks SET updated_at=? WHERE id=?",(now(),task["runbook_id"])); doc=runbook_document(db,task["runbook_id"],actor); db.commit()
+                return self.send_json({"data":doc})
         with connect() as db:
             actor=self.require(db,"runbooks:execute")
             if not actor:return
@@ -922,6 +1056,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path=urllib.parse.urlparse(self.path).path; parts=path.strip("/").split("/")
+        if len(parts)==3 and parts[:2]==["api","streams"]:
+            try: sid=int(parts[2])
+            except ValueError: return self.send_json({"error":"Not found"},404)
+            with connect() as db:
+                actor=self.require(db,"runbooks:edit")
+                if not actor:return
+                stream=db.execute("SELECT s.* FROM streams s JOIN runbooks r ON r.id=s.runbook_id JOIN workspaces w ON w.id=r.workspace_id WHERE s.id=? AND w.instance_id=?",(sid,actor["instance_id"])).fetchone()
+                if not stream: return self.send_json({"error":"Not found"},404)
+                in_use=db.execute("SELECT COUNT(*) FROM tasks WHERE runbook_id=? AND stream=?",(stream["runbook_id"],stream["name"])).fetchone()[0]
+                if in_use: return self.send_json({"error":"Move or remove this stream's tasks before deleting it"},409)
+                db.execute("DELETE FROM streams WHERE id=?",(sid,)); append_audit(db,stream["runbook_id"],"stream.deleted",stream["name"],actor["display_name"]); doc=runbook_document(db,stream["runbook_id"],actor); db.commit()
+                return self.send_json({"data":doc})
         if len(parts)!=4 or parts[:3]!=["api","admin","users"]:return self.send_json({"error":"Not found"},404)
         try:uid=int(parts[3])
         except ValueError:return self.send_json({"error":"Not found"},404)

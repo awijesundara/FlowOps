@@ -192,6 +192,73 @@ class FlowOpsTest(unittest.TestCase):
         with patch('server.urllib.request.urlopen',approved):code,body=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
         self.assertEqual(code,200);self.assertEqual(body['data']['serviceops_state'],'In Progress');self.assertEqual([r.method for r in requests],['GET','PATCH'])
         self.assertEqual(requests[1].get_header('Idempotency-key'),f'flowops-{rid}-live');self.assertEqual(json.loads(requests[1].data),{'state':'In Progress'})
+    def test_duplicate_runbook_clones_streams_tasks_and_dependencies(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Original release'}); rid=created['data']['id']
+        _,first=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Step one','stream':'Prep','duration':10}); first_id=first['data']['tasks'][0]['id']
+        self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Step two','stream':'Prep','duration':10,'depends_on':[first_id]})
+        code,dup=self.req(f'/api/runbooks/{rid}/duplicate','POST',{})
+        self.assertEqual(code,201)
+        self.assertEqual(dup['data']['name'],'Original release (copy)')
+        self.assertNotEqual(dup['data']['id'],rid)
+        self.assertEqual(len(dup['data']['tasks']),2)
+        self.assertEqual([s['name'] for s in dup['data']['streams']],['Prep'])
+        second_new=next(t for t in dup['data']['tasks'] if t['title']=='Step two')
+        first_new=next(t for t in dup['data']['tasks'] if t['title']=='Step one')
+        self.assertEqual(second_new['depends_on'],[first_new['id']])
+        original_after=self.req(f'/api/runbooks/{rid}')[1]['data']
+        self.assertEqual(len(original_after['tasks']),2)
+    def test_archive_requires_complete_and_hides_from_default_listing(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Archivable'}); rid=created['data']['id']
+        self.assertEqual(self.req(f'/api/runbooks/{rid}/archive','POST',{})[0],409)
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'complete'})
+        code,archived=self.req(f'/api/runbooks/{rid}/archive','POST',{})
+        self.assertEqual(code,200)
+        self.assertTrue(any(a['action']=='runbook.archived' for a in archived['data']['audit']))
+        listed=self.req('/api/runbooks')[1]['data']
+        self.assertNotIn(rid,[r['id'] for r in listed])
+        listed_all=self.req('/api/runbooks?include_archived=1')[1]['data']
+        self.assertIn(rid,[r['id'] for r in listed_all])
+    def test_task_field_edit_is_audited_without_requiring_live(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Edit audit'}); rid=created['data']['id']
+        _,made=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Draft step','duration':10}); tid=made['data']['tasks'][0]['id']
+        code,edited=self.req(f'/api/tasks/{tid}','PATCH',{'title':'Renamed step','duration':20})
+        self.assertEqual(code,200)
+        self.assertEqual(edited['data']['tasks'][0]['title'],'Renamed step')
+        self.assertEqual(edited['data']['tasks'][0]['duration'],20)
+        self.assertTrue(any(a['action']=='task.edited' for a in edited['data']['audit']))
+        self.assertEqual(self.req(f'/api/tasks/{tid}','PATCH',{'title':''})[0],400)
+    def test_runbook_field_edit_is_audited_and_blocked_when_terminal(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Edit runbook'}); rid=created['data']['id']
+        code,edited=self.req(f'/api/runbooks/{rid}','PATCH',{'name':'Renamed runbook','owner':'New owner'})
+        self.assertEqual(code,200)
+        self.assertEqual(edited['data']['name'],'Renamed runbook')
+        self.assertTrue(any(a['action']=='runbook.edited' for a in edited['data']['audit']))
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'complete'})
+        self.assertEqual(self.req(f'/api/runbooks/{rid}','PATCH',{'name':'Too late'})[0],409)
+    def test_stream_create_rename_delete_and_task_auto_creates_stream(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Stream mgmt'}); rid=created['data']['id']
+        self.assertEqual(created['data']['streams'],[])
+        code,made=self.req(f'/api/runbooks/{rid}/streams','POST',{'name':'Governance'})
+        self.assertEqual(code,201)
+        self.assertEqual([s['name'] for s in made['data']['streams']],['Governance'])
+        self.assertEqual(self.req(f'/api/runbooks/{rid}/streams','POST',{'name':'Governance'})[0],409)
+        self.assertEqual(self.req(f'/api/runbooks/{rid}/streams','POST',{'name':''})[0],400)
+        _,task=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Ad hoc step','stream':'Deployment'})
+        self.assertEqual(sorted(s['name'] for s in task['data']['streams']),['Deployment','Governance'])
+        governance_id=next(s['id'] for s in task['data']['streams'] if s['name']=='Governance')
+        code,renamed=self.req(f'/api/streams/{governance_id}','PATCH',{'name':'Approvals'})
+        self.assertEqual(code,200)
+        self.assertEqual(sorted(s['name'] for s in renamed['data']['streams']),['Approvals','Deployment'])
+        deployment_id=next(s['id'] for s in renamed['data']['streams'] if s['name']=='Deployment')
+        self.assertEqual(self.req(f'/api/streams/{deployment_id}','DELETE')[0],409)
+        approvals_id=next(s['id'] for s in renamed['data']['streams'] if s['name']=='Approvals')
+        code,after_delete=self.req(f'/api/streams/{approvals_id}','DELETE')
+        self.assertEqual(code,200)
+        self.assertEqual([s['name'] for s in after_delete['data']['streams']],['Deployment'])
     def test_full_execution_and_dependency_gate(self):
         _,created=self.req('/api/runbooks','POST',{'name':'Test release'}); rid=created['data']['id']
         _,first=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'First','duration':5}); first_id=first['data']['tasks'][0]['id']
