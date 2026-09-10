@@ -2,8 +2,10 @@
 """FlowOps: dependency-aware operational runbooks with ServiceOps integration."""
 from __future__ import annotations
 
+import csv
 import hashlib
 import hmac
+import io
 import json
 import os
 import secrets
@@ -432,6 +434,47 @@ def custom_field_values_for(db: sqlite3.Connection, workspace_id: int, entity_ty
 
 def owns_runbook(db: sqlite3.Connection, rid: int, instance_id: int) -> bool:
     return bool(db.execute("SELECT 1 FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE r.id=? AND w.instance_id=?",(rid,instance_id)).fetchone())
+
+
+TASK_CSV_TYPES={"normal","milestone","checklist","validation","sms","email","call"}
+
+
+def parse_tasks_csv(csv_text: str) -> list[dict]:
+    reader=csv.DictReader(io.StringIO(csv_text))
+    if reader.fieldnames is None or "title" not in {f.strip().lower() for f in reader.fieldnames}:
+        raise ValueError("CSV must include a 'title' column")
+    field_map={f.strip().lower(): f for f in reader.fieldnames}
+    rows_out=[]
+    for raw in reader:
+        title=str(raw.get(field_map.get("title",""),"") or "").strip()[:200]
+        if not title: continue
+        task_type=str(raw.get(field_map.get("task_type",""),"") or "normal").strip().lower() or "normal"
+        if task_type not in TASK_CSV_TYPES: task_type="normal"
+        try: duration=max(0,min(int(float(raw.get(field_map.get("duration",""),"") or 15)),10080))
+        except ValueError: duration=15
+        duration=0 if task_type in {"milestone","checklist","sms","email","call"} else max(1,duration)
+        try: scheduled_offset=max(0,int(float(raw.get(field_map.get("scheduled_offset",""),"") or 0)))
+        except ValueError: scheduled_offset=0
+        rows_out.append({
+            "title": title,
+            "stream": str(raw.get(field_map.get("stream",""),"") or "").strip()[:80],
+            "description": str(raw.get(field_map.get("description",""),"") or "").strip()[:2000],
+            "automation_url": str(raw.get(field_map.get("automation_url",""),"") or "").strip()[:500],
+            "task_type": task_type,
+            "scheduled_offset": scheduled_offset,
+            "duration": duration,
+        })
+    return rows_out
+
+
+def tasks_to_csv(tasks: list[dict]) -> str:
+    buf=io.StringIO()
+    fields=["title","stream","owner","duration","task_type","scheduled_offset","status","started_at","completed_at","late","description","automation_url"]
+    writer=csv.DictWriter(buf,fieldnames=fields,extrasaction="ignore")
+    writer.writeheader()
+    for task in tasks:
+        writer.writerow({k: task[k] for k in fields})
+    return buf.getvalue()
 
 
 def append_audit(db: sqlite3.Connection, runbook_id: int | None, action: str, detail: str, actor: str = "Preview User", instance_id: int | None = None) -> None:
@@ -964,6 +1007,13 @@ class Handler(BaseHTTPRequestHandler):
                         team["members"]=rows(db.execute(f"SELECT id,display_name,email FROM users WHERE id IN ({','.join('?'*len(member_ids)) or 'NULL'}) ORDER BY display_name",tuple(member_ids))) if member_ids else []
                         team["member_count"]=len(member_ids)
                     return self.send_json({"data":teams})
+                if len(parts)==4 and parts[3]=="tasks.csv":
+                    doc=runbook_document(db,rid,user)
+                    csv_body=tasks_to_csv(doc["tasks"] if doc else [])
+                    self.send_response(200); self.send_header("Content-Type","text/csv; charset=utf-8")
+                    self.send_header("Content-Disposition",f'attachment; filename="runbook-{rid}-tasks.csv"')
+                    self.send_header("Content-Length",str(len(csv_body.encode())))
+                    self.end_headers(); self.wfile.write(csv_body.encode()); return
                 if len(parts)!=3:return self.send_json({"error":"Not found"},404)
                 doc=runbook_document(db,rid,user)
                 return self.send_json({"data":doc} if doc else {"error":"Not found"},200 if doc else 404)
@@ -1341,6 +1391,24 @@ class Handler(BaseHTTPRequestHandler):
                         if db.execute("SELECT 1 FROM tasks WHERE id=? AND runbook_id=?",(dep,rid)).fetchone(): db.execute("INSERT OR IGNORE INTO dependencies VALUES(?,?)",(cur.lastrowid,dep))
                     append_audit(db,rid,"task.created",title,actor["display_name"]); db.execute("UPDATE runbooks SET updated_at=? WHERE id=?",(now(),rid)); doc=runbook_document(db,rid,actor); db.commit()
                     return self.send_json({"data":doc},201)
+                if len(parts)==4 and parts[3]=="tasks-import":
+                    actor=self.require(db,"runbooks:edit")
+                    if not actor:return
+                    csv_text=str(payload.get("csv",""))
+                    try: parsed=parse_tasks_csv(csv_text)
+                    except ValueError as exc: return self.send_json({"error":str(exc)},400)
+                    if not parsed: return self.send_json({"error":"No task rows found in CSV"},400)
+                    order=db.execute("SELECT COALESCE(MAX(sort_order),-1)+1 FROM tasks WHERE runbook_id=?",(rid,)).fetchone()[0]
+                    created=0
+                    for row in parsed:
+                        stream=row["stream"] or "General"
+                        if not db.execute("SELECT 1 FROM streams WHERE runbook_id=? AND name=?",(rid,stream)).fetchone():
+                            stream_order=db.execute("SELECT COALESCE(MAX(sort_order),-1)+1 FROM streams WHERE runbook_id=?",(rid,)).fetchone()[0]
+                            db.execute("INSERT INTO streams(runbook_id,name,sort_order,created_at) VALUES(?,?,?,?)",(rid,stream,stream_order,now()))
+                        db.execute("INSERT INTO tasks(runbook_id,title,description,stream,owner,duration,sort_order,automation_url,task_type,scheduled_offset) VALUES(?,?,?,?,?,?,?,?,?,?)",(rid,row["title"],row["description"],stream,"",row["duration"],order,row["automation_url"] or None,row["task_type"],row["scheduled_offset"]))
+                        order+=1; created+=1
+                    append_audit(db,rid,"task.csv_imported",f"{created} tasks",actor["display_name"]); db.execute("UPDATE runbooks SET updated_at=? WHERE id=?",(now(),rid)); doc=runbook_document(db,rid,actor); db.commit()
+                    return self.send_json({"data":doc,"imported":created},201)
                 if len(parts)==4 and parts[3]=="streams":
                     actor=self.require(db,"runbooks:edit")
                     if not actor:return

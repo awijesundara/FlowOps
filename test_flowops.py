@@ -601,5 +601,28 @@ class FlowOpsTest(unittest.TestCase):
             if line=='event: workspace':
                 payload=json.loads(stream.readline().decode().removeprefix('data: ').strip());break
         stream.close(); self.assertIn('event: workspace',lines);self.assertEqual(payload['action'],'runbook.created');self.assertEqual(payload['actor'],'Anushka')
+    def test_task_csv_import_creates_tasks_and_backfills_unknown_type_to_normal(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'CSV import target'}); rid=created['data']['id']
+        csv_text='title,stream,duration,task_type,scheduled_offset,description\nRestore snapshot,Database,30,normal,0,Restore from last good backup\nVerify integrity,Database,15,bogus_type,30,\nGo live milestone,Cutover,,milestone,60,'
+        code,body=self.req(f'/api/runbooks/{rid}/tasks-import','POST',{'csv':csv_text})
+        self.assertEqual(code,201); self.assertEqual(body['imported'],3)
+        tasks={t['title']:t for t in body['data']['tasks']}
+        self.assertEqual(tasks['Restore snapshot']['duration'],30)
+        self.assertEqual(tasks['Verify integrity']['task_type'],'normal')
+        self.assertEqual(tasks['Go live milestone']['task_type'],'milestone'); self.assertEqual(tasks['Go live milestone']['duration'],0)
+    def test_task_csv_import_rejects_csv_missing_title_column(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'CSV import rejects bad header'}); rid=created['data']['id']
+        code,body=self.req(f'/api/runbooks/{rid}/tasks-import','POST',{'csv':'name,duration\nSomething,10'})
+        self.assertEqual(code,400); self.assertIn('title',body['error'])
+    def test_task_csv_export_returns_downloadable_csv_with_current_task_state(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'CSV export source'}); rid=created['data']['id']
+        self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Exportable task','stream':'Ops','duration':20})
+        request=urllib.request.Request(f'{self.base}/api/runbooks/{rid}/tasks.csv',headers={'X-CSRF-Token':self.csrf})
+        with self.opener.open(request) as res:
+            self.assertEqual(res.status,200); self.assertIn('text/csv',res.headers['Content-Type'])
+            self.assertIn('attachment',res.headers['Content-Disposition'])
+            body=res.read().decode()
+        self.assertIn('title,stream,owner,duration',body.splitlines()[0])
+        self.assertIn('Exportable task,Ops,,20',body)
 
 if __name__=='__main__': unittest.main()

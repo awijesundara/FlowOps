@@ -164,8 +164,19 @@ managing central teams or linking one into a runbook yet.
 
 | Story | Priority | Size | Status |
 |---|---:|---:|---:|
-| Import tasks from CSV | P1 | M | BACKLOG |
+| Import tasks from CSV | P1 | M | DONE |
 | Bulk-edit owner or timing | P2 | M | BACKLOG |
+
+Import tasks from CSV: `DONE`. `POST /api/runbooks/{id}/tasks-import` accepts
+a raw CSV body (`title` column required; `stream`, `duration`, `task_type`,
+`scheduled_offset`, `description`, `automation_url` optional), auto-creates
+any streams referenced that don't already exist, and falls back an unknown
+`task_type` to `normal` rather than rejecting the row. Covered by
+`test_task_csv_import_creates_tasks_and_backfills_unknown_type_to_normal`
+and `test_task_csv_import_rejects_csv_missing_title_column`. Runbook detail
+view has an "Import CSV" button (Editor/Admin only, gated on
+`runbooks:edit`) that reads a local file and posts it. Bulk-edit owner or
+timing across many tasks in one action remains `BACKLOG`.
 
 ### Epic 2.6 — Node Map
 
@@ -295,7 +306,15 @@ linking exists yet -- API only, same disclosed pattern as Epics 2.4/3.2.
 ### Epic 4.2 — Dashboards and Reporting
 
 Configurable multi-runbook dashboard (P0/L): `PARTIAL`. Post-event timing and
-delay report (P1/M), CSV/PDF export (P1/S): `BACKLOG`.
+delay report (P1/M): `BACKLOG`. CSV export (P1/S): `DONE` at the
+per-runbook task level — `GET /api/runbooks/{id}/tasks.csv` returns every
+task's title, stream, owner, duration, type, schedule offset, live
+status/timestamps, and lateness as a downloadable CSV (reusing the same
+lateness calculation as the live view, not a separate/divergent one), wired
+to an "Export CSV" button in the runbook detail view. Covered by
+`test_task_csv_export_returns_downloadable_csv_with_current_task_state`.
+A cross-runbook multi-workspace delay report and PDF export remain
+`BACKLOG`.
 
 ### Epic 4.3 — Compliance Audit
 
