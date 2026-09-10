@@ -20,10 +20,6 @@ services:
       FLOWOPS_SMTP_PASSWORD: ${FLOWOPS_SMTP_PASSWORD:-}
       FLOWOPS_MAIL_FROM: ${FLOWOPS_MAIL_FROM:-}
       SERVICEOPS_URL: ${SERVICEOPS_URL:-http://host.docker.internal:8080}
-      SERVICEOPS_TOKEN: ${SERVICEOPS_TOKEN:-}
-      JENKINS_URL: ${JENKINS_URL:-}
-      JENKINS_USER: ${JENKINS_USER:-flowops}
-      JENKINS_TOKEN: ${JENKINS_TOKEN:-}
     volumes:
       - flowops-data:/data
     extra_hosts:

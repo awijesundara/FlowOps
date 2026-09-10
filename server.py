@@ -296,8 +296,7 @@ def integration_credential(db: sqlite3.Connection, instance_id: int, provider: s
     if row:
         try:return settings_cipher().decrypt(row[0].encode()).decode(),"Encrypted FlowOps setting"
         except (InvalidToken,RuntimeError,UnicodeDecodeError) as exc:raise RuntimeError(f"The stored {provider.title()} credential cannot be decrypted") from exc
-    variable="SERVICEOPS_TOKEN"
-    return os.getenv(variable,""),variable
+    return "","Not configured in FlowOps"
 
 
 def owns_runbook(db: sqlite3.Connection, rid: int, instance_id: int) -> bool:
@@ -342,12 +341,30 @@ def runbook_document(db: sqlite3.Connection, rid: int, user: dict[str,Any] | Non
         task["depends_on"] = dep_map.get(task["id"], [])
         task["blocked"] = task["status"] == "pending" and any(next((x["status"] for x in all_tasks if x["id"] == d), "pending") not in {"complete","skipped"} for d in task["depends_on"])
         task["owner_display"] = task["owner_user_name"] or task["owner_team_name"] or task["owner"] or "Unassigned"
+    # Earliest-possible-start offset per task, derived from its longest
+    # predecessor chain (not the unused, always-zero scheduled_offset column):
+    # a task blocked behind 90 minutes of prior work cannot be late the
+    # instant the runbook's overall start time passes -- it becomes late
+    # only once its own dependency chain's planned finish time passes.
+    by_id = {t["id"]: t for t in tasks}
+    earliest_start_memo: dict[int, int] = {}
+    def earliest_start(tid: int) -> int:
+        if tid in earliest_start_memo: return earliest_start_memo[tid]
+        task = by_id.get(tid)
+        if not task: return 0
+        earliest_start_memo[tid] = 0
+        offset = max((earliest_start(dep) + by_id[dep]["duration"] for dep in task["depends_on"] if dep in by_id), default=0)
+        earliest_start_memo[tid] = offset
+        return offset
+    runbook_live = rb["mode"] == "live" or bool(rb["actual_started_at"])
+    for task in tasks:
         task["late"] = False
-        if rb["scheduled_at"] and task["status"] not in {"complete","skipped"}:
+        if runbook_live and rb["scheduled_at"] and task["status"] not in {"complete","skipped"} and not task["blocked"]:
             try:
                 scheduled=datetime.fromisoformat(rb["scheduled_at"])
                 if scheduled.tzinfo is None: scheduled=scheduled.replace(tzinfo=timezone.utc)
-                task["late"] = datetime.now(timezone.utc).timestamp() > scheduled.timestamp() + (task["scheduled_offset"]+task["duration"])*60
+                offset = earliest_start(task["id"])
+                task["late"] = datetime.now(timezone.utc).timestamp() > scheduled.timestamp() + (offset+task["duration"])*60
             except ValueError: pass
     doc["tasks"] = tasks
     doc["comments"] = rows(db.execute("SELECT * FROM comments WHERE runbook_id=? ORDER BY id DESC", (rid,)))
@@ -761,7 +778,7 @@ class Handler(BaseHTTPRequestHandler):
                 provider=str(payload.get("provider","")).lower()
                 if provider != "serviceops":return self.send_json({"error":"Provider must be serviceops"},400)
                 if path.endswith("/test"):
-                    return self.test_integration(db,provider,actor)
+                    return self.test_integration(db,provider,actor,payload)
                 allowed={"enabled","url","sync_on_live","sync_on_complete","require_approved","trigger_workflow"}
                 if "secret" in payload or "token" in payload:return self.send_json({"error":"Use the one-way credential field; secrets are never returned to the browser"},400)
                 submitted=str(payload.get("credential","")).strip();revoke=payload.get("revoke_credential") is True
@@ -971,15 +988,19 @@ class Handler(BaseHTTPRequestHandler):
         self.store_serviceops_ticket(db,rid,remote,request_id);append_audit(db,rid,"serviceops.synced",f"Linked {ticket}");doc=runbook_document(db,rid);db.commit()
         return self.send_json({"data":doc,"serviceops":remote,"request_id":request_id})
 
-    def test_integration(self, db, provider, actor):
+    def test_integration(self, db, provider, actor, overrides=None):
+        overrides=overrides or {}
         values={r["key"]:r["value"] for r in db.execute("SELECT key,value FROM instance_settings WHERE instance_id=? AND key LIKE ?",(actor["instance_id"],f"{provider}_%"))}
-        base=values.get(f"{provider}_url","").rstrip("/")
-        try:token,_=integration_credential(db,actor["instance_id"],provider)
-        except RuntimeError as exc:return self.send_json({"error":str(exc)},503)
+        base=str(overrides.get("url") or values.get(f"{provider}_url","")).strip().rstrip("/")
+        token=str(overrides.get("credential") or "").strip()
+        testing_unsaved_credential=bool(token)
+        if not token:
+            try:token,_=integration_credential(db,actor["instance_id"],provider)
+            except RuntimeError as exc:return self.send_json({"error":str(exc)},503)
         if not base:return self.send_json({"error":"Configure the ServiceOps connection URL first"},400)
         if not token:return self.send_json({"error":"Paste a ServiceOps API key, save the connection, then test again"},400)
         if base.startswith("mock://"):
-            result={"ok":True,"provider":provider,"latency_ms":12,"message":"ServiceOps REST API v1 verified","credential_configured":True,"verified_scopes":["tickets:read"]}
+            result={"ok":True,"provider":provider,"latency_ms":12,"message":"ServiceOps REST API v1 verified","credential_configured":True,"tested_unsaved_credential":testing_unsaved_credential,"verified_scopes":["tickets:read"]}
         else:
             endpoint=(base if base.endswith("/api/v1") else f"{base}/api/v1")+"/tickets?limit=1"
             headers={"Accept":"application/json","Authorization":f"Bearer {token}"}
@@ -995,7 +1016,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"error":f"ServiceOps returned HTTP {exc.code}"},502)
             except (urllib.error.URLError,TimeoutError):return self.send_json({"error":"ServiceOps is unreachable from FlowOps"},502)
             except json.JSONDecodeError:return self.send_json({"error":"ServiceOps returned invalid JSON"},502)
-            result={"ok":True,"provider":provider,"latency_ms":round((time.monotonic()-started)*1000),"message":"ServiceOps REST API v1 and tickets:read verified","credential_configured":True,"verified_scopes":["tickets:read"],"required_for_lifecycle":["tickets:update"],"required_for_workflows":["workflows:execute"]}
+            result={"ok":True,"provider":provider,"latency_ms":round((time.monotonic()-started)*1000),"message":"ServiceOps REST API v1 and tickets:read verified","credential_configured":True,"tested_unsaved_credential":testing_unsaved_credential,"verified_scopes":["tickets:read"],"required_for_lifecycle":["tickets:update"],"required_for_workflows":["workflows:execute"]}
         append_audit(db,None,"integration.tested",f"{provider}: {result['message']}",actor["display_name"],actor["instance_id"]);db.commit()
         return self.send_json({"data":result})
 
