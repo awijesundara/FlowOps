@@ -192,6 +192,16 @@ class FlowOpsTest(unittest.TestCase):
         with patch('server.urllib.request.urlopen',approved):code,body=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
         self.assertEqual(code,200);self.assertEqual(body['data']['serviceops_state'],'In Progress');self.assertEqual([r.method for r in requests],['GET','PATCH'])
         self.assertEqual(requests[1].get_header('Idempotency-key'),f'flowops-{rid}-live');self.assertEqual(json.loads(requests[1].data),{'state':'In Progress'})
+    def test_audit_export_is_checksummed_and_chain_verified(self):
+        self.req('/api/runbooks','POST',{'name':'Audit export check'})
+        code,exported=self.req('/api/admin/audit/export')
+        self.assertEqual(code,200)
+        self.assertTrue(exported['data']['chain_verified'])
+        self.assertGreater(exported['data']['count'],0)
+        recomputed='sha256:'+__import__('hashlib').sha256(json.dumps(exported['data']['events'],sort_keys=True,separators=(',',':')).encode()).hexdigest()
+        self.assertEqual(exported['data']['checksum'],recomputed)
+        _,recent=self.req('/api/admin/audit')
+        self.assertTrue(any(e['action']=='audit.exported' for e in recent['data']))
     def test_linked_runbooks_aggregate_child_status_and_progress(self):
         _,parent=self.req('/api/runbooks','POST',{'name':'Parent migration'}); parent_id=parent['data']['id']
         _,childA=self.req('/api/runbooks','POST',{'name':'Wave A'}); child_a_id=childA['data']['id']

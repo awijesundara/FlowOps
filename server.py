@@ -835,6 +835,21 @@ class Handler(BaseHTTPRequestHandler):
                 actor=self.require(db,"admin:access")
                 if not actor:return
                 return self.send_json({"data":rows(db.execute("SELECT id,runbook_id,action,detail,actor,created_at,event_hash FROM audit WHERE instance_id=? ORDER BY id DESC LIMIT 250",(actor["instance_id"],)))})
+            if path=="/api/admin/audit/export":
+                actor=self.require(db,"admin:access")
+                if not actor:return
+                events=rows(db.execute("SELECT id,runbook_id,action,detail,actor,created_at,previous_hash,event_hash FROM audit WHERE instance_id=? ORDER BY id ASC",(actor["instance_id"],)))
+                chain_verified=True
+                previous="GENESIS"
+                for event in events:
+                    if event["previous_hash"]!=previous: chain_verified=False; break
+                    expected=hashlib.sha256(f"{previous}|{event['runbook_id']}|{event['action']}|{event['detail']}|{event['actor']}|{event['created_at']}".encode()).hexdigest()
+                    if expected!=event["event_hash"]: chain_verified=False; break
+                    previous=event["event_hash"]
+                export_body=json.dumps(events,sort_keys=True,separators=(",",":"))
+                checksum=hashlib.sha256(export_body.encode()).hexdigest()
+                append_audit(db,None,"audit.exported",f"{len(events)} events, chain_verified={chain_verified}",actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"events":events,"count":len(events),"exported_at":now(),"chain_verified":chain_verified,"checksum":f"sha256:{checksum}"}})
             if path=="/api/admin/health":
                 actor=self.require(db,"admin:access")
                 if not actor:return

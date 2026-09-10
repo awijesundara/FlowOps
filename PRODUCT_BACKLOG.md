@@ -299,8 +299,17 @@ delay report (P1/M), CSV/PDF export (P1/S): `BACKLOG`.
 
 ### Epic 4.3 — Compliance Audit
 
-Immutable-by-policy audit (P0/L): `PARTIAL`. Checksummed export (P1/M) and
-configurable retention (P1/M): `BACKLOG`.
+Immutable-by-policy audit (P0/L): `PARTIAL`. Checksummed export (P1/M):
+`DONE`. `GET /api/admin/audit/export` returns every audit event for the
+tenant, walks the existing hash chain server-side before returning
+(`previous_hash`/`event_hash`, already used for tamper-evidence) and
+reports `chain_verified: true/false`, plus a `sha256:` checksum computed
+over the canonical serialization of the exported events array -- a
+recipient can re-serialize `data.events` the same way
+(`json.dumps(events, sort_keys=True, separators=(',',':'))`) and confirm
+the export matches `data.checksum`. The export action is itself audited.
+Regression test recomputes the checksum independently and confirms it
+matches. Configurable retention (P1/M): `BACKLOG`.
 
 ### Epic 4.4 — Security Hardening
 
