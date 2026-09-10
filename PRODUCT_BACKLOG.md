@@ -52,14 +52,14 @@ mutation attempts return not found; regression coverage is in
 | Admin creates a workspace | P0 | S | DONE |
 | Editor creates a runbook inside a workspace | P0 | M | DONE |
 | Editor sets runbook name and scheduled start | P0 | S | DONE |
-| Editor duplicates a runbook | P1 | S | BACKLOG |
-| Editor archives a completed runbook | P1 | S | BACKLOG |
+| Editor duplicates a runbook | P1 | S | DONE |
+| Editor archives a completed runbook | P1 | S | DONE |
 
 ### Epic 1.3 — Streams and Tasks
 
 | Story | Priority | Size | Status |
 |---|---:|---:|---:|
-| Editor creates streams within a runbook | P0 | S | PARTIAL |
+| Editor creates streams within a runbook | P0 | S | DONE |
 | Editor creates a task with description, owner, start, and duration | P0 | M | DONE |
 | Editor sets task dependencies | P0 | L | DONE |
 | Dependencies block task start until predecessors finish | P0 | M | DONE |
@@ -93,7 +93,7 @@ manual refresh; concurrency must be load-tested before building later phases.
 
 | Story | Priority | Size | Status |
 |---|---:|---:|---:|
-| Every task status/edit is logged with timestamp and actor | P0 | M | PARTIAL |
+| Every task status/edit is logged with timestamp and actor | P0 | M | DONE |
 | Admin views the audit log for one runbook | P1 | S | DONE |
 
 Exit: a real team plans dependencies, executes live, receives real-time state,
@@ -253,8 +253,8 @@ compliance-grade evidence.
 
 ## Current Delivery Focus
 
-1. Finish Phase 1 Epic 1.3 P0: first-class stream creation and stream edits.
-2. Finish Phase 1 Epic 1.6 P0: audit every task and runbook edit, not only transitions.
+1. ~~Finish Phase 1 Epic 1.3 P0: first-class stream creation and stream edits.~~ Done 2026-09-10: dedicated `streams` table, create/rename/delete API and UI, existing task streams backfilled.
+2. ~~Finish Phase 1 Epic 1.6 P0: audit every task and runbook edit, not only transitions.~~ Done 2026-09-10: added field-edit endpoints (`PATCH /api/tasks/{id}` without `status`, `PATCH /api/runbooks/{id}`) audited as `task.edited`/`runbook.edited`, usable independent of live/status gating; dedicated edit UI (vs. API-only) remains a follow-up.
 3. Validate Phase 1 with dependency/scheduling breadth and real-time load evidence.
 4. Complete the core execution UI accessibility review before Phase 1 exit.
 
