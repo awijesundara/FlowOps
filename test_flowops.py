@@ -192,6 +192,29 @@ class FlowOpsTest(unittest.TestCase):
         with patch('server.urllib.request.urlopen',approved):code,body=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
         self.assertEqual(code,200);self.assertEqual(body['data']['serviceops_state'],'In Progress');self.assertEqual([r.method for r in requests],['GET','PATCH'])
         self.assertEqual(requests[1].get_header('Idempotency-key'),f'flowops-{rid}-live');self.assertEqual(json.loads(requests[1].data),{'state':'In Progress'})
+    def test_folder_scopes_runbooks_and_blocks_deletion_while_in_use(self):
+        code,folder=self.req('/api/folders','POST',{'name':'Q3 Releases'})
+        self.assertEqual(code,201); folder_id=folder['data']['id']
+        self.assertEqual(self.req('/api/folders','POST',{'name':'Q3 Releases'})[0],409)
+        _,created=self.req('/api/runbooks','POST',{'name':'Foldered run','folder_id':folder_id})
+        self.assertEqual(created['data']['folder_id'],folder_id)
+        _,other=self.req('/api/runbooks','POST',{'name':'Unfoldered run'})
+        scoped=self.req(f'/api/runbooks?folder_id={folder_id}')[1]['data']
+        self.assertEqual([r['id'] for r in scoped],[created['data']['id']])
+        _,folders=self.req('/api/folders')
+        self.assertTrue(any(f['id']==folder_id and f['runbook_count']==1 for f in folders['data']))
+        self.assertEqual(self.req(f'/api/folders/{folder_id}','DELETE')[0],409)
+    def test_runbook_type_default_description_applies_when_creating_without_one(self):
+        code,rtype=self.req('/api/runbook-types','POST',{'name':'Disaster Recovery','icon':'⌁','color':'#e5793a','default_description':'Declare, fail over, validate, and recover service.'})
+        self.assertEqual(code,201); type_id=rtype['data']['id']
+        self.assertEqual(self.req('/api/runbook-types','POST',{'name':'Disaster Recovery'})[0],409)
+        _,created=self.req('/api/runbooks','POST',{'name':'DR drill','runbook_type_id':type_id})
+        self.assertEqual(created['data']['description'],'Declare, fail over, validate, and recover service.')
+        _,custom=self.req('/api/runbooks','POST',{'name':'DR drill 2','runbook_type_id':type_id,'description':'Custom description'})
+        self.assertEqual(custom['data']['description'],'Custom description')
+        _,types=self.req('/api/runbook-types')
+        self.assertTrue(any(t['id']==type_id and t['runbook_count']==2 for t in types['data']))
+        self.assertEqual(self.req(f'/api/runbook-types/{type_id}','DELETE')[0],409)
     def test_save_and_use_template_clones_streams_tasks_and_dependencies(self):
         _,created=self.req('/api/runbooks','POST',{'name':'Template source'}); rid=created['data']['id']
         _,first=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Prep','stream':'Setup','duration':10}); first_id=first['data']['tasks'][0]['id']
