@@ -174,6 +174,22 @@ def init_db() -> None:
           id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE COLLATE NOCASE,
           name TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS templates (
+          id INTEGER PRIMARY KEY, workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', category TEXT NOT NULL DEFAULT 'General',
+          created_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS template_tasks (
+          id INTEGER PRIMARY KEY, template_id INTEGER NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
+          title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', stream TEXT NOT NULL DEFAULT 'General',
+          duration INTEGER NOT NULL DEFAULT 15, sort_order INTEGER NOT NULL DEFAULT 0,
+          automation_url TEXT, task_type TEXT NOT NULL DEFAULT 'normal', scheduled_offset INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS template_dependencies (
+          template_task_id INTEGER NOT NULL REFERENCES template_tasks(id) ON DELETE CASCADE,
+          depends_on_template_task_id INTEGER NOT NULL REFERENCES template_tasks(id) ON DELETE CASCADE,
+          PRIMARY KEY(template_task_id, depends_on_template_task_id)
+        );
         CREATE TABLE IF NOT EXISTS instance_settings (
           instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
           key TEXT NOT NULL, value TEXT NOT NULL, updated_at TEXT NOT NULL,
@@ -604,6 +620,11 @@ class Handler(BaseHTTPRequestHandler):
                 actor=self.require(db,"runbooks:view")
                 if not actor: return
                 return self.send_json({"data":rows(db.execute("SELECT id,name,description,color FROM workspaces WHERE active=1 AND instance_id=? ORDER BY name",(actor["instance_id"],)))})
+            if path=="/api/templates":
+                actor=self.require(db,"runbooks:view")
+                if not actor: return
+                items=rows(db.execute("SELECT t.*,COUNT(tt.id) task_count FROM templates t JOIN workspaces w ON w.id=t.workspace_id LEFT JOIN template_tasks tt ON tt.template_id=t.id WHERE w.instance_id=? GROUP BY t.id ORDER BY t.category,t.name",(actor["instance_id"],)))
+                return self.send_json({"data":items})
             if path=="/api/runbooks":
                 actor=self.require(db,"runbooks:view")
                 if not actor: return
@@ -825,6 +846,32 @@ class Handler(BaseHTTPRequestHandler):
                 append_audit(db,cur.lastrowid,"runbook.created",name,actor["display_name"]); doc=runbook_document(db,cur.lastrowid); db.commit()
                 return self.send_json({"data":doc},201)
             parts=path.strip("/").split("/")
+            if len(parts)==4 and parts[:2]==["api","templates"] and parts[3]=="use":
+                actor=self.require(db,"runbooks:edit")
+                if not actor:return
+                try: template_id=int(parts[2])
+                except ValueError: return self.send_json({"error":"Not found"},404)
+                template=db.execute("SELECT t.* FROM templates t JOIN workspaces w ON w.id=t.workspace_id WHERE t.id=? AND w.instance_id=?",(template_id,actor["instance_id"])).fetchone()
+                if not template: return self.send_json({"error":"Not found"},404)
+                name=str(payload.get("name","")).strip() or template["name"]
+                workspace_id=int(payload.get("workspace_id") or template["workspace_id"])
+                if not db.execute("SELECT 1 FROM workspaces WHERE id=? AND active=1 AND instance_id=?",(workspace_id,actor["instance_id"])).fetchone():
+                    return self.send_json({"error":"Select an active workspace"},400)
+                stamp=now()
+                cur=db.execute("INSERT INTO runbooks(name,description,owner,scheduled_at,workspace_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",(name[:160],template["description"],str(payload.get("owner",""))[:120],payload.get("scheduled_at") or None,workspace_id,stamp,stamp))
+                new_rid=cur.lastrowid
+                for s in db.execute("SELECT DISTINCT stream FROM template_tasks WHERE template_id=? ORDER BY sort_order",(template_id,)):
+                    order=db.execute("SELECT COALESCE(MAX(sort_order),-1)+1 FROM streams WHERE runbook_id=?",(new_rid,)).fetchone()[0]
+                    db.execute("INSERT OR IGNORE INTO streams(runbook_id,name,sort_order,created_at) VALUES(?,?,?,?)",(new_rid,s["stream"],order,stamp))
+                id_map={}
+                for t in db.execute("SELECT * FROM template_tasks WHERE template_id=? ORDER BY sort_order",(template_id,)):
+                    new_tid=db.execute("INSERT INTO tasks(runbook_id,title,description,stream,owner,duration,sort_order,automation_url,task_type,scheduled_offset) VALUES(?,?,?,?,?,?,?,?,?,?)",(new_rid,t["title"],t["description"],t["stream"],"",t["duration"],t["sort_order"],t["automation_url"],t["task_type"],t["scheduled_offset"])).lastrowid
+                    id_map[t["id"]]=new_tid
+                for dep in db.execute("SELECT template_task_id,depends_on_template_task_id FROM template_dependencies td JOIN template_tasks tt ON tt.id=td.template_task_id WHERE tt.template_id=?",(template_id,)):
+                    if dep["template_task_id"] in id_map and dep["depends_on_template_task_id"] in id_map:
+                        db.execute("INSERT INTO dependencies VALUES(?,?)",(id_map[dep["template_task_id"]],id_map[dep["depends_on_template_task_id"]]))
+                append_audit(db,new_rid,"runbook.created",f"Created from template: {template['name']}",actor["display_name"]); doc=runbook_document(db,new_rid,actor); db.commit()
+                return self.send_json({"data":doc},201)
             if len(parts)>=3 and parts[:2]==["api","runbooks"]:
                 try: rid=int(parts[2])
                 except ValueError: return self.send_json({"error":"Not found"},404)
@@ -922,6 +969,24 @@ class Handler(BaseHTTPRequestHandler):
                             db.execute("INSERT INTO dependencies VALUES(?,?)",(id_map[dep["task_id"]],id_map[dep["depends_on_id"]]))
                     append_audit(db,new_rid,"runbook.duplicated",f"Duplicated from {source['name']}",actor["display_name"]); doc=runbook_document(db,new_rid,actor); db.commit()
                     return self.send_json({"data":doc},201)
+                if len(parts)==4 and parts[3]=="save-as-template":
+                    actor=self.require(db,"runbooks:edit")
+                    if not actor:return
+                    name=str(payload.get("name","")).strip()
+                    if not name or len(name)>160: return self.send_json({"error":"Template name is required (maximum 160 characters)"},400)
+                    source=db.execute("SELECT * FROM runbooks WHERE id=?",(rid,)).fetchone()
+                    stamp=now(); category=str(payload.get("category","General")).strip()[:60] or "General"
+                    cur=db.execute("INSERT INTO templates(workspace_id,name,description,category,created_by,created_at) VALUES(?,?,?,?,?,?)",(source["workspace_id"],name,str(payload.get("description",source["description"]))[:2000],category,actor["display_name"],stamp))
+                    template_id=cur.lastrowid
+                    id_map={}
+                    for t in db.execute("SELECT * FROM tasks WHERE runbook_id=? ORDER BY sort_order",(rid,)):
+                        new_tid=db.execute("INSERT INTO template_tasks(template_id,title,description,stream,duration,sort_order,automation_url,task_type,scheduled_offset) VALUES(?,?,?,?,?,?,?,?,?)",(template_id,t["title"],t["description"],t["stream"],t["duration"],t["sort_order"],t["automation_url"],t["task_type"],t["scheduled_offset"])).lastrowid
+                        id_map[t["id"]]=new_tid
+                    for dep in db.execute("SELECT d.task_id,d.depends_on_id FROM dependencies d JOIN tasks t ON t.id=d.task_id WHERE t.runbook_id=?",(rid,)):
+                        if dep["task_id"] in id_map and dep["depends_on_id"] in id_map:
+                            db.execute("INSERT INTO template_dependencies VALUES(?,?)",(id_map[dep["task_id"]],id_map[dep["depends_on_id"]]))
+                    append_audit(db,rid,"template.saved",name,actor["display_name"]); db.commit()
+                    return self.send_json({"data":{"id":template_id,"name":name}},201)
                 if len(parts)==4 and parts[3]=="archive":
                     actor=self.require(db,"runbooks:edit")
                     if not actor:return
@@ -1069,6 +1134,16 @@ class Handler(BaseHTTPRequestHandler):
                 if in_use: return self.send_json({"error":"Move or remove this stream's tasks before deleting it"},409)
                 db.execute("DELETE FROM streams WHERE id=?",(sid,)); append_audit(db,stream["runbook_id"],"stream.deleted",stream["name"],actor["display_name"]); doc=runbook_document(db,stream["runbook_id"],actor); db.commit()
                 return self.send_json({"data":doc})
+        if len(parts)==3 and parts[:2]==["api","templates"]:
+            try: template_id=int(parts[2])
+            except ValueError: return self.send_json({"error":"Not found"},404)
+            with connect() as db:
+                actor=self.require(db,"runbooks:edit")
+                if not actor:return
+                template=db.execute("SELECT t.* FROM templates t JOIN workspaces w ON w.id=t.workspace_id WHERE t.id=? AND w.instance_id=?",(template_id,actor["instance_id"])).fetchone()
+                if not template: return self.send_json({"error":"Not found"},404)
+                db.execute("DELETE FROM templates WHERE id=?",(template_id,)); append_audit(db,None,"template.deleted",template["name"],actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"ok":True}})
         if len(parts)!=4 or parts[:3]!=["api","admin","users"]:return self.send_json({"error":"Not found"},404)
         try:uid=int(parts[3])
         except ValueError:return self.send_json({"error":"Not found"},404)
