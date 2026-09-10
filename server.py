@@ -789,8 +789,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200); self.send_header("Content-Type","application/json; charset=utf-8")
             self.send_header("Cache-Control","no-store"); self.send_header("X-Content-Type-Options","nosniff")
             self.end_headers(); return
-        if path=="/":
-            self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8")
+        static_types={"/":"text/html; charset=utf-8","/app.js":"application/javascript; charset=utf-8","/styles.css":"text/css; charset=utf-8"}
+        if path in static_types:
+            self.send_response(200); self.send_header("Content-Type",static_types[path])
             self.send_header("Cache-Control","no-store"); self.end_headers(); return
         self.send_error(404)
 
