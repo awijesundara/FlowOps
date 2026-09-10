@@ -149,8 +149,19 @@ def init_db() -> None:
         );
         CREATE TABLE IF NOT EXISTS workspaces (
           id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-          description TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT '#3158c7',
+          description TEXT NOT NULL DEFAULT '', color TEXT NOT NULL DEFAULT '#7557e8',
           active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS folders (
+          id INTEGER PRIMARY KEY, workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, sort_order INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+          UNIQUE(workspace_id, name)
+        );
+        CREATE TABLE IF NOT EXISTS runbook_types (
+          id INTEGER PRIMARY KEY, workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, icon TEXT NOT NULL DEFAULT '◇', color TEXT NOT NULL DEFAULT '#7557e8',
+          default_description TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+          UNIQUE(workspace_id, name)
         );
         CREATE TABLE IF NOT EXISTS invitations (
           id INTEGER PRIMARY KEY, email TEXT NOT NULL, role TEXT NOT NULL,
@@ -213,6 +224,8 @@ def init_db() -> None:
         if "actual_started_at" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN actual_started_at TEXT")
         if "actual_completed_at" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN actual_completed_at TEXT")
         if "archived" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+        if "folder_id" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN folder_id INTEGER REFERENCES folders(id)")
+        if "runbook_type_id" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN runbook_type_id INTEGER REFERENCES runbook_types(id)")
         for column,definition in {
           "serviceops_type":"TEXT","serviceops_title":"TEXT","serviceops_state":"TEXT",
           "serviceops_priority":"TEXT","serviceops_synced_at":"TEXT","serviceops_request_id":"TEXT"
@@ -229,10 +242,11 @@ def init_db() -> None:
         session_columns={row[1] for row in db.execute("PRAGMA table_info(sessions)")}
         for column,definition in {"ip_address":"TEXT NOT NULL DEFAULT ''","user_agent":"TEXT NOT NULL DEFAULT ''"}.items():
             if column not in session_columns:db.execute(f"ALTER TABLE sessions ADD COLUMN {column} {definition}")
+        db.execute("UPDATE workspaces SET color='#7557e8' WHERE color='#3158c7'")
         db.execute("UPDATE users SET role='Admin' WHERE role='Administrator'")
         db.execute("UPDATE users SET role='Editor' WHERE role='Runbook Manager'")
         db.execute("UPDATE users SET role='Member' WHERE role IN ('Operator','Viewer')")
-        db.execute("INSERT OR IGNORE INTO workspaces(name,description,color,created_at,instance_id) VALUES(?,?,?,?,?)",("Resilience Operations","Production change, recovery, and release orchestration.","#3158c7",now(),default_instance))
+        db.execute("INSERT OR IGNORE INTO workspaces(name,description,color,created_at,instance_id) VALUES(?,?,?,?,?)",("Resilience Operations","Production change, recovery, and release orchestration.","#7557e8",now(),default_instance))
         default_workspace=db.execute("SELECT id FROM workspaces WHERE instance_id=? ORDER BY id LIMIT 1",(default_instance,)).fetchone()[0]
         db.execute("UPDATE runbooks SET workspace_id=? WHERE workspace_id IS NULL",(default_workspace,))
         if db.execute("SELECT COUNT(*) FROM runbooks").fetchone()[0] == 0:
@@ -620,6 +634,16 @@ class Handler(BaseHTTPRequestHandler):
                 actor=self.require(db,"runbooks:view")
                 if not actor: return
                 return self.send_json({"data":rows(db.execute("SELECT id,name,description,color FROM workspaces WHERE active=1 AND instance_id=? ORDER BY name",(actor["instance_id"],)))})
+            if path=="/api/folders":
+                actor=self.require(db,"runbooks:view")
+                if not actor: return
+                items=rows(db.execute("SELECT f.*,COUNT(r.id) runbook_count FROM folders f JOIN workspaces w ON w.id=f.workspace_id LEFT JOIN runbooks r ON r.folder_id=f.id WHERE w.instance_id=? GROUP BY f.id ORDER BY f.sort_order,f.name",(actor["instance_id"],)))
+                return self.send_json({"data":items})
+            if path=="/api/runbook-types":
+                actor=self.require(db,"runbooks:view")
+                if not actor: return
+                items=rows(db.execute("SELECT rt.*,COUNT(r.id) runbook_count FROM runbook_types rt JOIN workspaces w ON w.id=rt.workspace_id LEFT JOIN runbooks r ON r.runbook_type_id=rt.id WHERE w.instance_id=? GROUP BY rt.id ORDER BY rt.name",(actor["instance_id"],)))
+                return self.send_json({"data":items})
             if path=="/api/templates":
                 actor=self.require(db,"runbooks:view")
                 if not actor: return
@@ -628,9 +652,13 @@ class Handler(BaseHTTPRequestHandler):
             if path=="/api/runbooks":
                 actor=self.require(db,"runbooks:view")
                 if not actor: return
-                include_archived=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("include_archived",["0"])[0]=="1"
+                query=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                include_archived=query.get("include_archived",["0"])[0]=="1"
                 archived_clause="" if include_archived else "AND r.archived=0"
-                items=rows(db.execute(f"SELECT r.*,w.name workspace_name,COUNT(t.id) task_count,SUM(CASE WHEN t.status='complete' THEN 1 ELSE 0 END) done_count FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id LEFT JOIN tasks t ON t.runbook_id=r.id WHERE w.instance_id=? {archived_clause} GROUP BY r.id ORDER BY r.updated_at DESC",(actor["instance_id"],)))
+                folder_clause=""; params=[actor["instance_id"]]
+                if query.get("folder_id"):
+                    folder_clause="AND r.folder_id=?"; params.append(int(query["folder_id"][0]))
+                items=rows(db.execute(f"SELECT r.*,w.name workspace_name,f.name folder_name,rt.name runbook_type_name,rt.icon runbook_type_icon,rt.color runbook_type_color,COUNT(t.id) task_count,SUM(CASE WHEN t.status='complete' THEN 1 ELSE 0 END) done_count FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id LEFT JOIN folders f ON f.id=r.folder_id LEFT JOIN runbook_types rt ON rt.id=r.runbook_type_id LEFT JOIN tasks t ON t.runbook_id=r.id WHERE w.instance_id=? {archived_clause} {folder_clause} GROUP BY r.id ORDER BY r.updated_at DESC",params))
                 return self.send_json({"data":items})
             if path.startswith("/api/runbooks/"):
                 user=self.require(db,"runbooks:view")
@@ -703,7 +731,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     cur=db.execute("INSERT INTO instances(slug,name,created_at) VALUES(?,?,?)",(slug,organization[:160],stamp)); instance_id=cur.lastrowid
                     user_id=db.execute("INSERT INTO users(username,display_name,email,role,team,password_hash,created_at,instance_id) VALUES(?,?,?,?,?,?,?,?)",(username,display,email,"Admin","",password_hash(password),stamp,instance_id)).lastrowid
-                    db.execute("INSERT INTO workspaces(name,description,color,created_at,instance_id) VALUES(?,?,?,?,?)",("Operations","Default workspace","#3158c7",stamp,instance_id))
+                    db.execute("INSERT INTO workspaces(name,description,color,created_at,instance_id) VALUES(?,?,?,?,?)",("Operations","Default workspace","#7557e8",stamp,instance_id))
                     defaults={r["key"]:r["value"] for r in db.execute("SELECT key,value FROM instance_settings WHERE instance_id=(SELECT id FROM instances WHERE slug=?)",(DEFAULT_INSTANCE_SLUG,))}
                     for key,value in defaults.items(): db.execute("INSERT INTO instance_settings(instance_id,key,value,updated_at) VALUES(?,?,?,?)",(instance_id,key,value,stamp))
                     db.execute("INSERT INTO instance_settings(instance_id,key,value,updated_at) VALUES(?,?,?,?) ON CONFLICT(instance_id,key) DO UPDATE SET value=excluded.value",(instance_id,"workspace_name",organization[:160],stamp))
@@ -800,7 +828,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not actor:return
                 name=str(payload.get("name","")).strip()
                 if not name:return self.send_json({"error":"Workspace name is required"},400)
-                try: cur=db.execute("INSERT INTO workspaces(name,description,color,created_at,instance_id) VALUES(?,?,?,?,?)",(name,str(payload.get("description",""))[:500],str(payload.get("color","#3158c7"))[:20],now(),actor["instance_id"]))
+                try: cur=db.execute("INSERT INTO workspaces(name,description,color,created_at,instance_id) VALUES(?,?,?,?,?)",(name,str(payload.get("description",""))[:500],str(payload.get("color","#7557e8"))[:20],now(),actor["instance_id"]))
                 except sqlite3.IntegrityError:return self.send_json({"error":"That workspace already exists"},409)
                 append_audit(db,None,"admin.workspace_created",name,actor["display_name"],actor["instance_id"]); db.commit(); return self.send_json({"data":{"id":cur.lastrowid,"name":name}},201)
             if path=="/api/admin/settings":
@@ -835,6 +863,33 @@ class Handler(BaseHTTPRequestHandler):
                 credential_action="; credential rotated" if submitted else "; stored credential revoked" if revoke else ""
                 append_audit(db,None,"integration.configured",f"{provider} connection policy updated{credential_action}",actor["display_name"],actor["instance_id"]);db.commit()
                 return self.send_json({"data":{"ok":True,"provider":provider}})
+            if path=="/api/folders":
+                actor=self.require(db,"runbooks:edit")
+                if not actor:return
+                name=str(payload.get("name","")).strip()
+                if not name or len(name)>120: return self.send_json({"error":"Folder name is required (maximum 120 characters)"},400)
+                workspace_id=int(payload.get("workspace_id") or db.execute("SELECT id FROM workspaces WHERE active=1 AND instance_id=? ORDER BY id LIMIT 1",(actor["instance_id"],)).fetchone()[0])
+                if not db.execute("SELECT 1 FROM workspaces WHERE id=? AND active=1 AND instance_id=?",(workspace_id,actor["instance_id"])).fetchone():
+                    return self.send_json({"error":"Select an active workspace"},400)
+                order=db.execute("SELECT COALESCE(MAX(sort_order),-1)+1 FROM folders WHERE workspace_id=?",(workspace_id,)).fetchone()[0]
+                try: cur=db.execute("INSERT INTO folders(workspace_id,name,sort_order,created_at) VALUES(?,?,?,?)",(workspace_id,name,order,now()))
+                except sqlite3.IntegrityError: return self.send_json({"error":"That folder already exists"},409)
+                append_audit(db,None,"folder.created",name,actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"id":cur.lastrowid,"name":name}},201)
+            if path=="/api/runbook-types":
+                actor=self.require(db,"runbooks:edit")
+                if not actor:return
+                name=str(payload.get("name","")).strip()
+                if not name or len(name)>80: return self.send_json({"error":"Runbook type name is required (maximum 80 characters)"},400)
+                workspace_id=int(payload.get("workspace_id") or db.execute("SELECT id FROM workspaces WHERE active=1 AND instance_id=? ORDER BY id LIMIT 1",(actor["instance_id"],)).fetchone()[0])
+                if not db.execute("SELECT 1 FROM workspaces WHERE id=? AND active=1 AND instance_id=?",(workspace_id,actor["instance_id"])).fetchone():
+                    return self.send_json({"error":"Select an active workspace"},400)
+                icon=str(payload.get("icon","◇")).strip()[:4] or "◇"
+                color=str(payload.get("color","#7557e8")).strip()[:20] or "#7557e8"
+                try: cur=db.execute("INSERT INTO runbook_types(workspace_id,name,icon,color,default_description,created_at) VALUES(?,?,?,?,?,?)",(workspace_id,name,icon,color,str(payload.get("default_description",""))[:2000],now()))
+                except sqlite3.IntegrityError: return self.send_json({"error":"That runbook type already exists"},409)
+                append_audit(db,None,"runbook_type.created",name,actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"id":cur.lastrowid,"name":name}},201)
             if path=="/api/runbooks":
                 actor=self.require(db,"runbooks:edit")
                 if not actor:return
@@ -842,7 +897,15 @@ class Handler(BaseHTTPRequestHandler):
                 if not name or len(name)>160: return self.send_json({"error":"Name is required (maximum 160 characters)"},400)
                 workspace_id=int(payload.get("workspace_id") or db.execute("SELECT id FROM workspaces WHERE active=1 AND instance_id=? ORDER BY id LIMIT 1",(actor["instance_id"],)).fetchone()[0]); workspace=db.execute("SELECT 1 FROM workspaces WHERE id=? AND active=1 AND instance_id=?",(workspace_id,actor["instance_id"])).fetchone()
                 if not workspace:return self.send_json({"error":"Select an active workspace"},400)
-                stamp=now(); cur=db.execute("INSERT INTO runbooks(name,description,owner,scheduled_at,serviceops_ticket,workspace_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",(name,str(payload.get("description",""))[:2000],str(payload.get("owner",""))[:120],payload.get("scheduled_at") or None,str(payload.get("serviceops_ticket",""))[:40],workspace_id,stamp,stamp))
+                folder_id=int(payload["folder_id"]) if payload.get("folder_id") else None
+                if folder_id and not db.execute("SELECT 1 FROM folders WHERE id=? AND workspace_id=?",(folder_id,workspace_id)).fetchone():
+                    return self.send_json({"error":"Invalid folder"},400)
+                runbook_type_id=int(payload["runbook_type_id"]) if payload.get("runbook_type_id") else None
+                runbook_type=db.execute("SELECT * FROM runbook_types WHERE id=? AND workspace_id=?",(runbook_type_id,workspace_id)).fetchone() if runbook_type_id else None
+                if runbook_type_id and not runbook_type:
+                    return self.send_json({"error":"Invalid runbook type"},400)
+                description=str(payload.get("description","")).strip() or (runbook_type["default_description"] if runbook_type else "")
+                stamp=now(); cur=db.execute("INSERT INTO runbooks(name,description,owner,scheduled_at,serviceops_ticket,workspace_id,folder_id,runbook_type_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(name,description[:2000],str(payload.get("owner",""))[:120],payload.get("scheduled_at") or None,str(payload.get("serviceops_ticket",""))[:40],workspace_id,folder_id,runbook_type_id,stamp,stamp))
                 append_audit(db,cur.lastrowid,"runbook.created",name,actor["display_name"]); doc=runbook_document(db,cur.lastrowid); db.commit()
                 return self.send_json({"data":doc},201)
             parts=path.strip("/").split("/")
@@ -1143,6 +1206,30 @@ class Handler(BaseHTTPRequestHandler):
                 template=db.execute("SELECT t.* FROM templates t JOIN workspaces w ON w.id=t.workspace_id WHERE t.id=? AND w.instance_id=?",(template_id,actor["instance_id"])).fetchone()
                 if not template: return self.send_json({"error":"Not found"},404)
                 db.execute("DELETE FROM templates WHERE id=?",(template_id,)); append_audit(db,None,"template.deleted",template["name"],actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"ok":True}})
+        if len(parts)==3 and parts[:2]==["api","folders"]:
+            try: folder_id=int(parts[2])
+            except ValueError: return self.send_json({"error":"Not found"},404)
+            with connect() as db:
+                actor=self.require(db,"runbooks:edit")
+                if not actor:return
+                folder=db.execute("SELECT f.* FROM folders f JOIN workspaces w ON w.id=f.workspace_id WHERE f.id=? AND w.instance_id=?",(folder_id,actor["instance_id"])).fetchone()
+                if not folder: return self.send_json({"error":"Not found"},404)
+                if db.execute("SELECT COUNT(*) FROM runbooks WHERE folder_id=?",(folder_id,)).fetchone()[0]:
+                    return self.send_json({"error":"Move or remove this folder's runbooks before deleting it"},409)
+                db.execute("DELETE FROM folders WHERE id=?",(folder_id,)); append_audit(db,None,"folder.deleted",folder["name"],actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"ok":True}})
+        if len(parts)==3 and parts[:2]==["api","runbook-types"]:
+            try: type_id=int(parts[2])
+            except ValueError: return self.send_json({"error":"Not found"},404)
+            with connect() as db:
+                actor=self.require(db,"runbooks:edit")
+                if not actor:return
+                rtype=db.execute("SELECT rt.* FROM runbook_types rt JOIN workspaces w ON w.id=rt.workspace_id WHERE rt.id=? AND w.instance_id=?",(type_id,actor["instance_id"])).fetchone()
+                if not rtype: return self.send_json({"error":"Not found"},404)
+                if db.execute("SELECT COUNT(*) FROM runbooks WHERE runbook_type_id=?",(type_id,)).fetchone()[0]:
+                    return self.send_json({"error":"Reassign this type's runbooks before deleting it"},409)
+                db.execute("DELETE FROM runbook_types WHERE id=?",(type_id,)); append_audit(db,None,"runbook_type.deleted",rtype["name"],actor["display_name"],actor["instance_id"]); db.commit()
                 return self.send_json({"data":{"ok":True}})
         if len(parts)!=4 or parts[:3]!=["api","admin","users"]:return self.send_json({"error":"Not found"},404)
         try:uid=int(parts[3])

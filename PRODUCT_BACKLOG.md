@@ -126,10 +126,10 @@ and retrieves an audit trail with no automation dependency.
 
 | Story | Priority | Size | Status |
 |---|---:|---:|---:|
-| Workspace folders | P0 | S | BACKLOG |
-| Custom runbook types with name, icon, and color | P1 | M | BACKLOG |
+| Workspace folders | P0 | S | DONE |
+| Custom runbook types with name, icon, and color | P1 | M | DONE |
 | Approval flow attached to runbook type | P1 | L | BACKLOG |
-| Creator selects a runbook type and inherits defaults | P0 | S | BACKLOG |
+| Creator selects a runbook type and inherits defaults | P0 | S | DONE |
 
 ### Epic 2.3 — Templates
 
