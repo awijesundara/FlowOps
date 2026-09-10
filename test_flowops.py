@@ -192,6 +192,32 @@ class FlowOpsTest(unittest.TestCase):
         with patch('server.urllib.request.urlopen',approved):code,body=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
         self.assertEqual(code,200);self.assertEqual(body['data']['serviceops_state'],'In Progress');self.assertEqual([r.method for r in requests],['GET','PATCH'])
         self.assertEqual(requests[1].get_header('Idempotency-key'),f'flowops-{rid}-live');self.assertEqual(json.loads(requests[1].data),{'state':'In Progress'})
+    def test_custom_fields_typed_definitions_and_values_on_runbooks_and_tasks(self):
+        code,textField=self.req('/api/custom-fields','POST',{'name':'Change ticket','entity_type':'runbook','field_type':'text'})
+        self.assertEqual(code,201); text_field_id=textField['data']['id']
+        code,selectField=self.req('/api/custom-fields','POST',{'name':'Risk level','entity_type':'runbook','field_type':'select','options':['Low','Medium','High']})
+        self.assertEqual(code,201); select_field_id=selectField['data']['id']
+        code,taskField=self.req('/api/custom-fields','POST',{'name':'Verified by QA','entity_type':'task','field_type':'boolean'})
+        self.assertEqual(code,201); task_field_id=taskField['data']['id']
+        self.assertEqual(self.req('/api/custom-fields','POST',{'name':'Change ticket','entity_type':'runbook','field_type':'text'})[0],409)
+        self.assertEqual(self.req('/api/custom-fields','POST',{'name':'Bad type','entity_type':'runbook','field_type':'not-a-type'})[0],400)
+        _,listed=self.req('/api/custom-fields?entity_type=runbook')
+        self.assertEqual({f['name'] for f in listed['data']},{'Change ticket','Risk level'})
+        _,created=self.req('/api/runbooks','POST',{'name':'Custom field run'}); rid=created['data']['id']
+        self.assertEqual(created['data']['custom_fields'],{'Change ticket':'','Risk level':''})
+        code,updated=self.req(f'/api/runbooks/{rid}','PATCH',{'custom_fields':{text_field_id:'CHG0099','not-an-id':'ignored'}})
+        self.assertEqual(code,200)
+        self.assertEqual(updated['data']['custom_fields']['Change ticket'],'CHG0099')
+        code,invalidOption=self.req(f'/api/runbooks/{rid}','PATCH',{'custom_fields':{select_field_id:'Not a real option'}})
+        self.assertEqual(updated['data']['custom_fields']['Risk level'],'')
+        _,made=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'QA check'}); tid=made['data']['tasks'][0]['id']
+        self.assertEqual(made['data']['tasks'][0]['custom_fields'],{'Verified by QA':''})
+        code,taskUpdated=self.req(f'/api/tasks/{tid}','PATCH',{'custom_fields':{task_field_id:True}})
+        self.assertEqual(code,200)
+        self.assertEqual(taskUpdated['data']['tasks'][0]['custom_fields']['Verified by QA'],'true')
+        self.assertEqual(self.req(f'/api/custom-fields/{text_field_id}','DELETE')[0],200)
+        _,afterDelete=self.req(f'/api/runbooks/{rid}')
+        self.assertNotIn('Change ticket',afterDelete['data']['custom_fields'])
     def test_webhook_delivers_signed_payload_to_a_real_receiver(self):
         import http.server as http_server_module
         received=[]

@@ -202,7 +202,22 @@ asynchronous delivery retry remain under Epic 3.5.
 ### Epic 3.2 — Custom Fields
 
 Typed, scoped custom-field definitions (P0/M) and values on tasks/runbooks
-(P1/S) are `BACKLOG`.
+(P1/S): `DONE` (API), no admin/runbook UI yet. `custom_field_definitions`
+are workspace- and entity-type-scoped (`runbook` or `task`), typed
+(text/number/date/boolean/select with a bounded option list), and unique
+per workspace+entity_type+name. `PATCH /api/runbooks/{id}` and
+`PATCH /api/tasks/{id}` both accept an optional `custom_fields` object
+(`{definition_id: value}`) alongside their existing field edits, validated
+against the field's own type/options and silently ignoring any
+definition_id that doesn't belong to that workspace/entity_type (fails
+closed rather than trusting client-supplied IDs). Every runbook and task in
+`runbook_document()` now carries a resolved `custom_fields` map keyed by
+field name. Regression test covers definition creation/duplicate
+rejection/invalid type, setting a value from each side (runbook and task),
+an invalid select option being silently rejected rather than stored, and
+deleting a definition cascading its values away. No UI exists yet for
+defining fields or entering their values -- API only, same disclosed gap
+as Epic 2.4's central teams.
 
 ### Epic 3.3 — Predefined Integrations
 

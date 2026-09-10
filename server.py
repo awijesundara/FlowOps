@@ -195,6 +195,19 @@ def init_db() -> None:
           user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           PRIMARY KEY(team_id,user_id)
         );
+        CREATE TABLE IF NOT EXISTS custom_field_definitions (
+          id INTEGER PRIMARY KEY, workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          entity_type TEXT NOT NULL CHECK(entity_type IN ('runbook','task')), name TEXT NOT NULL,
+          field_type TEXT NOT NULL DEFAULT 'text' CHECK(field_type IN ('text','number','date','boolean','select')),
+          options_json TEXT NOT NULL DEFAULT '[]', required INTEGER NOT NULL DEFAULT 0,
+          sort_order INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+          UNIQUE(workspace_id, entity_type, name)
+        );
+        CREATE TABLE IF NOT EXISTS custom_field_values (
+          definition_id INTEGER NOT NULL REFERENCES custom_field_definitions(id) ON DELETE CASCADE,
+          entity_id INTEGER NOT NULL, value TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL,
+          PRIMARY KEY(definition_id, entity_id)
+        );
         CREATE TABLE IF NOT EXISTS webhooks (
           id INTEGER PRIMARY KEY, instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
           name TEXT NOT NULL, url TEXT NOT NULL, secret TEXT NOT NULL,
@@ -391,6 +404,28 @@ def team_member_user_ids(db: sqlite3.Connection, team_id: int) -> set[int]:
     return ids
 
 
+def apply_custom_field_values(db: sqlite3.Connection, workspace_id: int, entity_type: str, entity_id: int, values: dict) -> list[str]:
+    """Upsert {definition_id: value} for one runbook or task, scoped to
+    definitions that actually belong to this workspace and entity type.
+    Returns a list of human-readable changes for the audit trail."""
+    changes=[]
+    for definition_id, value in values.items():
+        try: definition_id=int(definition_id)
+        except (TypeError, ValueError): continue
+        definition=db.execute("SELECT * FROM custom_field_definitions WHERE id=? AND workspace_id=? AND entity_type=?",(definition_id,workspace_id,entity_type)).fetchone()
+        if not definition: continue
+        text_value=str(value)[:2000]
+        if definition["field_type"]=="select" and text_value and text_value not in json.loads(definition["options_json"] or "[]"): continue
+        if definition["field_type"]=="boolean": text_value="true" if value in (True,"true","1",1) else "false"
+        db.execute("INSERT INTO custom_field_values(definition_id,entity_id,value,updated_at) VALUES(?,?,?,?) ON CONFLICT(definition_id,entity_id) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",(definition_id,entity_id,text_value,now()))
+        changes.append(f"{definition['name']}={text_value}")
+    return changes
+
+
+def custom_field_values_for(db: sqlite3.Connection, workspace_id: int, entity_type: str, entity_id: int) -> dict:
+    return {row["name"]: row["value"] or "" for row in db.execute("SELECT cfd.name,cfv.value FROM custom_field_definitions cfd LEFT JOIN custom_field_values cfv ON cfv.definition_id=cfd.id AND cfv.entity_id=? WHERE cfd.workspace_id=? AND cfd.entity_type=?",(entity_id,workspace_id,entity_type))}
+
+
 def owns_runbook(db: sqlite3.Connection, rid: int, instance_id: int) -> bool:
     return bool(db.execute("SELECT 1 FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE r.id=? AND w.instance_id=?",(rid,instance_id)).fetchone())
 
@@ -528,6 +563,8 @@ def runbook_document(db: sqlite3.Connection, rid: int, user: dict[str,Any] | Non
     doc["comments"] = rows(db.execute("SELECT * FROM comments WHERE runbook_id=? ORDER BY id DESC", (rid,)))
     doc["teams"] = [dict(t, member_count=len(team_member_user_ids(db, t["id"]))) for t in rows(db.execute("SELECT rt.id,rt.name,rt.central_team_id,ct.name central_team_name FROM runbook_teams rt LEFT JOIN central_teams ct ON ct.id=rt.central_team_id WHERE rt.runbook_id=? ORDER BY rt.name",(rid,)))]
     doc["streams"] = rows(db.execute("SELECT s.id,s.name,s.sort_order,COUNT(t.id) task_count FROM streams s LEFT JOIN tasks t ON t.runbook_id=s.runbook_id AND t.stream=s.name WHERE s.runbook_id=? GROUP BY s.id ORDER BY s.sort_order,s.name",(rid,)))
+    doc["custom_fields"] = custom_field_values_for(db, doc["workspace_id"], "runbook", rid)
+    for task in tasks: task["custom_fields"] = custom_field_values_for(db, doc["workspace_id"], "task", task["id"])
     doc["audit"] = rows(db.execute("SELECT * FROM audit WHERE runbook_id=? ORDER BY id DESC LIMIT 100", (rid,)))
     done = sum(t["status"] == "complete" for t in tasks)
     doc["progress"] = round(done * 100 / len(tasks)) if tasks else 0
@@ -792,6 +829,15 @@ class Handler(BaseHTTPRequestHandler):
                     team["members"]=rows(db.execute("SELECT u.id,u.display_name,u.email FROM users u JOIN central_team_members ctm ON ctm.user_id=u.id WHERE ctm.team_id=? ORDER BY u.display_name",(team["id"],)))
                     team["linked_runbooks"]=db.execute("SELECT COUNT(*) FROM runbook_teams WHERE central_team_id=?",(team["id"],)).fetchone()[0]
                 return self.send_json({"data":teams})
+            if path=="/api/custom-fields":
+                actor=self.require(db,"runbooks:view")
+                if not actor: return
+                entity_type=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("entity_type",[None])[0]
+                clause="AND cfd.entity_type=?" if entity_type else ""
+                params=[actor["instance_id"]]+([entity_type] if entity_type else [])
+                items=rows(db.execute(f"SELECT cfd.* FROM custom_field_definitions cfd JOIN workspaces w ON w.id=cfd.workspace_id WHERE w.instance_id=? {clause} ORDER BY cfd.entity_type,cfd.sort_order",params))
+                for item in items: item["options"]=json.loads(item.pop("options_json") or "[]")
+                return self.send_json({"data":items})
             if path=="/api/templates":
                 actor=self.require(db,"runbooks:view")
                 if not actor: return
@@ -1097,6 +1143,24 @@ class Handler(BaseHTTPRequestHandler):
                 except sqlite3.IntegrityError: return self.send_json({"error":"That central team already exists"},409)
                 append_audit(db,None,"central_team.created",name,actor["display_name"],actor["instance_id"]); db.commit()
                 return self.send_json({"data":{"id":cur.lastrowid,"name":name}},201)
+            if path=="/api/custom-fields":
+                actor=self.require(db,"admin:users")
+                if not actor:return
+                name=str(payload.get("name","")).strip()
+                entity_type=str(payload.get("entity_type",""))
+                field_type=str(payload.get("field_type","text"))
+                if not name or len(name)>80: return self.send_json({"error":"Field name is required (maximum 80 characters)"},400)
+                if entity_type not in {"runbook","task"}: return self.send_json({"error":"entity_type must be 'runbook' or 'task'"},400)
+                if field_type not in {"text","number","date","boolean","select"}: return self.send_json({"error":"Invalid field type"},400)
+                options=[str(o)[:80] for o in payload.get("options",[]) if isinstance(o,str)][:30] if field_type=="select" else []
+                workspace_id=int(payload.get("workspace_id") or db.execute("SELECT id FROM workspaces WHERE active=1 AND instance_id=? ORDER BY id LIMIT 1",(actor["instance_id"],)).fetchone()[0])
+                if not db.execute("SELECT 1 FROM workspaces WHERE id=? AND active=1 AND instance_id=?",(workspace_id,actor["instance_id"])).fetchone():
+                    return self.send_json({"error":"Select an active workspace"},400)
+                order=db.execute("SELECT COALESCE(MAX(sort_order),-1)+1 FROM custom_field_definitions WHERE workspace_id=? AND entity_type=?",(workspace_id,entity_type)).fetchone()[0]
+                try: cur=db.execute("INSERT INTO custom_field_definitions(workspace_id,entity_type,name,field_type,options_json,required,sort_order,created_at) VALUES(?,?,?,?,?,?,?,?)",(workspace_id,entity_type,name,field_type,json.dumps(options),1 if payload.get("required") else 0,order,now()))
+                except sqlite3.IntegrityError: return self.send_json({"error":"That field already exists for this entity type"},409)
+                append_audit(db,None,"custom_field.created",f"{entity_type}: {name} ({field_type})",actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"id":cur.lastrowid,"name":name}},201)
             parts_central=path.strip("/").split("/")
             if len(parts_central)==4 and parts_central[:2]==["api","central-teams"] and parts_central[3]=="members":
                 actor=self.require(db,"admin:users")
@@ -1329,10 +1393,12 @@ class Handler(BaseHTTPRequestHandler):
                 if "scheduled_at" in payload:
                     value=payload["scheduled_at"] or None
                     if value!=runbook["scheduled_at"]: changes.append("scheduled_at changed"); sets.append("scheduled_at=?"); values.append(value)
-                if not changes: return self.send_json({"data":runbook_document(db,rid,actor)})
-                sets.append("updated_at=?"); values.append(now()); values.append(rid)
-                db.execute(f"UPDATE runbooks SET {','.join(sets)} WHERE id=?",values)
-                append_audit(db,rid,"runbook.edited","; ".join(changes),actor["display_name"]); doc=runbook_document(db,rid,actor); db.commit()
+                field_changes=apply_custom_field_values(db,runbook["workspace_id"],"runbook",rid,payload.get("custom_fields",{})) if isinstance(payload.get("custom_fields"),dict) else []
+                if not changes and not field_changes: return self.send_json({"data":runbook_document(db,rid,actor)})
+                if changes:
+                    sets.append("updated_at=?"); values.append(now()); values.append(rid)
+                    db.execute(f"UPDATE runbooks SET {','.join(sets)} WHERE id=?",values)
+                append_audit(db,rid,"runbook.edited","; ".join(changes+field_changes),actor["display_name"]); doc=runbook_document(db,rid,actor); db.commit()
                 return self.send_json({"data":doc})
         if len(parts)==3 and parts[:2]==["api","streams"]:
             try: sid=int(parts[2])
@@ -1383,10 +1449,15 @@ class Handler(BaseHTTPRequestHandler):
                     if not db.execute("SELECT 1 FROM streams WHERE runbook_id=? AND name=?",(task["runbook_id"],stream_name)).fetchone():
                         order=db.execute("SELECT COALESCE(MAX(sort_order),-1)+1 FROM streams WHERE runbook_id=?",(task["runbook_id"],)).fetchone()[0]
                         db.execute("INSERT INTO streams(runbook_id,name,sort_order,created_at) VALUES(?,?,?,?)",(task["runbook_id"],stream_name,order,now()))
-                if not changes: doc=runbook_document(db,task["runbook_id"],actor); return self.send_json({"data":doc})
-                values.append(tid)
-                db.execute(f"UPDATE tasks SET {','.join(sets)} WHERE id=?",values)
-                append_audit(db,task["runbook_id"],"task.edited",f"{task['title']}: "+"; ".join(changes),actor["display_name"])
+                field_changes=[]
+                if isinstance(payload.get("custom_fields"),dict):
+                    workspace_id=db.execute("SELECT workspace_id FROM runbooks WHERE id=?",(task["runbook_id"],)).fetchone()[0]
+                    field_changes=apply_custom_field_values(db,workspace_id,"task",tid,payload["custom_fields"])
+                if not changes and not field_changes: doc=runbook_document(db,task["runbook_id"],actor); return self.send_json({"data":doc})
+                if changes:
+                    values.append(tid)
+                    db.execute(f"UPDATE tasks SET {','.join(sets)} WHERE id=?",values)
+                append_audit(db,task["runbook_id"],"task.edited",f"{task['title']}: "+"; ".join(changes+field_changes),actor["display_name"])
                 db.execute("UPDATE runbooks SET updated_at=? WHERE id=?",(now(),task["runbook_id"])); doc=runbook_document(db,task["runbook_id"],actor); db.commit()
                 return self.send_json({"data":doc})
         with connect() as db:
@@ -1468,6 +1539,16 @@ class Handler(BaseHTTPRequestHandler):
                 if db.execute("SELECT COUNT(*) FROM runbooks WHERE runbook_type_id=?",(type_id,)).fetchone()[0]:
                     return self.send_json({"error":"Reassign this type's runbooks before deleting it"},409)
                 db.execute("DELETE FROM runbook_types WHERE id=?",(type_id,)); append_audit(db,None,"runbook_type.deleted",rtype["name"],actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"ok":True}})
+        if len(parts)==3 and parts[:2]==["api","custom-fields"]:
+            try: definition_id=int(parts[2])
+            except ValueError: return self.send_json({"error":"Not found"},404)
+            with connect() as db:
+                actor=self.require(db,"admin:users")
+                if not actor:return
+                definition=db.execute("SELECT cfd.* FROM custom_field_definitions cfd JOIN workspaces w ON w.id=cfd.workspace_id WHERE cfd.id=? AND w.instance_id=?",(definition_id,actor["instance_id"])).fetchone()
+                if not definition: return self.send_json({"error":"Not found"},404)
+                db.execute("DELETE FROM custom_field_definitions WHERE id=?",(definition_id,)); append_audit(db,None,"custom_field.deleted",f"{definition['entity_type']}: {definition['name']}",actor["display_name"],actor["instance_id"]); db.commit()
                 return self.send_json({"data":{"ok":True}})
         if len(parts)==5 and parts[:2]==["api","central-teams"] and parts[3]=="members":
             try: central_team_id=int(parts[2]); user_id=int(parts[4])
