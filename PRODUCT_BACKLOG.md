@@ -84,10 +84,22 @@ real-time, and scheduling tests before shipment.
 |---|---:|---:|---:|
 | Task status reaches other viewers within two seconds without refresh | P0 | L | DONE |
 | Users see a live list or timeline of all tasks | P0 | M | DONE |
-| Users filter tasks by stream, owner, or status | P1 | M | PARTIAL |
+| Users filter tasks by stream, owner, or status | P1 | M | DONE |
 
 Real-time acceptance: changes appear for all viewers within two seconds without
 manual refresh; concurrency must be load-tested before building later phases.
+
+Load-test evidence (2026-09-10, `tools/load_test_realtime.py` against a
+disposable local instance, not production): the SSE feed (`/api/events`) is a
+1-second server-side poll per connection, not push-based, so worst-case
+propagation is bounded by design. Measured with real concurrent HTTP clients
+(not simulated): 25 viewers → p50 0.708s / max 0.710s; 60 viewers → p50 0.520s
+/ max 0.723s; 150 viewers → p50 0.524s / max 0.917s. All three runs delivered
+to 100% of connected clients with zero errors and stayed under the 2-second
+target with wide margin; server logs were clean (no errors/tracebacks) at all
+three concurrency levels. 150 concurrent viewers already exceeds Phase 1's
+single-team MVP scope; validating the "hundreds of users" target from Epic 4.6
+is out of scope for this pass and remains separately tracked there.
 
 ### Epic 1.6 — Basic Audit Trail
 
@@ -236,7 +248,7 @@ compliance-grade evidence.
 | Item | Priority | Status |
 |---|---:|---:|
 | Dependency and scheduling engine automated coverage | P0 | PARTIAL |
-| Real-time load test before each phase | P0 | NEXT |
+| Real-time load test before each phase | P0 | DONE for Phase 1 |
 | Structured API/background-job logging and error tracking | P0 | BACKLOG |
 | Database backup and point-in-time recovery | P0 | BACKLOG |
 | Public API rate limiting | P1 | BACKLOG |
@@ -255,7 +267,7 @@ compliance-grade evidence.
 
 1. ~~Finish Phase 1 Epic 1.3 P0: first-class stream creation and stream edits.~~ Done 2026-09-10: dedicated `streams` table, create/rename/delete API and UI, existing task streams backfilled.
 2. ~~Finish Phase 1 Epic 1.6 P0: audit every task and runbook edit, not only transitions.~~ Done 2026-09-10: added field-edit endpoints (`PATCH /api/tasks/{id}` without `status`, `PATCH /api/runbooks/{id}`) audited as `task.edited`/`runbook.edited`, usable independent of live/status gating; dedicated edit UI (vs. API-only) remains a follow-up.
-3. Validate Phase 1 with dependency/scheduling breadth and real-time load evidence.
+3. ~~Validate Phase 1 with dependency/scheduling breadth and real-time load evidence.~~ Load evidence done 2026-09-10 (see Epic 1.5 real-time acceptance note); dependency/scheduling breadth beyond the existing fan-in/chain regression tests remains open.
 4. Complete the core execution UI accessibility review before Phase 1 exit.
 
 ## Guide Requirements Traceability

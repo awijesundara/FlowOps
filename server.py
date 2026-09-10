@@ -212,13 +212,6 @@ def init_db() -> None:
         session_columns={row[1] for row in db.execute("PRAGMA table_info(sessions)")}
         for column,definition in {"ip_address":"TEXT NOT NULL DEFAULT ''","user_agent":"TEXT NOT NULL DEFAULT ''"}.items():
             if column not in session_columns:db.execute(f"ALTER TABLE sessions ADD COLUMN {column} {definition}")
-        for rid, stream, pos in db.execute(
-            "SELECT runbook_id, stream, MIN(sort_order) FROM tasks GROUP BY runbook_id, stream ORDER BY runbook_id, MIN(sort_order)"
-        ).fetchall():
-            db.execute(
-                "INSERT OR IGNORE INTO streams(runbook_id,name,sort_order,created_at) VALUES(?,?,?,?)",
-                (rid, stream, pos, now()),
-            )
         db.execute("UPDATE users SET role='Admin' WHERE role='Administrator'")
         db.execute("UPDATE users SET role='Editor' WHERE role='Runbook Manager'")
         db.execute("UPDATE users SET role='Member' WHERE role IN ('Operator','Viewer')")
@@ -246,6 +239,13 @@ def init_db() -> None:
                 db.execute("INSERT INTO dependencies VALUES(?,?)", (task_id, predecessor))
             append_audit(db, rid, "runbook.created", "Sample release runbook created", "FlowOps")
         db.execute("UPDATE runbooks SET workspace_id=? WHERE workspace_id IS NULL",(default_workspace,))
+        for stream_rid, stream, pos in db.execute(
+            "SELECT runbook_id, stream, MIN(sort_order) FROM tasks GROUP BY runbook_id, stream ORDER BY runbook_id, MIN(sort_order)"
+        ).fetchall():
+            db.execute(
+                "INSERT OR IGNORE INTO streams(runbook_id,name,sort_order,created_at) VALUES(?,?,?,?)",
+                (stream_rid, stream, pos, now()),
+            )
         if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             password=os.getenv("FLOWOPS_BOOTSTRAP_PASSWORD","FlowOps!Preview2026")
             db.execute("INSERT INTO users(username,display_name,email,role,team,password_hash,created_at,instance_id) VALUES(?,?,?,?,?,?,?,?)",
