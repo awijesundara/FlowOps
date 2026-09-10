@@ -774,7 +774,14 @@ class Handler(BaseHTTPRequestHandler):
         try: body=(STATIC/name).read_bytes()
         except FileNotFoundError: return self.send_error(404)
         self.send_response(200); self.send_header("Content-Type",content_type); self.send_header("Content-Length",str(len(body)))
-        self.send_header("Cache-Control","no-cache"); self.end_headers(); self.wfile.write(body)
+        # no-store, not no-cache: no-cache still permits a cache (browser or,
+        # critically, Cloudflare's edge in front of this app) to serve a
+        # stale copy without contacting the origin, since this response
+        # carries no ETag/Last-Modified to revalidate against anyway.
+        # no-store is the one directive every cache in the chain must obey
+        # unconditionally, which matters a lot for app.js: a stale cached
+        # copy silently hides every UI fix behind it, indefinitely.
+        self.send_header("Cache-Control","no-store"); self.end_headers(); self.wfile.write(body)
 
     def do_HEAD(self):
         path=urllib.parse.urlparse(self.path).path
@@ -784,7 +791,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers(); return
         if path=="/":
             self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8")
-            self.send_header("Cache-Control","no-cache"); self.end_headers(); return
+            self.send_header("Cache-Control","no-store"); self.end_headers(); return
         self.send_error(404)
 
     def do_GET(self):
