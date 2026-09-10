@@ -228,7 +228,23 @@ gets 401, and proves revocation takes effect on the next request.
 
 ### Epic 3.5 — Outbound Webhooks
 
-State-change webhooks (P1/M) and retry with backoff (P1/M) are `BACKLOG`.
+State-change webhooks (P1/M) and retry with backoff (P1/M): `DONE`.
+Administrators create named, HMAC-SHA256-signed webhooks under
+Administration → Webhooks; a background poller (same polling design as the
+SSE feed, not request-path delivery) picks up every new audit event --
+which already covers every runbook and task state change, since those are
+audited today -- and POSTs a signed payload (`X-FlowOps-Signature: sha256=…`,
+`X-FlowOps-Event: <action>`) to every active, subscribed webhook, retrying
+up to 3 attempts with a fixed backoff on network failure or non-2xx.
+Verified with a real regression test that spins up an actual local HTTP
+receiver (not a mock) and confirms the delivered signature matches an
+independently computed HMAC. Not done: outbound URL SSRF hardening (the
+existing MicroK8s NetworkPolicy already restricts this app's egress to DNS
+and the ServiceOps pod only, meaningfully limiting blast radius, but there
+is no app-level DNS-rebinding-resistant destination validation the way
+ServiceOps has for its own webhooks) and per-webhook granular event-type
+subscriptions (a webhook can filter by action name via its `events` list
+today, but there's no UI for choosing anything other than the "*" default).
 
 Exit: runbooks trigger external work and external systems safely drive runbooks.
 

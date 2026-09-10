@@ -11,6 +11,7 @@ import sqlite3
 import smtplib
 import ssl
 import subprocess
+import threading
 import time
 import base64
 import urllib.error
@@ -193,6 +194,20 @@ def init_db() -> None:
           team_id INTEGER NOT NULL REFERENCES central_teams(id) ON DELETE CASCADE,
           user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           PRIMARY KEY(team_id,user_id)
+        );
+        CREATE TABLE IF NOT EXISTS webhooks (
+          id INTEGER PRIMARY KEY, instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, url TEXT NOT NULL, secret TEXT NOT NULL,
+          events_json TEXT NOT NULL DEFAULT '["*"]', active INTEGER NOT NULL DEFAULT 1,
+          created_by INTEGER REFERENCES users(id), created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS webhook_deliveries (
+          id INTEGER PRIMARY KEY, webhook_id INTEGER NOT NULL REFERENCES webhooks(id) ON DELETE CASCADE,
+          audit_id INTEGER, event_type TEXT NOT NULL, success INTEGER NOT NULL DEFAULT 0,
+          status_code INTEGER, error TEXT, attempts INTEGER NOT NULL DEFAULT 0, attempted_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS webhook_cursor (
+          id INTEGER PRIMARY KEY CHECK (id=1), last_audit_id INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS api_tokens (
           id INTEGER PRIMARY KEY, instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
@@ -396,6 +411,71 @@ def append_audit(db: sqlite3.Connection, runbook_id: int | None, action: str, de
 
 def rows(items) -> list[dict[str, Any]]:
     return [dict(row) for row in items]
+
+
+def webhook_matches(events_json: str, action: str) -> bool:
+    try:
+        patterns = json.loads(events_json or '["*"]')
+    except (TypeError, ValueError):
+        return False
+    return any(p == "*" or p == action for p in patterns) if isinstance(patterns, list) else False
+
+
+def deliver_webhook_once(webhook: dict[str, Any], event: dict[str, Any]) -> tuple[int | None, str | None, int]:
+    """Sign and POST one audit event to one webhook, retrying up to 3 times
+    with a short fixed backoff on network failure or a non-2xx response."""
+    payload = {
+        "event": event["action"], "id": event["id"], "runbook_id": event["runbook_id"],
+        "detail": event["detail"], "actor": event["actor"], "created_at": event["created_at"],
+    }
+    body = json.dumps(payload, sort_keys=True).encode()
+    signature = hmac.new(webhook["secret"].encode(), body, hashlib.sha256).hexdigest()
+    last_error = None; status = None
+    for attempt in range(1, 4):
+        request = urllib.request.Request(webhook["url"], data=body, method="POST", headers={
+            "Content-Type": "application/json",
+            "X-FlowOps-Signature": f"sha256={signature}",
+            "X-FlowOps-Event": event["action"],
+        })
+        try:
+            with urllib.request.urlopen(request, timeout=8) as response:
+                return response.status, None, attempt
+        except urllib.error.HTTPError as exc:
+            status = exc.code; last_error = f"HTTP {exc.code}"
+        except (urllib.error.URLError, TimeoutError) as exc:
+            status = None; last_error = str(exc)[:300]
+        if attempt < 3: time.sleep(attempt * 2)
+    return status, last_error, 3
+
+
+def webhook_dispatcher_loop() -> None:
+    """Background poller (mirrors the SSE feed's own polling design): picks
+    up newly committed audit rows and delivers them to every active webhook
+    subscribed to that action, so delivery never blocks a request thread."""
+    while True:
+        try:
+            with connect() as db:
+                cursor = db.execute("SELECT last_audit_id FROM webhook_cursor WHERE id=1").fetchone()
+                if not cursor:
+                    db.execute("INSERT OR IGNORE INTO webhook_cursor(id,last_audit_id) VALUES(1,0)"); last_id = 0
+                else:
+                    last_id = cursor[0]
+                events = rows(db.execute("SELECT * FROM audit WHERE id>? ORDER BY id LIMIT 50", (last_id,)))
+                if events:
+                    for event in events:
+                        webhooks = rows(db.execute("SELECT * FROM webhooks WHERE instance_id=? AND active=1", (event["instance_id"],)))
+                        for webhook in webhooks:
+                            if not webhook_matches(webhook["events_json"], event["action"]): continue
+                            status, error, attempts = deliver_webhook_once(webhook, event)
+                            db.execute(
+                                "INSERT INTO webhook_deliveries(webhook_id,audit_id,event_type,success,status_code,error,attempts,attempted_at) VALUES(?,?,?,?,?,?,?,?)",
+                                (webhook["id"], event["id"], event["action"], 1 if status and 200<=status<300 else 0, status, error, attempts, now()),
+                            )
+                    db.execute("UPDATE webhook_cursor SET last_audit_id=?", (events[-1]["id"],))
+                db.commit()
+        except Exception as exc:
+            print(f"webhook dispatcher error: {exc}")
+        time.sleep(2)
 
 
 def runbook_document(db: sqlite3.Connection, rid: int, user: dict[str,Any] | None=None) -> dict[str, Any] | None:
@@ -646,6 +726,15 @@ class Handler(BaseHTTPRequestHandler):
                 items=rows(db.execute("SELECT id,name,scopes_json,created_at,last_used_at,revoked_at FROM api_tokens WHERE instance_id=? ORDER BY created_at DESC",(actor["instance_id"],)))
                 for item in items: item["scopes"]=json.loads(item.pop("scopes_json") or "[]")
                 return self.send_json({"data":items})
+            if path=="/api/admin/webhooks":
+                actor=self.require(db,"admin:users")
+                if not actor: return
+                items=rows(db.execute("SELECT id,name,url,events_json,active,created_at FROM webhooks WHERE instance_id=? ORDER BY created_at DESC",(actor["instance_id"],)))
+                for item in items:
+                    item["events"]=json.loads(item.pop("events_json") or "[]")
+                    recent=rows(db.execute("SELECT success,status_code,error,attempted_at FROM webhook_deliveries WHERE webhook_id=? ORDER BY id DESC LIMIT 5",(item["id"],)))
+                    item["recent_deliveries"]=recent
+                return self.send_json({"data":items})
             if path=="/api/admin/settings":
                 actor=self.require(db,"admin:settings")
                 if not actor: return
@@ -891,6 +980,30 @@ class Handler(BaseHTTPRequestHandler):
                 cur=db.execute("INSERT INTO api_tokens(instance_id,name,token_hash,scopes_json,created_by,created_at) VALUES(?,?,?,?,?,?)",(actor["instance_id"],name,digest,json.dumps(scopes),actor["id"],now()))
                 append_audit(db,None,"api_token.created",f"{name}: {', '.join(scopes)}",actor["display_name"],actor["instance_id"]); db.commit()
                 return self.send_json({"data":{"id":cur.lastrowid,"name":name,"token":raw,"scopes":scopes}},201)
+            if path=="/api/admin/webhooks":
+                actor=self.require(db,"admin:users")
+                if not actor:return
+                name=str(payload.get("name","")).strip()
+                url=str(payload.get("url","")).strip()
+                if not name or len(name)>120: return self.send_json({"error":"Webhook name is required (maximum 120 characters)"},400)
+                if not (url.startswith("https://") or url.startswith("http://")) or len(url)>500:
+                    return self.send_json({"error":"A valid http(s) URL is required"},400)
+                events=[e for e in payload.get("events",["*"]) if isinstance(e,str)][:20] or ["*"]
+                secret=secrets.token_urlsafe(32)
+                cur=db.execute("INSERT INTO webhooks(instance_id,name,url,secret,events_json,created_by,created_at) VALUES(?,?,?,?,?,?,?)",(actor["instance_id"],name,url,secret,json.dumps(events),actor["id"],now()))
+                append_audit(db,None,"webhook.created",f"{name}: {url}",actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"id":cur.lastrowid,"name":name,"secret":secret}},201)
+            if path.startswith("/api/admin/webhooks/") and path.endswith("/test"):
+                actor=self.require(db,"admin:users")
+                if not actor:return
+                try: webhook_id=int(path.strip("/").split("/")[3])
+                except (ValueError,IndexError): return self.send_json({"error":"Not found"},404)
+                webhook=db.execute("SELECT * FROM webhooks WHERE id=? AND instance_id=?",(webhook_id,actor["instance_id"])).fetchone()
+                if not webhook: return self.send_json({"error":"Not found"},404)
+                status,error,attempts=deliver_webhook_once(dict(webhook),{"id":0,"action":"webhook.test","runbook_id":None,"detail":"Test delivery","actor":actor["display_name"],"created_at":now()})
+                db.execute("INSERT INTO webhook_deliveries(webhook_id,audit_id,event_type,success,status_code,error,attempts,attempted_at) VALUES(?,?,?,?,?,?,?,?)",(webhook_id,None,"webhook.test",1 if status and 200<=status<300 else 0,status,error,attempts,now())); db.commit()
+                if status and 200<=status<300: return self.send_json({"data":{"ok":True,"status_code":status}})
+                return self.send_json({"error":error or f"HTTP {status}"},502)
             if path=="/api/admin/invitations":
                 actor=self.require(db,"admin:users")
                 if not actor:return
@@ -1312,6 +1425,16 @@ class Handler(BaseHTTPRequestHandler):
                 if in_use: return self.send_json({"error":"Move or remove this stream's tasks before deleting it"},409)
                 db.execute("DELETE FROM streams WHERE id=?",(sid,)); append_audit(db,stream["runbook_id"],"stream.deleted",stream["name"],actor["display_name"]); doc=runbook_document(db,stream["runbook_id"],actor); db.commit()
                 return self.send_json({"data":doc})
+        if len(parts)==4 and parts[:3]==["api","admin","webhooks"]:
+            try: webhook_id=int(parts[3])
+            except ValueError: return self.send_json({"error":"Not found"},404)
+            with connect() as db:
+                actor=self.require(db,"admin:users")
+                if not actor:return
+                webhook=db.execute("SELECT * FROM webhooks WHERE id=? AND instance_id=?",(webhook_id,actor["instance_id"])).fetchone()
+                if not webhook: return self.send_json({"error":"Not found"},404)
+                db.execute("DELETE FROM webhooks WHERE id=?",(webhook_id,)); append_audit(db,None,"webhook.deleted",webhook["name"],actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"ok":True}})
         if len(parts)==3 and parts[:2]==["api","templates"]:
             try: template_id=int(parts[2])
             except ValueError: return self.send_json({"error":"Not found"},404)
@@ -1470,6 +1593,7 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     init_db()
+    threading.Thread(target=webhook_dispatcher_loop, daemon=True).start()
     host=os.getenv("FLOWOPS_HOST","127.0.0.1"); port=int(os.getenv("FLOWOPS_PORT","8080"))
     print(f"FlowOps listening on http://{host}:{port}")
     ThreadingHTTPServer((host,port),Handler).serve_forever()
