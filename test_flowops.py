@@ -192,6 +192,10 @@ class FlowOpsTest(unittest.TestCase):
         with patch('server.urllib.request.urlopen',approved):code,body=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
         self.assertEqual(code,200);self.assertEqual(body['data']['serviceops_state'],'In Progress');self.assertEqual([r.method for r in requests],['GET','PATCH'])
         self.assertEqual(requests[1].get_header('Idempotency-key'),f'flowops-{rid}-live');self.assertEqual(json.loads(requests[1].data),{'state':'In Progress'})
+    def test_seed_runbook_has_backfilled_streams_on_fresh_install(self):
+        _,doc=self.req('/api/runbooks/1')
+        self.assertGreater(len(doc['data']['streams']),0)
+        self.assertEqual({s['name'] for s in doc['data']['streams']}, {t['stream'] for t in doc['data']['tasks']})
     def test_duplicate_runbook_clones_streams_tasks_and_dependencies(self):
         _,created=self.req('/api/runbooks','POST',{'name':'Original release'}); rid=created['data']['id']
         _,first=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Step one','stream':'Prep','duration':10}); first_id=first['data']['tasks'][0]['id']
