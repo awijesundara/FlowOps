@@ -315,7 +315,8 @@ def init_db() -> None:
         task_migrations={
           "task_type":"TEXT NOT NULL DEFAULT 'normal'", "scheduled_offset":"INTEGER NOT NULL DEFAULT 0",
           "owner_user_id":"INTEGER REFERENCES users(id)", "owner_team_id":"INTEGER REFERENCES runbook_teams(id)",
-          "validation_result":"TEXT", "validation_comment":"TEXT", "blocked_reason":"TEXT"
+          "validation_result":"TEXT", "validation_comment":"TEXT", "blocked_reason":"TEXT",
+          "serviceops_ctask":"TEXT"
         }
         for column,definition in task_migrations.items():
             if column not in task_columns: db.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
@@ -1484,8 +1485,14 @@ class Handler(BaseHTTPRequestHandler):
                 if runbook_type_id and not runbook_type:
                     return self.send_json({"error":"Invalid runbook type"},400)
                 description=str(payload.get("description","")).strip() or (runbook_type["default_description"] if runbook_type else "")
-                stamp=now(); cur=db.execute("INSERT INTO runbooks(name,description,owner,scheduled_at,serviceops_ticket,workspace_id,folder_id,runbook_type_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(name,description[:2000],str(payload.get("owner",""))[:120],payload.get("scheduled_at") or None,str(payload.get("serviceops_ticket",""))[:40],workspace_id,folder_id,runbook_type_id,stamp,stamp))
-                append_audit(db,cur.lastrowid,"runbook.created",name,actor["display_name"]); doc=runbook_document(db,cur.lastrowid); db.commit()
+                stamp=now(); ticket=str(payload.get("serviceops_ticket","")).strip()[:40]
+                cur=db.execute("INSERT INTO runbooks(name,description,owner,scheduled_at,serviceops_ticket,workspace_id,folder_id,runbook_type_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(name,description[:2000],str(payload.get("owner",""))[:120],payload.get("scheduled_at") or None,ticket,workspace_id,folder_id,runbook_type_id,stamp,stamp))
+                rid=cur.lastrowid
+                append_audit(db,rid,"runbook.created",name,actor["display_name"]); db.commit()
+                if ticket:
+                    try: self.apply_serviceops_sync(db,rid,ticket); db.commit()
+                    except RuntimeError as exc: append_audit(db,rid,"serviceops.sync_failed",str(exc)); db.commit()
+                doc=runbook_document(db,rid)
                 return self.send_json({"data":doc},201)
             parts=path.strip("/").split("/")
             if len(parts)==4 and parts[:2]==["api","templates"] and parts[3]=="use":
@@ -1750,10 +1757,15 @@ class Handler(BaseHTTPRequestHandler):
                     if parent_id!=runbook["parent_runbook_id"]: changes.append("parent_runbook_id changed"); sets.append("parent_runbook_id=?"); values.append(parent_id)
                 field_changes=apply_custom_field_values(db,runbook["workspace_id"],"runbook",rid,payload.get("custom_fields",{})) if isinstance(payload.get("custom_fields"),dict) else []
                 if not changes and not field_changes: return self.send_json({"data":runbook_document(db,rid,actor)})
+                ticket_linked="serviceops_ticket" in payload and str(payload["serviceops_ticket"]).strip()[:40]!=runbook["serviceops_ticket"] and str(payload["serviceops_ticket"]).strip()
                 if changes:
                     sets.append("updated_at=?"); values.append(now()); values.append(rid)
                     db.execute(f"UPDATE runbooks SET {','.join(sets)} WHERE id=?",values)
-                append_audit(db,rid,"runbook.edited","; ".join(changes+field_changes),actor["display_name"]); doc=runbook_document(db,rid,actor); db.commit()
+                append_audit(db,rid,"runbook.edited","; ".join(changes+field_changes),actor["display_name"]); db.commit()
+                if ticket_linked:
+                    try: self.apply_serviceops_sync(db,rid,ticket_linked); db.commit()
+                    except RuntimeError as exc: append_audit(db,rid,"serviceops.sync_failed",str(exc)); db.commit()
+                doc=runbook_document(db,rid,actor)
                 return self.send_json({"data":doc})
         if len(parts)==3 and parts[:2]==["api","streams"]:
             try: sid=int(parts[2])
@@ -2018,15 +2030,55 @@ class Handler(BaseHTTPRequestHandler):
         append_audit(db,rid,"serviceops.lifecycle",f"{ticket_number} → {ticket.get('state')}","FlowOps API")
         return {"ticket":ticket,"workflow":workflow,"request_id":request_id}
 
-    def sync_serviceops(self, db, rid, payload):
+    def sync_serviceops_ctasks(self, db, rid, instance_id, ticket_number, ticket_type):
+        if ticket_type != "change": return []
+        try:
+            ctasks,_,_=self.serviceops_request(db,instance_id,"GET",f"tickets/{urllib.parse.quote(ticket_number)}/ctasks")
+        except RuntimeError:
+            return []
+        existing={row["serviceops_ctask"]:row["id"] for row in db.execute("SELECT id,serviceops_ctask FROM tasks WHERE runbook_id=? AND serviceops_ctask IS NOT NULL",(rid,))}
+        max_order=db.execute("SELECT COALESCE(MAX(sort_order),0) FROM tasks WHERE runbook_id=?",(rid,)).fetchone()[0]
+        if ctasks and not db.execute("SELECT 1 FROM streams WHERE runbook_id=? AND name='Change tasks'",(rid,)).fetchone():
+            stream_order=db.execute("SELECT COALESCE(MAX(sort_order),-1)+1 FROM streams WHERE runbook_id=?",(rid,)).fetchone()[0]
+            db.execute("INSERT INTO streams(runbook_id,name,sort_order,created_at) VALUES(?,?,?,?)",(rid,"Change tasks",stream_order,now()))
+        created=[];previous_id=None
+        for ctask in ctasks:
+            number=str(ctask.get("number") or "").strip()
+            if not number: continue
+            if number in existing:
+                previous_id=existing[number];continue
+            max_order+=1
+            owner=str(ctask.get("assignee") or ctask.get("assignmentGroup") or "")[:120]
+            description=str(ctask.get("workNotes") or "")[:2000]
+            title=str(ctask.get("title") or number)[:200]
+            cur=db.execute("INSERT INTO tasks(runbook_id,title,description,stream,owner,duration,status,sort_order,serviceops_ctask) VALUES(?,?,?,?,?,?,?,?,?)",
+                (rid,title,description,"Change tasks",owner,15,"pending",max_order,number))
+            task_id=cur.lastrowid;created.append(task_id)
+            if previous_id: db.execute("INSERT OR IGNORE INTO dependencies(task_id,depends_on_id) VALUES(?,?)",(task_id,previous_id))
+            previous_id=task_id
+        if created: append_audit(db,rid,"serviceops.ctasks_imported",f"Imported {len(created)} change task(s) from {ticket_number}")
+        return created
+
+    def apply_serviceops_sync(self, db, rid, ticket):
+        """Fetch a linked change ticket, store its status, and import its CTASKs
+        into this runbook's task list. Raises RuntimeError on any ServiceOps
+        failure; callers on a best-effort path (e.g. runbook creation) should
+        catch that and proceed without blocking on ServiceOps availability."""
         rb=db.execute("SELECT r.*,w.instance_id FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE r.id=?",(rid,)).fetchone()
-        ticket=str(payload.get("ticket") or rb["serviceops_ticket"] or "").strip()
+        remote,request_id,_=self.serviceops_request(db,rb["instance_id"],"GET",f"tickets/{urllib.parse.quote(ticket)}")
+        self.store_serviceops_ticket(db,rid,remote,request_id);append_audit(db,rid,"serviceops.synced",f"Linked {ticket}")
+        created=self.sync_serviceops_ctasks(db,rid,rb["instance_id"],ticket,remote.get("type"))
+        return remote,request_id,created
+
+    def sync_serviceops(self, db, rid, payload):
+        rb=db.execute("SELECT serviceops_ticket FROM runbooks WHERE id=?",(rid,)).fetchone()
+        ticket=str(payload.get("ticket") or (rb["serviceops_ticket"] if rb else "") or "").strip()
         if not ticket: return self.send_json({"error":"Link a ServiceOps ticket first"},400)
         try:
-            remote,request_id,_=self.serviceops_request(db,rb["instance_id"],"GET",f"tickets/{urllib.parse.quote(ticket)}")
+            remote,request_id,created=self.apply_serviceops_sync(db,rid,ticket)
         except RuntimeError as exc:return self.send_json({"error":str(exc)},502)
-        self.store_serviceops_ticket(db,rid,remote,request_id);append_audit(db,rid,"serviceops.synced",f"Linked {ticket}");doc=runbook_document(db,rid);db.commit()
-        return self.send_json({"data":doc,"serviceops":remote,"request_id":request_id})
+        doc=runbook_document(db,rid);db.commit()
+        return self.send_json({"data":doc,"serviceops":remote,"request_id":request_id,"ctasks_imported":len(created)})
 
     def test_integration(self, db, provider, actor, overrides=None):
         overrides=overrides or {}
