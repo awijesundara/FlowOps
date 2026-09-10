@@ -279,7 +279,18 @@ Exit: runbooks trigger external work and external systems safely drive runbooks.
 ### Epic 4.1 — Linked Runbooks
 
 Primary/secondary runbook linking (P0/L) and aggregate parent status (P0/L):
-`BACKLOG`.
+`DONE` (API), no UI yet. `PATCH /api/runbooks/{id}` accepts
+`parent_runbook_id`, rejects self-parenting and a two-hop cycle (linking a
+runbook's own parent back to itself as a child), and is workspace-scoped.
+`runbook_document()` resolves `parent_runbook` (id/name/status) on a child
+and `child_runbooks` (each with its own task_count/done_count/progress) on
+a parent, plus `aggregate_progress` (completed tasks across every child,
+not per-child averaged) and `aggregate_status` (complete only if every
+child is complete; live if any child is live; cancelled if any child is
+cancelled; otherwise in_progress). Regression test links two children with
+real tasks under one parent, executes a task in one child, and confirms
+the parent's aggregate progress/status reflect it. No admin/runbook UI for
+linking exists yet -- API only, same disclosed pattern as Epics 2.4/3.2.
 
 ### Epic 4.2 — Dashboards and Reporting
 
