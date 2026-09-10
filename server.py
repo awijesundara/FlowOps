@@ -1036,7 +1036,10 @@ class Handler(BaseHTTPRequestHandler):
             if path=="/api/templates":
                 actor=self.require(db,"runbooks:view")
                 if not actor: return
-                items=rows(db.execute("SELECT t.*,COUNT(tt.id) task_count FROM templates t JOIN workspaces w ON w.id=t.workspace_id LEFT JOIN template_tasks tt ON tt.template_id=t.id WHERE w.instance_id=? GROUP BY t.id ORDER BY t.category,t.name",(actor["instance_id"],)))
+                workspace_id=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("workspace_id",[None])[0]
+                clause="AND t.workspace_id=?" if workspace_id else ""
+                params=[actor["instance_id"]]+([int(workspace_id)] if workspace_id else [])
+                items=rows(db.execute(f"SELECT t.*,COUNT(tt.id) task_count FROM templates t JOIN workspaces w ON w.id=t.workspace_id LEFT JOIN template_tasks tt ON tt.template_id=t.id WHERE w.instance_id=? {clause} GROUP BY t.id ORDER BY t.category,t.name",params))
                 return self.send_json({"data":items})
             if path=="/api/runbooks":
                 actor=self.require(db,"runbooks:view")
@@ -1437,9 +1440,7 @@ class Handler(BaseHTTPRequestHandler):
                 template=db.execute("SELECT t.* FROM templates t JOIN workspaces w ON w.id=t.workspace_id WHERE t.id=? AND w.instance_id=?",(template_id,actor["instance_id"])).fetchone()
                 if not template: return self.send_json({"error":"Not found"},404)
                 name=str(payload.get("name","")).strip() or template["name"]
-                workspace_id=int(payload.get("workspace_id") or template["workspace_id"])
-                if not db.execute("SELECT 1 FROM workspaces WHERE id=? AND active=1 AND instance_id=?",(workspace_id,actor["instance_id"])).fetchone():
-                    return self.send_json({"error":"Select an active workspace"},400)
+                workspace_id=template["workspace_id"]
                 stamp=now()
                 cur=db.execute("INSERT INTO runbooks(name,description,owner,scheduled_at,workspace_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",(name[:160],template["description"],str(payload.get("owner",""))[:120],payload.get("scheduled_at") or None,workspace_id,stamp,stamp))
                 new_rid=cur.lastrowid
@@ -1499,6 +1500,29 @@ class Handler(BaseHTTPRequestHandler):
                         order+=1; created+=1
                     append_audit(db,rid,"task.csv_imported",f"{created} tasks",actor["display_name"]); db.execute("UPDATE runbooks SET updated_at=? WHERE id=?",(now(),rid)); doc=runbook_document(db,rid,actor); db.commit()
                     return self.send_json({"data":doc,"imported":created},201)
+                if len(parts)==4 and parts[3]=="tasks-bulk-edit":
+                    actor=self.require_scoped_edit(db,runbook_id=rid)
+                    if not actor:return
+                    task_ids=[int(t) for t in payload.get("task_ids",[]) if str(t).lstrip("-").isdigit()]
+                    valid_ids=[row[0] for row in db.execute(f"SELECT id FROM tasks WHERE runbook_id=? AND id IN ({','.join('?'*len(task_ids)) or 'NULL'})",[rid]+task_ids)] if task_ids else []
+                    if not valid_ids: return self.send_json({"error":"No matching tasks selected"},400)
+                    sets=[]; values=[]; changes=[]
+                    if "owner_user_id" in payload:
+                        owner_user_id=int(payload["owner_user_id"]) if payload.get("owner_user_id") else None
+                        if owner_user_id and not db.execute("SELECT 1 FROM users WHERE id=? AND active=1 AND instance_id=?",(owner_user_id,actor["instance_id"])).fetchone():return self.send_json({"error":"Assigned user is invalid"},400)
+                        sets.append("owner_user_id=?"); values.append(owner_user_id); sets.append("owner_team_id=NULL"); changes.append("owner")
+                    elif "owner_team_id" in payload:
+                        owner_team_id=int(payload["owner_team_id"]) if payload.get("owner_team_id") else None
+                        if owner_team_id and not db.execute("SELECT 1 FROM runbook_teams WHERE id=? AND runbook_id=?",(owner_team_id,rid)).fetchone():return self.send_json({"error":"Assigned team is invalid"},400)
+                        sets.append("owner_team_id=?"); values.append(owner_team_id); sets.append("owner_user_id=NULL"); changes.append("owner")
+                    if "duration" in payload:
+                        sets.append("duration=?"); values.append(max(0,min(int(payload["duration"]),10080))); changes.append("duration")
+                    if "scheduled_offset" in payload:
+                        sets.append("scheduled_offset=?"); values.append(max(0,int(payload["scheduled_offset"]))); changes.append("scheduled_offset")
+                    if not sets: return self.send_json({"error":"No fields to update"},400)
+                    db.execute(f"UPDATE tasks SET {','.join(sets)} WHERE runbook_id=? AND id IN ({','.join('?'*len(valid_ids))})",values+[rid]+valid_ids)
+                    append_audit(db,rid,"task.bulk_edited",f"{len(valid_ids)} tasks: {', '.join(changes)}",actor["display_name"]); db.execute("UPDATE runbooks SET updated_at=? WHERE id=?",(now(),rid)); doc=runbook_document(db,rid,actor); db.commit()
+                    return self.send_json({"data":doc,"updated":len(valid_ids)})
                 if len(parts)==4 and parts[3]=="streams":
                     actor=self.require_scoped_edit(db,runbook_id=rid)
                     if not actor:return

@@ -439,6 +439,34 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(self.req(f'/api/templates/{template_id}','DELETE')[0],200)
         _,listed_after=self.req('/api/templates')
         self.assertFalse(any(t['id']==template_id for t in listed_after['data']))
+    def test_template_visibility_and_use_are_scoped_to_their_own_workspace(self):
+        _,ws=self.req('/api/workspaces'); home_workspace=ws['data'][0]['id']
+        code,other_ws=self.req('/api/admin/workspaces','POST',{'name':'Second workspace for template scoping'})
+        _,ws2=self.req('/api/workspaces'); other_workspace=next(w['id'] for w in ws2['data'] if w['name']=='Second workspace for template scoping')
+        _,created=self.req('/api/runbooks','POST',{'name':'Scoped template source','workspace_id':home_workspace}); rid=created['data']['id']
+        code,saved=self.req(f'/api/runbooks/{rid}/save-as-template','POST',{'name':'Home-only template'})
+        self.assertEqual(code,201); template_id=saved['data']['id']
+        _,filtered=self.req(f'/api/templates?workspace_id={other_workspace}')
+        self.assertFalse(any(t['id']==template_id for t in filtered['data']))
+        _,filtered_home=self.req(f'/api/templates?workspace_id={home_workspace}')
+        self.assertTrue(any(t['id']==template_id for t in filtered_home['data']))
+        code,used=self.req(f'/api/templates/{template_id}/use','POST',{'name':'Ignores workspace override','workspace_id':other_workspace})
+        self.assertEqual(code,201); self.assertEqual(used['data']['workspace_id'],home_workspace)
+    def test_bulk_edit_tasks_updates_owner_and_duration_across_selected_tasks_only(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Bulk edit target'}); rid=created['data']['id']
+        _,t1=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'A','duration':5})
+        _,t2=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'B','duration':5})
+        _,t3=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'C','duration':5})
+        ids=[t['id'] for t in t3['data']['tasks']]
+        code,updated=self.req(f'/api/runbooks/{rid}/tasks-bulk-edit','POST',{'task_ids':ids[:2],'duration':45})
+        self.assertEqual(code,200); self.assertEqual(updated['updated'],2)
+        by_title={t['title']:t for t in updated['data']['tasks']}
+        self.assertEqual(by_title['A']['duration'],45); self.assertEqual(by_title['B']['duration'],45)
+        self.assertEqual(by_title['C']['duration'],5)
+    def test_bulk_edit_tasks_rejects_empty_or_invalid_task_id_selection(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Bulk edit empty target'}); rid=created['data']['id']
+        code,body=self.req(f'/api/runbooks/{rid}/tasks-bulk-edit','POST',{'task_ids':[999999],'duration':10})
+        self.assertEqual(code,400)
     def test_seed_runbook_has_backfilled_streams_on_fresh_install(self):
         _,doc=self.req('/api/runbooks/1')
         self.assertGreater(len(doc['data']['streams']),0)
