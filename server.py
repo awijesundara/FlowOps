@@ -767,7 +767,15 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "FlowOps/0.1"
 
     def log_message(self, fmt, *args):
-        print(f"{self.address_string()} {fmt % args}")
+        code=args[1] if len(args)>1 else None
+        print(json.dumps({
+            "ts":now(),"level":"error" if code and str(code)[0] in "45" else "info",
+            "client":self.address_string(),"method":self.command,"path":self.path.split("?")[0] if getattr(self,"path",None) else None,
+            "status":code,"message":fmt%args,
+        },separators=(",",":")))
+
+    def log_error(self, fmt, *args):
+        print(json.dumps({"ts":now(),"level":"error","client":self.address_string(),"message":fmt%args},separators=(",",":")))
 
     def send_json(self, payload: Any, status=200, headers: dict[str,str] | None=None):
         body=json.dumps(payload, separators=(",", ":")).encode()
