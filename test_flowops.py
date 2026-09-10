@@ -192,6 +192,35 @@ class FlowOpsTest(unittest.TestCase):
         with patch('server.urllib.request.urlopen',approved):code,body=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
         self.assertEqual(code,200);self.assertEqual(body['data']['serviceops_state'],'In Progress');self.assertEqual([r.method for r in requests],['GET','PATCH'])
         self.assertEqual(requests[1].get_header('Idempotency-key'),f'flowops-{rid}-live');self.assertEqual(json.loads(requests[1].data),{'state':'In Progress'})
+    def test_central_team_membership_propagates_live_to_linked_runbooks(self):
+        _,users=self.req('/api/admin/users'); operator_id=next(u['id'] for u in users['data'] if u['username']=='operator')
+        admin_id=next(u['id'] for u in users['data'] if u['username']=='admin')
+        code,team=self.req('/api/central-teams','POST',{'name':'Platform SRE'})
+        self.assertEqual(code,201); central_id=team['data']['id']
+        self.assertEqual(self.req('/api/central-teams','POST',{'name':'Platform SRE'})[0],409)
+        self.req(f'/api/central-teams/{central_id}/members','POST',{'user_id':operator_id})
+        _,created=self.req('/api/runbooks','POST',{'name':'Central team run'}); rid=created['data']['id']
+        code,linked=self.req(f'/api/runbooks/{rid}/teams','POST',{'central_team_id':central_id})
+        self.assertEqual(code,201); runbook_team_id=linked['data']['id']
+        self.assertEqual(linked['data']['name'],'Platform SRE')
+        _,teamsView=self.req(f'/api/runbooks/{rid}/teams')
+        self.assertEqual(teamsView['data'][0]['member_count'],1)
+        self.assertEqual([m['id'] for m in teamsView['data'][0]['members']],[operator_id])
+        self.req(f'/api/central-teams/{central_id}/members','POST',{'user_id':admin_id})
+        _,teamsAfter=self.req(f'/api/runbooks/{rid}/teams')
+        self.assertEqual(teamsAfter['data'][0]['member_count'],2)
+        self.assertEqual(sorted(m['id'] for m in teamsAfter['data'][0]['members']),sorted([operator_id,admin_id]))
+        self.assertEqual(self.req(f'/api/central-teams/{central_id}','DELETE')[0],409)
+        _,assigned=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'SRE task','owner_team_id':runbook_team_id})
+        assigned_id=assigned['data']['tasks'][0]['id']
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'});self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        admin_opener,admin_csrf=self.opener,self.csrf;self.__class__.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()));self.__class__.csrf=''
+        _,login=self.req('/api/auth/login','POST',{'username':'operator','password':'Operator!Preview2026'});self.__class__.csrf=login['data']['csrf_token']
+        self.assertEqual(self.req(f'/api/tasks/{assigned_id}','PATCH',{'status':'running'})[0],200)
+        self.__class__.opener,self.__class__.csrf=admin_opener,admin_csrf
+        self.req(f'/api/central-teams/{central_id}/members/{operator_id}','DELETE')
+        _,teamsFinal=self.req(f'/api/runbooks/{rid}/teams')
+        self.assertEqual(teamsFinal['data'][0]['member_count'],1)
     def test_folder_scopes_runbooks_and_blocks_deletion_while_in_use(self):
         code,folder=self.req('/api/folders','POST',{'name':'Q3 Releases'})
         self.assertEqual(code,201); folder_id=folder['data']['id']
