@@ -75,6 +75,28 @@ class FlowOpsBrowserTest(unittest.TestCase):
         titles = [r.inner_text() for r in rows]
         self.assertEqual(len(titles), len(set(titles)), "no category should be listed twice")
 
+    def test_api_explorer_can_call_a_real_endpoint_with_a_pasted_token(self):
+        token = self.page.evaluate("""async () => {
+            const res = await fetch('/api/admin/api-tokens', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json', 'X-CSRF-Token': state.csrf},
+                body: JSON.stringify({name: 'Browser explorer test', scopes: ['runbooks:read']})
+            });
+            const body = await res.json();
+            return body.data.token;
+        }""")
+        self.assertTrue(token.startswith('fo_'))
+        self.page.goto(self.base + '/api-explorer')
+        self.page.wait_for_selector('#endpointList button')
+        self.page.fill('#token', token)
+        self.page.click('#endpointList button:has-text("GET")')
+        self.page.wait_for_selector('#tryForm')
+        self.page.click('#tryForm button:has-text("Try it")')
+        self.page.wait_for_selector('#responseView pre')
+        status_chip = self.page.inner_text('#responseView .chip')
+        self.assertIn('Status 200', status_chip)
+        response_text = self.page.inner_text('#responseView pre')
+        self.assertIn('"data"', response_text)
     def test_runbook_search_surfaces_task_level_matches(self):
         self.page.click('[data-view="runbooks"]')
         self.page.wait_for_selector('#runbooks.view.active')

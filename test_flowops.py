@@ -1283,6 +1283,34 @@ class FlowOpsTest(unittest.TestCase):
                 self.assertEqual(len(tables),1)
                 listed=server.list_backups()
                 self.assertTrue(any(b['filename']==result['filename'] and b['encrypted'] for b in listed))
+    def test_api_explorer_openapi_doc_paths_resolve_to_real_routes(self):
+        code,body=self.req('/openapi.json')
+        self.assertEqual(code,200)
+        code,writeToken=self.req('/api/admin/api-tokens','POST',{'name':'Explorer doc-drift check','scopes':['runbooks:write']})
+        self.assertEqual(code,201)
+        token=writeToken['data']['token']
+        headers={'Authorization':f'Bearer {token}'}
+        runbook_id=None
+        task_id=None
+        for path,methods in body['paths'].items():
+            resolved=path.replace('{id}',str(runbook_id if '/runbooks/' in path else task_id) if (runbook_id or task_id) else '1')
+            for method in methods:
+                if method.upper()=='GET' and 'events' in path: continue  # SSE stream, not a one-shot request
+                request=urllib.request.Request(self.base+resolved,method=method.upper(),headers=headers)
+                if method.upper() in ('POST','PATCH'):
+                    payload={'name':'Explorer doc-drift runbook'} if 'runbooks' in path and method.upper()=='POST' and '{id}' not in path else {'title':'Explorer task'} if 'tasks' in path else {'status':'ready'} if 'transition' in path else {}
+                    request.data=json.dumps(payload).encode(); request.add_header('Content-Type','application/json')
+                try:
+                    with urllib.request.urlopen(request) as res: status=res.status; response_body=json.loads(res.read())
+                except urllib.error.HTTPError as err: status=err.code; response_body=json.loads(err.read())
+                self.assertNotEqual(status,404,f'{method.upper()} {resolved} is documented in openapi.json but does not resolve to a real route')
+                if path=='/api/runbooks' and method.upper()=='POST' and status==201: runbook_id=response_body['data']['id']
+                if path=='/api/runbooks/{id}/tasks' and method.upper()=='POST' and status==201: task_id=response_body['data']['tasks'][-1]['id']
+    def test_api_explorer_page_serves_and_can_call_a_real_endpoint(self):
+        with urllib.request.urlopen(self.base+'/api-explorer') as res:
+            self.assertEqual(res.status,200); self.assertIn(b'API Explorer',res.read())
+        with urllib.request.urlopen(self.base+'/api-explorer.js') as res:
+            self.assertEqual(res.status,200); self.assertIn(b'openapi.json',res.read())
     def test_api_token_requests_are_rate_limited(self):
         code,token=self.req('/api/admin/api-tokens','POST',{'name':'Rate limit probe','scopes':['runbooks:read']})
         self.assertEqual(code,201)

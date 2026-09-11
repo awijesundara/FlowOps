@@ -1205,6 +1205,9 @@ class Handler(BaseHTTPRequestHandler):
         if path=="/": return self.static("index.html","text/html; charset=utf-8")
         if path=="/app.js": return self.static("app.js","application/javascript; charset=utf-8")
         if path=="/styles.css": return self.static("styles.css","text/css; charset=utf-8")
+        if path=="/api-explorer": return self.static("api-explorer.html","text/html; charset=utf-8")
+        if path=="/api-explorer.js": return self.static("api-explorer.js","application/javascript; charset=utf-8")
+        if path=="/openapi.json": return self.static("openapi.json","application/json; charset=utf-8")
         if path in ("/health","/ready"): return self.send_json({"status":"ok","service":"flowops","version":VERSION})
         if path.startswith("/avatar/"):
             with connect() as db:

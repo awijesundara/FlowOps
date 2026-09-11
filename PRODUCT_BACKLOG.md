@@ -456,7 +456,25 @@ cookie, so every existing runbook/task endpoint -- not a hand-picked subset
 (P0/M), and task updates (P1/M) once authenticated this way; token requests
 are correctly exempt from the CSRF header (CSRF is a cookie/browser-session
 concern only). Documented sandbox API (P0/M): `DONE` as a README section
-with curl examples; a dedicated interactive API explorer remains open.
+with curl examples. Interactive API explorer: `DONE` (2026-09-11).
+`/api-explorer` is a small, hand-rolled explorer (`static/api-explorer.html`/
+`.js`, ~90 lines) -- deliberately not a vendored Swagger UI bundle, to stay
+consistent with this app's zero-third-party-dependency architecture. It
+reads a hand-maintained `static/openapi.json` (a real, partial OpenAPI 3.0
+document covering exactly the 7 endpoints in this section's own README
+table), renders a clickable endpoint list, builds a parameter/body form
+from each operation's schema, and fires a real authenticated `fetch()`
+with a pasted bearer token, showing the raw response. This is good
+interactive coverage of the documented sandbox API, not a full
+schema-driven client -- a proportionate, stated scope call given the
+no-third-party-JS constraint. Covered by
+`test_api_explorer_openapi_doc_paths_resolve_to_real_routes` (drives every
+documented path with a real bearer token and fails if any of them 404s,
+catching doc drift automatically), `test_api_explorer_page_serves_and_can_call_a_real_endpoint`,
+and a Playwright test
+(`test_api_explorer_can_call_a_real_endpoint_with_a_pasted_token`) that
+pastes a freshly-created token into the real page and confirms a live
+`GET /api/runbooks` call renders a 200 response in the browser.
 Regression test creates a read-scoped and a write-scoped token, proves the
 read token gets 403 on a write call, proves a write token can create a
 runbook and transition it without any CSRF header, proves an invalid token
