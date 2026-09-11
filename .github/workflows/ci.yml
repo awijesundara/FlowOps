@@ -19,9 +19,13 @@ jobs:
       - name: Check JS syntax
         run: node --check static/app.js
       - name: Install test dependencies
-        run: pip install pytest
-      - name: Run test suite
+        run: pip install pytest playwright
+      - name: Install Playwright browser
+        run: python3 -m playwright install --with-deps chromium
+      - name: Run server test suite
         run: python3 -m pytest test_flowops.py -v
+      - name: Run browser regression suite
+        run: python3 -m pytest test_browser.py -v
 
   build:
     runs-on: ubuntu-latest
