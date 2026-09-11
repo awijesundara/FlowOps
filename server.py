@@ -102,6 +102,11 @@ ROLE_PERMISSIONS = {
     "Stream Editor": {"runbooks:view","runbooks:execute"},
 }
 SCOPED_ROLES = {"Workspace Manager","Folder Creator","Stream Editor"}
+# i18n scaffolding: English + Japanese (matching this app's existing
+# Asia/Tokyo default timezone), wired into a representative slice of the
+# UI (login, primary nav, runbook-detail task actions) -- not a full
+# translation of the app, a deliberate, stated scope call.
+SUPPORTED_LOCALES = {"en","ja"}
 TOKEN_SCOPE_PERMISSIONS = {
     "runbooks:read": {"runbooks:view"},
     "runbooks:write": {"runbooks:view","runbooks:edit","runbooks:execute"},
@@ -820,6 +825,7 @@ def init_db() -> None:
         for column,definition in {
           "avatar_path":"TEXT", "title":"TEXT NOT NULL DEFAULT ''",
           "timezone":"TEXT NOT NULL DEFAULT 'Asia/Tokyo'", "date_format":"TEXT NOT NULL DEFAULT 'system'",
+          "locale":"TEXT NOT NULL DEFAULT 'en'",
         }.items():
             if column not in user_columns: db.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
         session_columns={row[1] for row in db.execute("PRAGMA table_info(sessions)")}
@@ -1688,6 +1694,7 @@ class Handler(BaseHTTPRequestHandler):
         path=urllib.parse.urlparse(self.path).path
         if path=="/": return self.static("index.html","text/html; charset=utf-8")
         if path=="/app.js": return self.static("app.js","application/javascript; charset=utf-8")
+        if path=="/strings.js": return self.static("strings.js","application/javascript; charset=utf-8")
         if path=="/styles.css": return self.static("styles.css","text/css; charset=utf-8")
         if path=="/api-explorer": return self.static("api-explorer.html","text/html; charset=utf-8")
         if path=="/api-explorer.js": return self.static("api-explorer.js","application/javascript; charset=utf-8")
@@ -2734,13 +2741,19 @@ class Handler(BaseHTTPRequestHandler):
                     date_format=str(payload["date_format"]).strip()
                     if date_format not in {"system","day_first","month_first"}: return self.send_json({"error":"Invalid date format"},400)
                     sets.append("date_format=?"); values.append(date_format)
+                if "locale" in payload:
+                    # Unsupported locales fall back to "en" rather than erroring --
+                    # matches the same fallback the frontend's t() helper applies.
+                    locale=str(payload["locale"]).strip()
+                    if locale not in SUPPORTED_LOCALES: locale="en"
+                    sets.append("locale=?"); values.append(locale)
                 if sets:
                     values.append(actor["id"])
                     db.execute(f"UPDATE users SET {','.join(sets)} WHERE id=?",values)
                     append_audit(db,None,"profile.updated","Self-service profile updated",actor["display_name"],actor["instance_id"])
                     db.commit()
                 updated=db.execute("SELECT * FROM users WHERE id=?",(actor["id"],)).fetchone()
-                safe={k:updated[k] for k in ("id","username","display_name","email","role","team","title","timezone","date_format","avatar_path")}
+                safe={k:updated[k] for k in ("id","username","display_name","email","role","team","title","timezone","date_format","locale","avatar_path")}
                 return self.send_json({"data":safe})
         if parts==["api","me","dashboard"]:
             with connect() as db:

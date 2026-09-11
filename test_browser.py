@@ -75,6 +75,28 @@ class FlowOpsBrowserTest(unittest.TestCase):
         titles = [r.inner_text() for r in rows]
         self.assertEqual(len(titles), len(set(titles)), "no category should be listed twice")
 
+    def test_switching_locale_to_japanese_translates_nav_and_falls_back_for_unknown_locale(self):
+        self.page.click('[data-view="runbooks"]', force=True)
+        self.page.wait_for_selector('#runbooks.view.active')
+        nav_runbooks = self.page.locator('.nav[data-view="runbooks"] span')
+        self.assertEqual(nav_runbooks.inner_text(), 'Runbooks')
+        self.page.evaluate("setLocale('ja')")
+        self.assertEqual(nav_runbooks.inner_text(), 'ランブック')
+        self.assertEqual(self.page.locator('.nav[data-view="home"] span').inner_text(), 'コマンドセンター')
+        # an unknown/unsupported locale must fall back to English, not show raw keys or crash
+        self.page.evaluate("setLocale('xx-not-real')")
+        self.assertEqual(nav_runbooks.inner_text(), 'Runbooks')
+        self.page.evaluate("setLocale('en')")  # restore for other tests
+
+    def test_login_screen_renders_in_the_locale_persisted_from_a_previous_session(self):
+        self.page.click('#logout')
+        self.page.wait_for_selector('.login-button')
+        self.page.evaluate("localStorage.setItem('flowops_locale','ja')")
+        self.page.reload()
+        self.page.wait_for_selector('.login-button')
+        self.assertEqual(self.page.locator('.login-button').inner_text(), 'サインイン')
+        self.page.evaluate("localStorage.setItem('flowops_locale','en')")
+
     def test_api_explorer_can_call_a_real_endpoint_with_a_pasted_token(self):
         token = self.page.evaluate("""async () => {
             const res = await fetch('/api/admin/api-tokens', {

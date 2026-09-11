@@ -952,8 +952,34 @@ compliance-grade evidence.
 | Database backup and point-in-time recovery | P0 | DONE (snapshot backup, not continuous PITR) |
 | Public API rate limiting | P1 | DONE |
 | Core execution UI accessibility review | P1 | DONE for Phase 1 |
-| Internationalization scaffolding | P2 | BACKLOG |
+| Internationalization scaffolding | P2 | DONE |
 | FlowOps platform disaster-recovery plan | P1 | BACKLOG |
+
+Internationalization scaffolding (2026-09-11): `DONE`. A `static/strings.js`
+keyed dictionary (`en`/`ja` — Japanese chosen to match this codebase's
+existing `Asia/Tokyo` default timezone) with a `t(key)` helper and an
+`applyLocale()` DOM-update function, served via a new `GET /strings.js`
+static route. Wired into a representative slice of the UI, not the whole
+app — a deliberate, stated scope call matching the plan's own framing:
+the login screen's sign-in button, the five primary sidebar nav labels,
+and the assigned-task execution view's action buttons (Start/Complete/
+skipped). A new `users.locale` column (`ALTER TABLE`, default `'en'`)
+persists the choice server-side, switchable from the existing profile
+page (`PATCH /api/profile`, a `SUPPORTED_LOCALES` server-side allowlist —
+an unsupported value silently falls back to `en` rather than erroring,
+matching the frontend `t()` helper's own fallback so client and server
+never disagree). The login screen itself reads the locale from
+`localStorage` (set after every successful login/profile update) since
+there's no authenticated user yet to look a stored preference up for.
+Covered by `test_self_service_profile_update_edits_own_fields_and_is_audited`
+(locale persists through `PATCH /api/profile` and `GET /api/auth/me`;
+an unsupported locale falls back to `en`) and two real-browser tests:
+`test_switching_locale_to_japanese_translates_nav_and_falls_back_for_unknown_locale`
+(live nav-label translation via `setLocale('ja')`, then confirms an
+unknown locale renders English, not raw keys or a crash) and
+`test_login_screen_renders_in_the_locale_persisted_from_a_previous_session`
+(logs out, sets `localStorage`, reloads, confirms the real login button
+renders in Japanese).
 
 Dependency and scheduling engine coverage (2026-09-11): `DONE`. The
 existing `earliest_start()`/`critical_path()` logic (`runbook_document()`)

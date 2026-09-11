@@ -1572,6 +1572,13 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(me['data']['user']['display_name'],'Anushka W')
         code,rejected=self.req('/api/profile','PATCH',{'date_format':'nonsense'})
         self.assertEqual(code,400)
+        code,ja=self.req('/api/profile','PATCH',{'locale':'ja'})
+        self.assertEqual(code,200); self.assertEqual(ja['data']['locale'],'ja')
+        code,me=self.req('/api/auth/me')
+        self.assertEqual(me['data']['user']['locale'],'ja')
+        # unsupported locale falls back to "en" rather than erroring
+        code,fallback=self.req('/api/profile','PATCH',{'locale':'xx-not-real'})
+        self.assertEqual(code,200); self.assertEqual(fallback['data']['locale'],'en')
         # restore for other tests relying on the seeded display name
         self.req('/api/profile','PATCH',{'display_name':'Anushka','title':''})
     def test_self_service_profile_update_requires_csrf_token(self):
