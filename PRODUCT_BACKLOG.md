@@ -256,8 +256,18 @@ and `test_bulk_edit_tasks_rejects_empty_or_invalid_task_id_selection`.
 
 | Story | Priority | Size | Status |
 |---|---:|---:|---:|
-| Dependency graph identifies sequence and bottlenecks | P1 | L | PARTIAL |
+| Dependency graph identifies sequence and bottlenecks | P1 | L | DONE |
 | Nodes color-code task status | P2 | S | DONE |
+
+Dependency graph identifies sequence and bottlenecks: `DONE`. The node-map
+view now lays tasks out in columns by dependency depth (each task's column
+is `1 + max(column of its dependencies)`, `0` for entry points), so
+parallel branches render side by side instead of one flat left-to-right
+row — the layout itself shows real fan-out/fan-in structure, not just
+task-creation order. Nodes on the runbook's already-computed
+`critical_path` (the same list the timeline view uses) get a visually
+distinct border and a "Critical path" badge, identifying the
+zero-slack bottleneck sequence directly on the graph.
 
 Exit: multiple teams self-serve within governed boundaries and reuse structures
 and central team rosters.
@@ -407,9 +417,16 @@ stdlib-only). Covered by
 `test_delay_report_includes_completed_late_tasks_and_currently_late_tasks`,
 verified end-to-end against a real container (both a still-late and a
 finished-late task correctly appear in both the JSON and CSV forms).
-A genuinely *configurable* (filterable/scheduled-email) multi-runbook
-dashboard remains `PARTIAL` -- this closes the reporting/export half of
-the epic, not the interactive-dashboard-builder half.
+Configurable multi-runbook dashboard (P0/L): `DONE`. Each user can now
+show/hide the three command-center widgets (Runbook activity, Today
+readiness, Delay summary) via a "Customize" button on the home view,
+persisted server-side per-user (`users.dashboard_widgets`, `PATCH
+/api/me/dashboard`) and applied on every login. The new Delay summary
+widget surfaces the same `/api/reports/delay` data used by the full
+report, directly on the dashboard. Scheduled-email delivery of the
+dashboard is not implemented -- FlowOps has no outbound email scheduler
+today and adding one is out of proportion to this story; the CSV/PDF
+export routes already give a manual path to the same data.
 
 ### Epic 4.3 — Compliance Audit
 
