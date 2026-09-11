@@ -171,9 +171,27 @@ Admin/Editor only; `Workspace Manager` does not extend to that layer yet.
 | Custom runbook types with name, icon, and color | P1 | M | DONE |
 | Approval flow attached to runbook type | P1 | L | DONE |
 | Creator selects a runbook type and inherits defaults | P0 | S | DONE |
-| Nested folders | P2 | M | BACKLOG |
-| Saved, reusable runbook-list filter views | P2 | M | BACKLOG |
+| Nested folders | P2 | M | DONE |
+| Saved, reusable runbook-list filter views | P2 | M | DONE |
 | Runbook home page for instructions and links | P2 | M | BACKLOG |
+
+Nested folders (2026-09-11): `folders.parent_folder_id` (nullable,
+self-referencing) is set at creation time (`POST /api/folders` accepts
+`parent_folder_id`, rejecting an invalid one) -- arbitrary depth, not
+capped at one level like linked runbooks. The runbook-creation folder
+picker renders the tree depth-first with indentation so nesting is
+visible, not just a flat alphabetical list. Covered by
+`test_nested_folders_track_parent_and_reject_invalid_parent`.
+
+Saved runbook-list filter views (2026-09-11): `saved_views` are per-user
+(`POST/GET/DELETE /api/saved-views`), storing an arbitrary `filters`
+JSON object (today: search text + status) under a name unique per user.
+The Runbooks page toolbar has a "Saved views" picker (applies the
+stored filters immediately) and a "☆ Save view" button (captures the
+current search box + status filter). Covered by
+`test_saved_views_are_per_user_created_listed_and_deleted` (including
+cross-user isolation -- one user's saved views are invisible to
+another).
 
 Approval flow evidence (2026-09-10): `runbook_types.requires_approval`
 (set at type-creation time, "New runbook type" admin action) gates the
@@ -629,8 +647,8 @@ FlowOps, but remain subordinate to the phase and P0 ordering above.
 
 | Requirement | Source | Backlog mapping | Status |
 |---|---|---|---|
-| Workspace list/table/timeline views, sorting, filters, saved views | QS p8-p13 | 2.2 | BACKLOG |
-| Folders, nested folders, sticky/applied filters | QS p13 | 2.2 | BACKLOG |
+| Workspace list/table/timeline views, sorting, filters, saved views | QS p8-p13 | 2.2 | PARTIAL (list view with saved filters DONE; table/timeline view alternatives remain BACKLOG) |
+| Folders, nested folders, sticky/applied filters | QS p13 | 2.2 | DONE |
 | Runbook type selection and blank/template creation | QS p19-p20 | 2.2, 2.3 | PARTIAL |
 | Central teams propagate membership into linked runbook teams | QS p10-p11, p22 | 2.4 | DONE |
 | Interactive dependency node map with critical path | QS p17 | 2.6 | PARTIAL |

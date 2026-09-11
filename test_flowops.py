@@ -587,6 +587,36 @@ class FlowOpsTest(unittest.TestCase):
         _,folders=self.req('/api/folders')
         self.assertTrue(any(f['id']==folder_id and f['runbook_count']==1 for f in folders['data']))
         self.assertEqual(self.req(f'/api/folders/{folder_id}','DELETE')[0],409)
+    def test_nested_folders_track_parent_and_reject_invalid_parent(self):
+        code,parent=self.req('/api/folders','POST',{'name':'2026 Releases'})
+        self.assertEqual(code,201); parent_id=parent['data']['id']
+        code,child=self.req('/api/folders','POST',{'name':'Q3','parent_folder_id':parent_id})
+        self.assertEqual(code,201)
+        self.assertEqual(child['data']['parent_folder_id'],parent_id)
+        code,grandchild=self.req('/api/folders','POST',{'name':'July','parent_folder_id':child['data']['id']})
+        self.assertEqual(code,201)
+        self.assertEqual(grandchild['data']['parent_folder_id'],child['data']['id'])
+        self.assertEqual(self.req('/api/folders','POST',{'name':'Orphan','parent_folder_id':999999})[0],400)
+        _,folders=self.req('/api/folders')
+        by_id={f['id']:f for f in folders['data']}
+        self.assertEqual(by_id[child['data']['id']]['parent_folder_id'],parent_id)
+    def test_saved_views_are_per_user_created_listed_and_deleted(self):
+        code,view=self.req('/api/saved-views','POST',{'name':'My live runbooks','filters':{'status':'live'}})
+        self.assertEqual(code,201); view_id=view['data']['id']
+        self.assertEqual(view['data']['filters'],{'status':'live'})
+        self.assertEqual(self.req('/api/saved-views','POST',{'name':'My live runbooks','filters':{}})[0],409)
+        _,listed=self.req('/api/saved-views')
+        self.assertTrue(any(v['id']==view_id and v['filters']=={'status':'live'} for v in listed['data']))
+        admin_opener,admin_csrf=self.opener,self.csrf
+        self.req('/api/admin/users','POST',{'username':'view-isolation','display_name':'View Isolation','email':'view-isolation@example.com','role':'Editor','password':'Temporary!123'})
+        self.__class__.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())); self.__class__.csrf=''
+        _,login=self.req('/api/auth/login','POST',{'username':'view-isolation','password':'Temporary!123'}); self.__class__.csrf=login['data']['csrf_token']
+        _,otherListed=self.req('/api/saved-views')
+        self.assertEqual(otherListed['data'],[])
+        self.__class__.opener,self.__class__.csrf=admin_opener,admin_csrf
+        self.assertEqual(self.req(f'/api/saved-views/{view_id}','DELETE')[0],200)
+        _,afterDelete=self.req('/api/saved-views')
+        self.assertFalse(any(v['id']==view_id for v in afterDelete['data']))
     def test_runbook_type_default_description_applies_when_creating_without_one(self):
         code,rtype=self.req('/api/runbook-types','POST',{'name':'Disaster Recovery','icon':'⌁','color':'#e5793a','default_description':'Declare, fail over, validate, and recover service.'})
         self.assertEqual(code,201); type_id=rtype['data']['id']
