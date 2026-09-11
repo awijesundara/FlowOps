@@ -776,10 +776,62 @@ works, not just that deletion happened.
 
 ### Epic 4.4 — Security Hardening
 
-SAML/OIDC SSO (P0/L): `BACKLOG`, in progress — scoped to a standards-
-compliant OIDC relying party validated against a throwaway local Keycloak
-container (no real customer IdP is available in this environment; SAML
-itself is not attempted this pass).
+SAML/OIDC SSO (P0/L): `DONE` (2026-09-11) for OIDC; SAML itself remains
+out of scope this pass (no real customer IdP is available in this
+environment — validated instead against a throwaway local Keycloak
+container, scripted end to end via its own admin REST API, no manual
+clicking). A full authorization-code + PKCE relying party, independently
+implemented against the existing dependency-free architecture (`urllib`
+only, no `authlib`/`requests-oauthlib`): `GET /auth/oidc/login` builds a
+PKCE `code_verifier`/`code_challenge` (S256) and `state`, persists them in
+a new `oidc_states` DB table (replica-safe — the MicroK8s deployment runs
+2 pod replicas with no session affinity between the login and callback
+requests, so an in-memory dict would break under load balancing) with a
+10-minute expiry, and redirects to the provider's `authorization_endpoint`
+resolved via OIDC discovery (`GET {issuer}/.well-known/openid-configuration`,
+cached 1h). `GET /auth/oidc/callback` validates and single-use-consumes the
+`state` row, exchanges the code for an `id_token` at the `token_endpoint`
+(via the existing SSRF-hardened `safe_urlopen`, `allow_private_network=True`
+— matches the ServiceOps/ServiceNow connectors' trust model), and verifies
+the `id_token`'s RS256 signature via a generalized `verify_oidc_id_token()`/
+`_fetch_jwks()` pair (parameterized versions of the existing Cloudflare
+Access JWT verifier — same `pow(base,exp,mod)` modular-exponentiation
+technique, no crypto library added), checking signature, issuer, audience,
+and expiry. On success, maps the verified email to an existing active
+FlowOps user (same trust model as the already-shipped Cloudflare Access
+SSO — deliberately no auto-provisioning here; that's SCIM's job) and issues
+a session through the exact same code path `/api/auth/login` already uses.
+Settings/credential storage extends `/api/admin/integrations` to a third
+`oidc` provider (issuer URL, client ID, client secret via the existing
+one-way-encrypted `integration_credentials` table); a `GET
+/api/admin/integrations/test` variant fetches the live discovery document
+and JWKS and reports the RSA key count, without needing a full login round
+trip to sanity-check a new configuration. Fast-suite coverage (no
+Docker/Keycloak needed):
+`test_verify_oidc_id_token_checks_signature_issuer_audience_and_expiry`
+(real RSA keypair generated in-test, same technique as the Cloudflare
+Access test — signature tampering, wrong issuer, wrong audience, expiry,
+unknown `kid`, and list-shaped `aud` all independently verified),
+`test_oidc_connection_test_verifies_a_real_discovery_document_and_jwks`
+(real local HTTP double serving a discovery document + JWKS; credential
+never echoed back), `test_oidc_login_is_disabled_by_default_and_redirects_when_enabled`.
+Heavy, opt-in, real end-to-end coverage against an actual Keycloak
+container lives in `test_oidc.py`
+(`FLOWOPS_OIDC_TEST_KEYCLOAK=1 python3 -m pytest test_oidc.py -v`, kept out
+of the default fast run since it boots a real Docker container): a realm,
+confidential client, and two test users are provisioned via Keycloak's own
+admin REST API (no manual clicking); a real Playwright browser drives
+`/auth/oidc/login` through Keycloak's actual login form and back through
+`/auth/oidc/callback`, asserting a real FlowOps session cookie is set, `GET
+/api/auth/me` returns the correct verified identity, and a real
+`auth.oidc_login` audit row is written
+(`test_full_authorization_code_pkce_flow_establishes_a_real_flowops_session`);
+a second test confirms an OIDC identity with no matching active FlowOps
+account is correctly rejected, not silently logged in
+(`test_login_is_rejected_when_no_active_flowops_account_matches_the_oidc_email`).
+Verified live in the Docker preview: `/api/admin/integrations` correctly
+reports the new `oidc` block, and `/auth/oidc/login` 404s while disabled
+rather than redirecting anywhere.
 
 SCIM (P1/L): `BACKLOG`, in progress — SCIM 2.0 Users/Groups provisioning
 over the existing bearer-token mechanism.

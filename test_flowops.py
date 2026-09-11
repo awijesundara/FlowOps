@@ -311,6 +311,106 @@ class FlowOpsTest(unittest.TestCase):
         self.req('/api/admin/integrations','POST',{'provider':'servicenow','url':'','username':'','revoke_credential':True})
         code,body=self.req('/api/admin/integrations/test','POST',{'provider':'servicenow'})
         self.assertEqual(code,400)
+    def test_verify_oidc_id_token_checks_signature_issuer_audience_and_expiry(self):
+        import base64 as b64
+        import random
+        def is_probable_prime(num, rounds=20):
+            if num < 2: return False
+            for small in (2,3,5,7,11,13,17,19,23,29,31,37):
+                if num % small == 0: return num == small
+            d, r = num - 1, 0
+            while d % 2 == 0: d //= 2; r += 1
+            for _ in range(rounds):
+                a = random.randrange(2, num - 1)
+                x = pow(a, d, num)
+                if x in (1, num - 1): continue
+                for _ in range(r - 1):
+                    x = pow(x, 2, num)
+                    if x == num - 1: break
+                else: return False
+            return True
+        def gen_prime(bits):
+            while True:
+                candidate = random.getrandbits(bits) | (1 << (bits - 1)) | 1
+                if is_probable_prime(candidate): return candidate
+        random.seed(7654321)
+        p, q = gen_prime(512), gen_prime(512)
+        n = p * q; phi = (p - 1) * (q - 1); e = 65537; d = pow(e, -1, phi)
+        def sign(message: bytes) -> bytes:
+            digest_info_prefix = bytes.fromhex("3031300d060960864801650304020105000420")
+            digest = hashlib.sha256(message).digest()
+            key_bytes = (n.bit_length() + 7) // 8
+            padded_len = key_bytes - 3 - len(digest_info_prefix) - len(digest)
+            em = b"\x00\x01" + b"\xff" * padded_len + b"\x00" + digest_info_prefix + digest
+            sig_int = pow(int.from_bytes(em, "big"), d, n)
+            return sig_int.to_bytes(key_bytes, "big")
+        def b64url(data: bytes) -> str:
+            return b64.urlsafe_b64encode(data).decode().rstrip("=")
+        kid="oidc-test-key"; issuer="https://idp.example.test/realms/flowops"; audience="flowops-client"
+        server._oidc_jwks_cache["https://idp.example.test/jwks"]={"keys":{kid:(n,e)},"fetched_at":time.monotonic()}
+        def make_jwt(email,aud=audience,iss=issuer,exp=None,kid_used=kid,tamper=False):
+            header=b64url(json.dumps({"alg":"RS256","kid":kid_used}).encode())
+            payload=b64url(json.dumps({"email":email,"iss":iss,"aud":aud,"exp":exp if exp is not None else int(time.time())+300}).encode())
+            sig=sign(f"{header}.{payload}".encode())
+            if tamper:
+                payload=b64url(json.dumps({"email":"attacker@example.com","iss":iss,"aud":aud,"exp":int(time.time())+300}).encode())
+            return f"{header}.{payload}.{b64url(sig)}"
+        jwks_url="https://idp.example.test/jwks"
+        claims=server.verify_oidc_id_token(jwks_url,issuer,audience,make_jwt("user@example.com"))
+        self.assertIsNotNone(claims); self.assertEqual(claims['email'],'user@example.com')
+        self.assertIsNone(server.verify_oidc_id_token(jwks_url,issuer,audience,make_jwt("user@example.com",tamper=True)),"tampered payload must fail signature check")
+        self.assertIsNone(server.verify_oidc_id_token(jwks_url,issuer,audience,make_jwt("user@example.com",aud="some-other-client")),"wrong audience must be rejected")
+        self.assertIsNone(server.verify_oidc_id_token(jwks_url,issuer,audience,make_jwt("user@example.com",iss="https://attacker.example/realms/evil")),"wrong issuer must be rejected")
+        self.assertIsNone(server.verify_oidc_id_token(jwks_url,issuer,audience,make_jwt("user@example.com",exp=int(time.time())-10)),"expired token must be rejected")
+        self.assertIsNone(server.verify_oidc_id_token(jwks_url,issuer,audience,make_jwt("user@example.com",kid_used="not-a-real-kid")),"unknown kid must be rejected")
+        # aud may also be delivered as a list per the OIDC spec
+        header=b64url(json.dumps({"alg":"RS256","kid":kid}).encode())
+        payload=b64url(json.dumps({"email":"user@example.com","iss":issuer,"aud":[audience,"other"],"exp":int(time.time())+300}).encode())
+        list_token=f"{header}.{payload}.{b64url(sign(f'{header}.{payload}'.encode()))}"
+        self.assertIsNotNone(server.verify_oidc_id_token(jwks_url,issuer,audience,list_token))
+    def test_oidc_connection_test_verifies_a_real_discovery_document_and_jwks(self):
+        import http.server as http_server_module
+        class OidcDouble(http_server_module.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path=='/realms/flowops/.well-known/openid-configuration':
+                    body=json.dumps({
+                        'issuer':f'http://127.0.0.1:{self.server.server_port}/realms/flowops',
+                        'authorization_endpoint':f'http://127.0.0.1:{self.server.server_port}/realms/flowops/auth',
+                        'token_endpoint':f'http://127.0.0.1:{self.server.server_port}/realms/flowops/token',
+                        'jwks_uri':f'http://127.0.0.1:{self.server.server_port}/realms/flowops/certs',
+                    }).encode()
+                elif self.path=='/realms/flowops/certs':
+                    body=json.dumps({'keys':[{'kty':'RSA','kid':'k1','n':base64.urlsafe_b64encode((12345678901234567890).to_bytes(9,'big')).decode().rstrip('='),'e':base64.urlsafe_b64encode((65537).to_bytes(3,'big')).decode().rstrip('=')}]}).encode()
+                else:
+                    self.send_response(404); self.end_headers(); return
+                self.send_response(200); self.send_header('Content-Type','application/json'); self.end_headers(); self.wfile.write(body)
+            def log_message(self,*a): pass
+        double=http_server_module.HTTPServer(('127.0.0.1',0),OidcDouble)
+        threading.Thread(target=double.serve_forever,daemon=True).start()
+        try:
+            base=f'http://127.0.0.1:{double.server_port}/realms/flowops'
+            with patch('server.safe_urlopen',unrestricted_urlopen):
+                code,saved=self.req('/api/admin/integrations','POST',{'provider':'oidc','url':base,'client_id':'flowops','credential':'kc_secret','enabled':True})
+                self.assertEqual(code,200)
+                code,tested=self.req('/api/admin/integrations/test','POST',{'provider':'oidc'})
+                self.assertEqual(code,200,tested); self.assertTrue(tested['data']['ok'])
+                self.assertEqual(tested['data']['rsa_keys_found'],1)
+            _,connections=self.req('/api/admin/integrations')
+            self.assertTrue(connections['data']['oidc']['credential_configured'])
+            self.assertNotIn('credential',connections['data']['oidc'])
+            self.assertNotIn('client_secret',connections['data']['oidc'])
+        finally:
+            double.shutdown()
+    def test_oidc_login_is_disabled_by_default_and_redirects_when_enabled(self):
+        opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        opener.handlers=[h for h in opener.handlers if not isinstance(h,urllib.request.HTTPRedirectHandler)]
+        code,body=self.req('/api/admin/integrations','POST',{'provider':'oidc','enabled':False})
+        self.assertEqual(code,200)
+        request=urllib.request.Request(self.base+'/auth/oidc/login')
+        try:
+            with opener.open(request) as res: status=res.status
+        except urllib.error.HTTPError as err: status=err.code
+        self.assertEqual(status,404,"OIDC login must 404 while disabled, not silently redirect anywhere")
     def test_completing_a_task_pushes_its_ctask_state_back_to_serviceops(self):
         self.req('/api/admin/integrations','POST',{'provider':'serviceops','url':'https://serviceops.example','credential':'sop_ctask_push','enabled':True})
         _,created=self.req('/api/runbooks','POST',{'name':'Push-back change','serviceops_ticket':'CHG0000044'});rid=created['data']['id']

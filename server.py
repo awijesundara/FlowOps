@@ -120,7 +120,7 @@ WEBHOOK_EVENT_ACTIONS = (
     "admin.workspace_manager_revoked","api_token.created","api_token.revoked","audit.exported",
     "audit.retention_purged","auth.invitation_accepted","auth.login","auth.logout",
     "auth.password_reset_completed","auth.password_reset_delivery_failed",
-    "auth.password_reset_requested","auth.sso_login","central_team.created","central_team.deleted",
+    "auth.password_reset_requested","auth.sso_login","auth.oidc_login","central_team.created","central_team.deleted",
     "central_team.member_added","central_team.member_removed","comment.added","custom_field.created",
     "custom_field.deleted","folder.created","folder.deleted","instance.created",
     "integration.configured","integration.tested","profile.avatar_updated","profile.password_changed",
@@ -742,6 +742,11 @@ def init_db() -> None:
           workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
           PRIMARY KEY(user_id,workspace_id)
         );
+        CREATE TABLE IF NOT EXISTS oidc_states (
+          state TEXT PRIMARY KEY, code_verifier TEXT NOT NULL,
+          redirect_to TEXT NOT NULL, instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+          expires_at INTEGER NOT NULL, created_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS folder_creator_grants (
           user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           folder_id INTEGER NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
@@ -927,6 +932,77 @@ def verify_cf_access_jwt(token: str) -> dict[str, Any] | None:
         if not _rsa_pkcs1_sha256_verify(f"{header_b64}.{payload_b64}".encode(), signature, *key):
             return None
         if CF_ACCESS_AUD not in (claims.get("aud") or []):
+            return None
+        if int(claims.get("exp", 0)) < int(time.time()):
+            return None
+        return claims
+    except Exception:
+        return None
+
+
+_oidc_discovery_cache: dict[str, dict[str, Any]] = {}
+_oidc_discovery_lock = threading.Lock()
+_oidc_jwks_cache: dict[str, dict[str, Any]] = {}
+_oidc_jwks_lock = threading.Lock()
+
+
+def oidc_discovery_document(issuer: str) -> dict[str, Any]:
+    """Fetches (and caches for 1 hour) an OIDC provider's discovery
+    document. Keyed by issuer so multiple providers can be swapped in
+    without stale cross-contamination."""
+    with _oidc_discovery_lock:
+        entry = _oidc_discovery_cache.get(issuer)
+        if entry and time.monotonic() - entry["fetched_at"] < 3600:
+            return entry["document"]
+        url = issuer.rstrip("/") + "/.well-known/openid-configuration"
+        with safe_urlopen(url, timeout=5, allow_private_network=True) as response:
+            document = json.loads(response.read())
+        _oidc_discovery_cache[issuer] = {"document": document, "fetched_at": time.monotonic()}
+        return document
+
+
+def _fetch_jwks(jwks_url: str) -> dict[str, tuple[int, int]]:
+    """Generalized version of _cf_access_jwks() -- fetches (and caches for
+    1 hour) any provider's RS256 public keys by JWKS URL, no external
+    crypto dependency."""
+    with _oidc_jwks_lock:
+        entry = _oidc_jwks_cache.get(jwks_url)
+        if entry and time.monotonic() - entry["fetched_at"] < 3600:
+            return entry["keys"]
+        with safe_urlopen(jwks_url, timeout=5, allow_private_network=True) as response:
+            document = json.loads(response.read())
+        keys = {}
+        for jwk in document.get("keys", []):
+            if jwk.get("kty") != "RSA":
+                continue
+            n = int.from_bytes(_b64url_decode(jwk["n"]), "big")
+            e = int.from_bytes(_b64url_decode(jwk["e"]), "big")
+            keys[jwk["kid"]] = (n, e)
+        _oidc_jwks_cache[jwks_url] = {"keys": keys, "fetched_at": time.monotonic()}
+        return keys
+
+
+def verify_oidc_id_token(jwks_url: str, issuer: str, audience: str, token: str) -> dict[str, Any] | None:
+    """Generalized version of verify_cf_access_jwt() -- verifies any
+    OIDC provider's RS256 id_token: signature (via _fetch_jwks), issuer,
+    audience, and expiry. Returns claims on success, None on any failure."""
+    try:
+        header_b64, payload_b64, sig_b64 = token.split(".")
+        header = json.loads(_b64url_decode(header_b64))
+        claims = json.loads(_b64url_decode(payload_b64))
+        signature = _b64url_decode(sig_b64)
+        if header.get("alg") != "RS256":
+            return None
+        keys = _fetch_jwks(jwks_url)
+        key = keys.get(header.get("kid"))
+        if not key:
+            return None
+        if not _rsa_pkcs1_sha256_verify(f"{header_b64}.{payload_b64}".encode(), signature, *key):
+            return None
+        if claims.get("iss") != issuer:
+            return None
+        aud = claims.get("aud")
+        if audience != aud and audience not in (aud if isinstance(aud, list) else []):
             return None
         if int(claims.get("exp", 0)) < int(time.time()):
             return None
@@ -1541,6 +1617,8 @@ class Handler(BaseHTTPRequestHandler):
         if path=="/api-explorer.js": return self.static("api-explorer.js","application/javascript; charset=utf-8")
         if path=="/openapi.json": return self.static("openapi.json","application/json; charset=utf-8")
         if path in ("/health","/ready"): return self.send_json({"status":"ok","service":"flowops","version":VERSION})
+        if path=="/auth/oidc/login": return self.oidc_login()
+        if path=="/auth/oidc/callback": return self.oidc_callback()
         if path.startswith("/avatar/"):
             with connect() as db:
                 actor=self.current_user(db)
@@ -1630,9 +1708,12 @@ class Handler(BaseHTTPRequestHandler):
                 except RuntimeError:serviceops_token,serviceops_source="","Encrypted credential unavailable"
                 try:servicenow_token,servicenow_source=integration_credential(db,actor["instance_id"],"servicenow")
                 except RuntimeError:servicenow_token,servicenow_source="","Encrypted credential unavailable"
+                try:oidc_token,oidc_source=integration_credential(db,actor["instance_id"],"oidc")
+                except RuntimeError:oidc_token,oidc_source="","Encrypted credential unavailable"
                 data={
                   "serviceops":{"enabled":values.get("serviceops_enabled","true"),"url":values.get("serviceops_url",os.getenv("SERVICEOPS_URL","")),"credential_configured":bool(serviceops_token),"credential_source":serviceops_source,"credential_editable":bool(os.getenv("FLOWOPS_SETTINGS_ENCRYPTION_KEY")),"sync_on_live":values.get("serviceops_sync_on_live","true"),"sync_on_complete":values.get("serviceops_sync_on_complete","true"),"require_approved":values.get("serviceops_require_approved","true"),"trigger_workflow":values.get("serviceops_trigger_workflow","false"),"api_version":"v1","required_scopes":["tickets:read","tickets:update","workflows:execute"]},
-                  "servicenow":{"enabled":values.get("servicenow_enabled","false"),"url":values.get("servicenow_url",""),"username":values.get("servicenow_username",""),"credential_configured":bool(servicenow_token),"credential_source":servicenow_source,"credential_editable":bool(os.getenv("FLOWOPS_SETTINGS_ENCRYPTION_KEY")),"sync_on_live":values.get("servicenow_sync_on_live","true"),"sync_on_complete":values.get("servicenow_sync_on_complete","true")}
+                  "servicenow":{"enabled":values.get("servicenow_enabled","false"),"url":values.get("servicenow_url",""),"username":values.get("servicenow_username",""),"credential_configured":bool(servicenow_token),"credential_source":servicenow_source,"credential_editable":bool(os.getenv("FLOWOPS_SETTINGS_ENCRYPTION_KEY")),"sync_on_live":values.get("servicenow_sync_on_live","true"),"sync_on_complete":values.get("servicenow_sync_on_complete","true")},
+                  "oidc":{"enabled":values.get("oidc_enabled","false"),"url":values.get("oidc_url",""),"client_id":values.get("oidc_client_id",""),"credential_configured":bool(oidc_token),"credential_source":oidc_source,"credential_editable":bool(os.getenv("FLOWOPS_SETTINGS_ENCRYPTION_KEY")),"login_url":"/auth/oidc/login"}
                 }
                 return self.send_json({"data":data})
             if path=="/api/admin/workspaces":
@@ -2145,13 +2226,15 @@ class Handler(BaseHTTPRequestHandler):
                 actor=self.require(db,"admin:settings")
                 if not actor:return
                 provider=str(payload.get("provider","")).lower()
-                if provider not in {"serviceops","servicenow"}:return self.send_json({"error":"Provider must be serviceops or servicenow"},400)
+                if provider not in {"serviceops","servicenow","oidc"}:return self.send_json({"error":"Provider must be serviceops, servicenow, or oidc"},400)
                 if path.endswith("/test"):
                     if provider=="servicenow": return self.test_servicenow_integration(db,actor,payload)
+                    if provider=="oidc": return self.test_oidc_integration(db,actor,payload)
                     return self.test_integration(db,provider,actor,payload)
                 allowed={"enabled","url","sync_on_live","sync_on_complete"}
                 if provider=="serviceops": allowed|={"require_approved","trigger_workflow"}
                 if provider=="servicenow": allowed|={"username"}
+                if provider=="oidc": allowed={"enabled","url","client_id"}
                 if "secret" in payload or "token" in payload:return self.send_json({"error":"Use the one-way credential field; secrets are never returned to the browser"},400)
                 submitted=str(payload.get("credential","")).strip();revoke=payload.get("revoke_credential") is True
                 if submitted and revoke:return self.send_json({"error":"Set or revoke a credential, not both"},400)
@@ -3152,6 +3235,102 @@ class Handler(BaseHTTPRequestHandler):
             if "result" not in document:return self.send_json({"error":"ServiceNow returned an incompatible Table API response"},502)
         result={"ok":True,"provider":"servicenow","latency_ms":round((time.monotonic()-started)*1000),"message":"ServiceNow Table API verified","credential_configured":True,"tested_unsaved_credential":testing_unsaved_credential}
         append_audit(db,None,"integration.tested",f"servicenow: {result['message']}",actor["display_name"],actor["instance_id"]);db.commit()
+        return self.send_json({"data":result})
+
+    # --- OIDC SSO (authorization-code + PKCE) ----------------------------
+    # State is stored in the shared `oidc_states` table (not an in-memory
+    # dict) because the MicroK8s deployment runs 2 pod replicas behind one
+    # Service with no guaranteed session affinity between /auth/oidc/login
+    # and /auth/oidc/callback -- both pods share the same SQLite file, so
+    # a DB row is replica-safe where an in-process dict would not be.
+    def oidc_login(self):
+        with connect() as db:
+            instance=db.execute("SELECT id FROM instances WHERE slug=?",(DEFAULT_INSTANCE_SLUG,)).fetchone()
+            if not instance: return self.send_json({"error":"FlowOps instance is unavailable"},503)
+            values=instance_settings(db,instance["id"])
+            if values.get("oidc_enabled","false")!="true": return self.send_json({"error":"OIDC sign-in is not enabled"},404)
+            issuer=values.get("oidc_url","").strip().rstrip("/"); client_id=values.get("oidc_client_id","").strip()
+            if not issuer or not client_id: return self.send_json({"error":"OIDC is enabled but not fully configured"},503)
+            try: document=oidc_discovery_document(issuer)
+            except Exception as exc: return self.send_json({"error":f"OIDC discovery failed: {exc}"},502)
+            redirect_to=urllib.parse.urlparse(self.path).query
+            qs=urllib.parse.parse_qs(redirect_to)
+            requested=(qs.get("redirect_to") or ["/"])[0]
+            redirect_target=requested if requested.startswith("/") and not requested.startswith("//") else "/"
+            code_verifier=secrets.token_urlsafe(64)
+            code_challenge=base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode()).digest()).rstrip(b"=").decode()
+            state=secrets.token_urlsafe(24)
+            db.execute("DELETE FROM oidc_states WHERE expires_at<=?",(int(time.time()),))
+            db.execute("INSERT INTO oidc_states(state,code_verifier,redirect_to,instance_id,expires_at,created_at) VALUES(?,?,?,?,?,?)",(state,code_verifier,redirect_target,instance["id"],int(time.time())+600,now()))
+            db.commit()
+            public_url=os.getenv("FLOWOPS_PUBLIC_URL","").strip().rstrip("/")
+            redirect_uri=f"{public_url}/auth/oidc/callback"
+            params={"response_type":"code","client_id":client_id,"redirect_uri":redirect_uri,"scope":"openid email profile","state":state,"code_challenge":code_challenge,"code_challenge_method":"S256"}
+            auth_url=document["authorization_endpoint"]+"?"+urllib.parse.urlencode(params)
+        self.send_response(302); self.send_header("Location",auth_url); self.end_headers()
+
+    def oidc_callback(self):
+        query=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        provider_error=(query.get("error") or [""])[0]
+        if provider_error: return self.send_json({"error":f"OIDC provider returned an error: {provider_error}"},400)
+        code=(query.get("code") or [""])[0]; state=(query.get("state") or [""])[0]
+        if not code or not state: return self.send_json({"error":"Missing code or state on OIDC callback"},400)
+        with connect() as db:
+            row=db.execute("SELECT * FROM oidc_states WHERE state=? AND expires_at>?",(state,int(time.time()))).fetchone()
+            db.execute("DELETE FROM oidc_states WHERE state=?",(state,)); db.commit()
+            if not row: return self.send_json({"error":"OIDC sign-in expired or was already used. Try signing in again."},400)
+            instance_id=row["instance_id"]; values=instance_settings(db,instance_id)
+            issuer=values.get("oidc_url","").strip().rstrip("/"); client_id=values.get("oidc_client_id","").strip()
+            if not issuer or not client_id: return self.send_json({"error":"OIDC is not fully configured"},503)
+            try: client_secret,_=integration_credential(db,instance_id,"oidc")
+            except RuntimeError as exc: return self.send_json({"error":str(exc)},503)
+            try: document=oidc_discovery_document(issuer)
+            except Exception as exc: return self.send_json({"error":f"OIDC discovery failed: {exc}"},502)
+            public_url=os.getenv("FLOWOPS_PUBLIC_URL","").strip().rstrip("/")
+            redirect_uri=f"{public_url}/auth/oidc/callback"
+            token_body=urllib.parse.urlencode({"grant_type":"authorization_code","code":code,"redirect_uri":redirect_uri,"client_id":client_id,"client_secret":client_secret,"code_verifier":row["code_verifier"]}).encode()
+            try:
+                with safe_urlopen(document["token_endpoint"],data=token_body,headers={"Content-Type":"application/x-www-form-urlencoded","Accept":"application/json"},method="POST",timeout=8,allow_private_network=True) as response:
+                    token_response=json.loads(response.read())
+            except RuntimeError as exc: return self.send_json({"error":f"OIDC token exchange failed: {exc}"},502)
+            id_token=token_response.get("id_token")
+            if not id_token: return self.send_json({"error":"OIDC provider did not return an id_token"},502)
+            claims=verify_oidc_id_token(document.get("jwks_uri",""),issuer,client_id,id_token)
+            if not claims or not claims.get("email"): return self.send_json({"error":"Could not verify the OIDC identity token"},401)
+            email=str(claims["email"]).strip().lower()
+            user=db.execute("SELECT * FROM users WHERE LOWER(email)=? AND active=1",(email,)).fetchone()
+            if not user: return self.send_json({"error":"No active FlowOps account matches your OIDC identity"},404)
+            hours=max(1,min(24,int(instance_settings(db,user["instance_id"]).get("session_hours","8")))); session_seconds=hours*3600
+            raw=secrets.token_urlsafe(36); csrf=secrets.token_urlsafe(24); expires=int(time.time())+session_seconds
+            db.execute("DELETE FROM sessions WHERE expires_at<=?",(int(time.time()),)); db.execute("INSERT INTO sessions(token_hash,csrf_token,user_id,expires_at,created_at,ip_address,user_agent) VALUES(?,?,?,?,?,?,?)",(hashlib.sha256(raw.encode()).hexdigest(),csrf,user["id"],expires,now(),self.client_address[0][:64],self.headers.get("User-Agent","")[:300]))
+            db.execute("UPDATE users SET last_login_at=? WHERE id=?",(now(),user["id"]))
+            append_audit(db,None,"auth.oidc_login",f"{user['username']} signed in via OIDC ({email})",user["display_name"],user["instance_id"]); db.commit()
+            redirect_to=row["redirect_to"] or "/"
+        self.send_response(302)
+        self.send_header("Location",redirect_to)
+        self.send_header("Set-Cookie",f"flowops_session={raw}; Path=/; HttpOnly; SameSite=Strict; Max-Age={session_seconds}")
+        self.end_headers()
+
+    def test_oidc_integration(self, db, actor, overrides=None):
+        overrides=overrides or {}
+        values=instance_settings(db,actor["instance_id"])
+        issuer=str(overrides.get("url") or values.get("oidc_url","")).strip().rstrip("/")
+        client_id=str(overrides.get("client_id") or values.get("oidc_client_id","")).strip()
+        if not issuer:return self.send_json({"error":"Configure the OIDC issuer URL first"},400)
+        if not client_id:return self.send_json({"error":"Configure the OIDC client ID first"},400)
+        started=time.monotonic()
+        try:
+            document=oidc_discovery_document(issuer)
+        except Exception as exc:return self.send_json({"error":f"OIDC discovery failed: {exc}"},502)
+        missing=[key for key in ("authorization_endpoint","token_endpoint","jwks_uri","issuer") if not document.get(key)]
+        if missing:return self.send_json({"error":f"OIDC discovery document is missing: {', '.join(missing)}"},502)
+        if document["issuer"].rstrip("/")!=issuer:return self.send_json({"error":f"Discovery document issuer ({document['issuer']}) does not match the configured issuer"},502)
+        try:
+            keys=_fetch_jwks(document["jwks_uri"])
+        except Exception as exc:return self.send_json({"error":f"JWKS fetch failed: {exc}"},502)
+        if not keys:return self.send_json({"error":"OIDC provider's JWKS contains no usable RSA keys"},502)
+        result={"ok":True,"provider":"oidc","latency_ms":round((time.monotonic()-started)*1000),"message":"OIDC discovery document and JWKS verified","authorization_endpoint":document["authorization_endpoint"],"rsa_keys_found":len(keys)}
+        append_audit(db,None,"integration.tested",f"oidc: {result['message']}",actor["display_name"],actor["instance_id"]);db.commit()
         return self.send_json({"data":result})
 
     def test_integration(self, db, provider, actor, overrides=None):
