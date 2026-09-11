@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check Python syntax
+        run: python3 -m py_compile server.py
+      - name: Check JS syntax
+        run: node --check static/app.js
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run test suite
+        run: python3 -m pytest test_flowops.py -v
+
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t flowops:ci .
+      - name: Smoke test the built image
+        run: |
+          docker run -d --name flowops-ci -p 8099:8080 -e FLOWOPS_HOST=0.0.0.0 -e FLOWOPS_PORT=8080 flowops:ci
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8099/health; then break; fi
+            sleep 1
+          done
+          curl -sf http://localhost:8099/health
+          docker logs flowops-ci
+          docker stop flowops-ci
