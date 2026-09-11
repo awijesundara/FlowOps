@@ -167,6 +167,38 @@ def check_rate_limit(key: str) -> int | None:
     return None
 
 
+def run_automation_task(task_id: int, request_id: str) -> None:
+    """Executes an 'automation' task's outbound HTTP call in the background so
+    the triggering request returns immediately with 'queued'/'running' state;
+    the SSE feed (backed by the audit table) carries the eventual success/
+    failure to connected clients in real time."""
+    with connect() as db:
+        task = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not task or task["task_type"] != "automation": return
+        db.execute("UPDATE tasks SET automation_status='running', automation_attempts=automation_attempts+1 WHERE id=?", (task_id,))
+        append_audit(db, task["runbook_id"], "task.automation_running", f"{task['title']}: calling {task['automation_url']}", "FlowOps automation")
+        db.commit()
+    try:
+        body = json.dumps({"request_id": request_id, "task_id": task_id, "task_title": task["title"]}).encode()
+        request = urllib.request.Request(task["automation_url"], data=body, method="POST", headers={"Content-Type": "application/json", "X-Request-ID": request_id})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            status_ok = 200 <= response.status < 300
+            snippet = response.read(2000).decode(errors="replace")
+    except Exception as exc:
+        status_ok, snippet = False, f"{type(exc).__name__}: {exc}"
+    with connect() as db:
+        task = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not task: return
+        final_status = "complete" if status_ok else "failed"
+        db.execute(
+            "UPDATE tasks SET status=?, automation_status=?, automation_result=?, completed_at=CASE WHEN ?='complete' THEN ? ELSE completed_at END WHERE id=?",
+            (final_status, "success" if status_ok else "failed", snippet[:2000], final_status, now(), task_id),
+        )
+        append_audit(db, task["runbook_id"], "task.automation_result", f"{task['title']}: {final_status}" + ("" if status_ok else f" ({snippet[:200]})"), "FlowOps automation")
+        db.execute("UPDATE runbooks SET updated_at=? WHERE id=?", (now(), task["runbook_id"]))
+        db.commit()
+
+
 def backup_loop() -> None:
     while True:
         time.sleep(BACKUP_INTERVAL_HOURS * 3600)
@@ -382,7 +414,9 @@ def init_db() -> None:
           "task_type":"TEXT NOT NULL DEFAULT 'normal'", "scheduled_offset":"INTEGER NOT NULL DEFAULT 0",
           "owner_user_id":"INTEGER REFERENCES users(id)", "owner_team_id":"INTEGER REFERENCES runbook_teams(id)",
           "validation_result":"TEXT", "validation_comment":"TEXT", "blocked_reason":"TEXT",
-          "serviceops_ctask":"TEXT"
+          "serviceops_ctask":"TEXT",
+          "automation_status":"TEXT NOT NULL DEFAULT 'idle'", "automation_result":"TEXT",
+          "automation_attempts":"INTEGER NOT NULL DEFAULT 0", "skip_reason":"TEXT"
         }
         for column,definition in task_migrations.items():
             if column not in task_columns: db.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
@@ -530,7 +564,7 @@ def owns_runbook(db: sqlite3.Connection, rid: int, instance_id: int) -> bool:
     return bool(db.execute("SELECT 1 FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE r.id=? AND w.instance_id=?",(rid,instance_id)).fetchone())
 
 
-TASK_CSV_TYPES={"normal","milestone","checklist","validation","sms","email","call"}
+TASK_CSV_TYPES={"normal","milestone","checklist","validation","sms","email","call","automation"}
 
 
 def parse_tasks_csv(csv_text: str) -> list[dict]:
@@ -1655,7 +1689,7 @@ class Handler(BaseHTTPRequestHandler):
                     title=str(payload.get("title","")).strip()
                     if not title: return self.send_json({"error":"Task title is required"},400)
                     order=db.execute("SELECT COALESCE(MAX(sort_order),-1)+1 FROM tasks WHERE runbook_id=?",(rid,)).fetchone()[0]
-                    task_type=str(payload.get("task_type","normal")); allowed_types={"normal","milestone","checklist","validation","sms","email","call"}
+                    task_type=str(payload.get("task_type","normal")); allowed_types={"normal","milestone","checklist","validation","sms","email","call","automation"}
                     if task_type not in allowed_types:return self.send_json({"error":"Invalid task type"},400)
                     duration=max(0,min(int(payload.get("duration",15)),10080)); duration=0 if task_type in {"milestone","checklist","sms","email","call"} else max(1,duration)
                     owner_user_id=int(payload["owner_user_id"]) if payload.get("owner_user_id") else None; owner_team_id=int(payload["owner_team_id"]) if payload.get("owner_team_id") else None
@@ -1895,6 +1929,8 @@ class Handler(BaseHTTPRequestHandler):
                         parent=db.execute("SELECT id,parent_runbook_id FROM runbooks WHERE id=? AND workspace_id=?",(parent_id,runbook["workspace_id"])).fetchone()
                         if not parent: return self.send_json({"error":"Invalid parent runbook"},400)
                         if parent["parent_runbook_id"]==rid: return self.send_json({"error":"That runbook is already a child of this one"},400)
+                        if parent["parent_runbook_id"]: return self.send_json({"error":"That runbook is already a child of another runbook; linking supports only one level of nesting"},400)
+                        if db.execute("SELECT 1 FROM runbooks WHERE parent_runbook_id=?",(rid,)).fetchone(): return self.send_json({"error":"This runbook already has its own linked children; linking supports only one level of nesting"},400)
                     if parent_id!=runbook["parent_runbook_id"]: changes.append("parent_runbook_id changed"); sets.append("parent_runbook_id=?"); values.append(parent_id)
                 field_changes=apply_custom_field_values(db,runbook["workspace_id"],"runbook",rid,payload.get("custom_fields",{})) if isinstance(payload.get("custom_fields"),dict) else []
                 if not changes and not field_changes: return self.send_json({"data":runbook_document(db,rid,actor)})
@@ -1979,6 +2015,8 @@ class Handler(BaseHTTPRequestHandler):
             if not task: return self.send_json({"error":"Not found"},404)
             runbook=db.execute("SELECT status FROM runbooks WHERE id=?",(task["runbook_id"],)).fetchone()
             if not runbook or runbook["status"]!="live":return self.send_json({"error":"Tasks can only be executed while the runbook is live"},409)
+            if task["task_type"]=="automation" and "runbooks:edit" not in actor["permissions"]:
+                return self.send_json({"error":"Automation tasks trigger external systems and require editor-level authorization, not just task assignment."},403)
             if actor["role"]=="Member":
                 assigned=task["owner_user_id"]==actor["id"] or (task["owner_team_id"] and actor["id"] in team_member_user_ids(db, task["owner_team_id"]))
                 if not assigned:return self.send_json({"error":"Members may only act on tasks assigned to them or their team"},403)
@@ -1990,11 +2028,20 @@ class Handler(BaseHTTPRequestHandler):
                 if blockers: return self.send_json({"error":"Complete predecessor tasks first"},409)
             validation_result=str(payload.get("validation_result","")).strip()
             if task["task_type"]=="validation" and target=="complete" and validation_result not in {"Pass","Fail","Not Tested"}:return self.send_json({"error":"Validation completion requires Pass, Fail, or Not Tested"},400)
-            db.execute("UPDATE tasks SET status=?,started_at=CASE WHEN ? IN ('running','complete') THEN COALESCE(started_at,?) ELSE started_at END,completed_at=CASE WHEN ? IN ('complete','skipped') THEN ? ELSE NULL END,validation_result=CASE WHEN ?!='' THEN ? ELSE validation_result END,validation_comment=CASE WHEN ?!='' THEN ? ELSE validation_comment END,blocked_reason=CASE WHEN ?='blocked' THEN ? ELSE blocked_reason END WHERE id=?",(target,target,now(),target,now(),validation_result,validation_result,str(payload.get("validation_comment","")).strip(),str(payload.get("validation_comment","")).strip(),target,str(payload.get("blocked_reason","")).strip()[:500],tid))
-            append_audit(db,task["runbook_id"],"task.transition",f"{task['title']}: {task['status']} → {target}",actor["display_name"]); db.execute("UPDATE runbooks SET updated_at=? WHERE id=?",(now(),task["runbook_id"]))
+            skip_reason=str(payload.get("skip_reason","")).strip()
+            if task["task_type"]=="automation" and target=="skipped" and not skip_reason:
+                return self.send_json({"error":"Skipping a failed automation task requires an audited reason."},400)
+            if task["task_type"]=="automation" and target=="running" and not str(task["automation_url"] or "").strip():
+                return self.send_json({"error":"This automation task has no automation URL configured. Set one before starting it."},400)
+            automation_status="queued" if task["task_type"]=="automation" and target=="running" else ("idle" if target=="pending" else task["automation_status"])
+            db.execute("UPDATE tasks SET status=?,started_at=CASE WHEN ? IN ('running','complete') THEN COALESCE(started_at,?) ELSE started_at END,completed_at=CASE WHEN ? IN ('complete','skipped') THEN ? ELSE NULL END,validation_result=CASE WHEN ?!='' THEN ? ELSE validation_result END,validation_comment=CASE WHEN ?!='' THEN ? ELSE validation_comment END,blocked_reason=CASE WHEN ?='blocked' THEN ? ELSE blocked_reason END,skip_reason=CASE WHEN ?!='' THEN ? ELSE skip_reason END,automation_status=? WHERE id=?",(target,target,now(),target,now(),validation_result,validation_result,str(payload.get("validation_comment","")).strip(),str(payload.get("validation_comment","")).strip(),target,str(payload.get("blocked_reason","")).strip()[:500],skip_reason,skip_reason,automation_status,tid))
+            append_audit(db,task["runbook_id"],"task.transition",f"{task['title']}: {task['status']} → {target}"+(f" ({skip_reason})" if skip_reason else ""),actor["display_name"]); db.execute("UPDATE runbooks SET updated_at=? WHERE id=?",(now(),task["runbook_id"]))
             if task["serviceops_ctask"]:
                 self.push_serviceops_ctask_state(db,task["runbook_id"],task["serviceops_ctask"],target)
             doc=runbook_document(db,task["runbook_id"],actor); db.commit()
+            if task["task_type"]=="automation" and target=="running":
+                request_id=uuid.uuid4().hex
+                threading.Thread(target=run_automation_task,args=(tid,request_id),daemon=True).start()
             return self.send_json({"data":doc})
 
     def do_DELETE(self):

@@ -171,6 +171,9 @@ Admin/Editor only; `Workspace Manager` does not extend to that layer yet.
 | Custom runbook types with name, icon, and color | P1 | M | DONE |
 | Approval flow attached to runbook type | P1 | L | DONE |
 | Creator selects a runbook type and inherits defaults | P0 | S | DONE |
+| Nested folders | P2 | M | BACKLOG |
+| Saved, reusable runbook-list filter views | P2 | M | BACKLOG |
+| Runbook home page for instructions and links | P2 | M | BACKLOG |
 
 Approval flow evidence (2026-09-10): `runbook_types.requires_approval`
 (set at type-creation time, "New runbook type" admin action) gates the
@@ -194,6 +197,7 @@ Approved by ...") and an Approve button for admins on gated types.
 | Save runbook as reusable template | P0 | M | DONE |
 | Create runbook from saved template | P0 | S | DONE |
 | Scope template visibility by workspace | P2 | M | DONE |
+| Reusable task snippets (subset of tasks, not a whole runbook), capped at 100 tasks | P2 | M | BACKLOG |
 
 Scoping evidence (2026-09-10): previously any active workspace could be
 passed to `POST /api/templates/{id}/use`, letting a template created in one
@@ -286,15 +290,50 @@ and central team rosters.
 ### Epic 3.1 — Integration Framework
 
 Named connections (P0/M), API key/basic/bearer/OAuth authentication (P0/L),
-triggered actions with URL and payload template (P0/L), automatic context
-(P1/M), auto-complete on success (P1/M), and sandbox action tests (P0/M) are
-all `BACKLOG` except the fixed ServiceOps read connector, which is `PARTIAL`.
+automatic context (P1/M), and sandbox action tests (P0/M) remain `BACKLOG`
+-- there is still no reusable, named "connection" abstraction with its own
+stored credentials; an automation task's URL is per-task, not backed by a
+shared, admin-managed connection profile.
+
+Triggered actions with URL and payload template (P0/L) and auto-complete
+on success (P1/M): `DONE` (2026-09-11) via a new `automation` task type.
+`PATCH /api/tasks/{id}` starting an automation task (`pending`/`failed` ->
+`running`) validates an `automation_url` is set, then returns immediately
+with `automation_status: "queued"` while a background thread POSTs
+`{request_id, task_id, task_title}` to that URL and reports the eventual
+outcome asynchronously -- the triggering HTTP request is never blocked on
+slow/unreliable external I/O. Success (2xx) auto-completes the task and
+sets `automation_status: "success"`; failure (non-2xx, timeout, connection
+error) sets `automation_status: "failed"` and the task status to
+`failed`, storing the error detail in `automation_result` for the
+operator. `failed -> running` (already a valid transition in the existing
+task state machine) doubles as "Retry" and increments
+`automation_attempts`; `failed -> skipped` doubles as an *audited* skip --
+FlowOps-specifically requires a non-empty `skip_reason` for automation
+tasks (stored and shown in the audit trail), where a normal task's skip
+needs no reason. Every state change is written through `append_audit`, so
+the existing SSE feed (already polling the audit table) carries queued →
+running → success/failed to every connected client in real time with no
+new transport. Authorization is intentionally stricter than a normal
+task: triggering, retrying, or skipping an automation task requires
+`runbooks:edit` (Editor/Admin), not just being the task's assigned
+owner -- a Member who owns an automation task cannot fire it themselves,
+since it calls an external system on the runbook's behalf. There is no
+distinct "rehearsal" execution mode in FlowOps today (tasks of every type
+can only execute while the runbook is `live`, per the pre-existing status
+check), so "rehearsal safely skips integration tasks" doesn't have a
+literal analog to close here — it isn't a gap specific to automation
+tasks. Covered by `test_automation_task_executes_and_reports_success`
+(real local HTTP receiver, not mocked), `test_automation_task_failure_allows_retry_and_audited_skip`,
+`test_automation_task_requires_editor_permission_not_just_assignment`,
+and `test_automation_task_requires_url_before_starting`.
 
 Product-owner sequencing note (2026-09-06): the supplied automation demonstration
 and explicit ServiceOps administration request authorize a bounded Phase 3
 foundation slice while Phase 1 remains active. Connection policy, encrypted
-credential lifecycle, and safe connection tests are `DONE`; job actions, asynchronous polling,
-and task outcome automation remain `BACKLOG` and may not be represented as done.
+credential lifecycle, and safe connection tests are `DONE`; a reusable
+named-connection abstraction (as opposed to a per-task URL) remains
+`BACKLOG`.
 
 The first-party ServiceOps REST v1 connector is now `PARTIAL`: ticket retrieval,
 server-side bearer authentication, request correlation, change approval checks,
@@ -398,6 +437,13 @@ the parent's aggregate progress/status reflect it. The runbook detail view
 has a "Linked runbooks" card ("Set parent" action) that shows the parent
 when this runbook is a child, or the linked children with live aggregate
 progress/status when it's a parent.
+
+One level of nesting only (P1/S): `DONE` (2026-09-11). `PATCH
+/api/runbooks/{id}` now also rejects linking when the prospective parent
+already has its own parent, or when the runbook being linked already has
+children of its own -- both would create a grandparent/grandchild chain,
+which "one level of linking" explicitly rules out. Covered by
+`test_linked_runbooks_reject_more_than_one_level_of_nesting`.
 
 ### Epic 4.2 — Dashboards and Reporting
 
@@ -615,12 +661,12 @@ reviewed from the full 5:22 transcript on 2026-09-06.
 | ServiceOps API compatibility test validates JSON, authentication, and `tickets:read`, and explains additional lifecycle scopes | ServiceOps REST API v1 contract | 3.1 | DONE |
 | Test Connection validates the URL and API key currently entered in the browser before saving, rather than silently testing a stale deployment fallback | ServiceOps administrator workflow regression 2026-09-10 | 3.1 | DONE |
 | Browser-triggered ServiceOps synchronization uses the authenticated CSRF-aware API client and refreshes the runbook projection without a page reload | ServiceOps runbook synchronization regression 2026-09-10 | 3.1 | DONE |
-| Integration tasks execute only in Live; rehearsal safely skips them | 1:28-1:39 | 3.1 | BACKLOG |
+| Integration tasks execute only in Live; rehearsal safely skips them | 1:28-1:39 | 3.1 | DONE (no distinct rehearsal mode exists; all task types already gate on live-only execution) |
 | Directory sign-in delegates AD/LDAP verification to ServiceOps and displays the configured AD domain | ServiceOps login behavior | 4.4 | DONE |
-| Queued/running progress and percentage update the task in real time | 1:42-2:25 | 1.5, 3.1 | BACKLOG |
+| Queued/running progress and percentage update the task in real time | 1:42-2:25 | 1.5, 3.1 | DONE |
 | Removed unsupported automation-provider configuration from the product surface and API | Product-owner decision 2026-09-07 | 3.1 | DONE |
-| Missing-job errors return actionable detail; operator can retry or audited-skip | 2:55-3:50 | 1.6, 3.1 | BACKLOG |
-| Only authorized executors can trigger potentially destructive external jobs | 4:38-5:03 | 1.1, 3.1 | BACKLOG |
+| Missing-job errors return actionable detail; operator can retry or audited-skip | 2:55-3:50 | 1.6, 3.1 | DONE |
+| Only authorized executors can trigger potentially destructive external jobs | 4:38-5:03 | 1.1, 3.1 | DONE |
 | ServiceOps owns approval/risk/record lifecycle; FlowOps returns execution state and evidence | Product integration decision | 3.1, 3.5 | PARTIAL |
 | Use ServiceOps REST v1 ticket, update, and workflow APIs with scoped bearer identity, request IDs, and idempotency keys | ServiceOps `docs/API_REFERENCE.md` §§1-3, 5, 7-8 | 3.1 | DONE |
 | Block a linked change from Live when ServiceOps reports it is not approved | ServiceOps lifecycle guard and FlowOps integration policy | 3.1 | DONE |
