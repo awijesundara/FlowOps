@@ -320,6 +320,8 @@ def init_db() -> None:
         }
         for column,definition in task_migrations.items():
             if column not in task_columns: db.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
+        user_columns={row[1] for row in db.execute("PRAGMA table_info(users)")}
+        if "dashboard_widgets" not in user_columns: db.execute("ALTER TABLE users ADD COLUMN dashboard_widgets TEXT")
         session_columns={row[1] for row in db.execute("PRAGMA table_info(sessions)")}
         for column,definition in {"ip_address":"TEXT NOT NULL DEFAULT ''","user_agent":"TEXT NOT NULL DEFAULT ''"}.items():
             if column not in session_columns:db.execute(f"ALTER TABLE sessions ADD COLUMN {column} {definition}")
@@ -945,6 +947,10 @@ class Handler(BaseHTTPRequestHandler):
             if path=="/api/auth/me":
                 user=self.current_user(db)
                 if not user: return self.send_json({"error":"Authentication required"},401)
+                raw_widgets=user.get("dashboard_widgets")
+                try: widgets=json.loads(raw_widgets) if raw_widgets else None
+                except json.JSONDecodeError: widgets=None
+                user["dashboard_widgets"]=widgets if widgets is not None else ["runbook_activity","today_readiness","delay_summary"]
                 settings=instance_settings(db,user["instance_id"])
                 return self.send_json({"data":{"user":user,"settings":settings}})
             if path=="/api/admin/users":
@@ -1711,6 +1717,18 @@ class Handler(BaseHTTPRequestHandler):
         path=urllib.parse.urlparse(self.path).path; parts=path.strip("/").split("/")
         try: payload=self.body()
         except (ValueError,json.JSONDecodeError) as exc: return self.send_json({"error":str(exc)},400)
+        if parts==["api","me","dashboard"]:
+            with connect() as db:
+                actor=self.current_user(db)
+                if not actor: return self.send_json({"error":"Authentication required"},401)
+                widgets=payload.get("widgets")
+                if not isinstance(widgets,list) or not all(isinstance(w,str) for w in widgets):
+                    return self.send_json({"error":"widgets must be a list of strings"},400)
+                allowed={"runbook_activity","today_readiness","delay_summary"}
+                widgets=[w for w in widgets if w in allowed]
+                db.execute("UPDATE users SET dashboard_widgets=? WHERE id=?",(json.dumps(widgets),actor["id"]))
+                db.commit()
+                return self.send_json({"data":{"widgets":widgets}})
         if len(parts)==4 and parts[:3]==["api","admin","users"]:
             try: uid=int(parts[3])
             except ValueError:return self.send_json({"error":"Not found"},404)

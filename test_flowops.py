@@ -589,6 +589,18 @@ class FlowOpsTest(unittest.TestCase):
             self.assertEqual(res.status,200); self.assertIn('text/csv',res.headers['Content-Type'])
             csv_body=res.read().decode()
         self.assertIn('Finished late',csv_body)
+    def test_dashboard_widgets_default_to_all_and_persist_per_user(self):
+        code,me=self.req('/api/auth/me')
+        self.assertEqual(code,200)
+        self.assertEqual(sorted(me['data']['user']['dashboard_widgets']),['delay_summary','runbook_activity','today_readiness'])
+        code,updated=self.req('/api/me/dashboard','PATCH',{'widgets':['runbook_activity','not_a_real_widget']})
+        self.assertEqual(code,200)
+        self.assertEqual(updated['data']['widgets'],['runbook_activity'])
+        code,me2=self.req('/api/auth/me')
+        self.assertEqual(me2['data']['user']['dashboard_widgets'],['runbook_activity'])
+    def test_dashboard_widgets_rejects_non_list_payload(self):
+        code,body=self.req('/api/me/dashboard','PATCH',{'widgets':'runbook_activity'})
+        self.assertEqual(code,400)
     def test_seed_runbook_has_backfilled_streams_on_fresh_install(self):
         _,doc=self.req('/api/runbooks/1')
         self.assertGreater(len(doc['data']['streams']),0)
