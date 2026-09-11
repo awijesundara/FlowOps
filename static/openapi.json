@@ -1,0 +1,117 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "FlowOps API",
+    "version": "sandbox",
+    "description": "The documented FlowOps sandbox API (README 'API highlights'). Every endpoint accepts a scoped bearer token (Authorization: Bearer fo_...) created under Administration → API tokens, in addition to a browser session."
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerToken": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "fo_..."
+      }
+    }
+  },
+  "security": [{"bearerToken": []}],
+  "paths": {
+    "/api/runbooks": {
+      "get": {
+        "summary": "List runbooks",
+        "parameters": [
+          {"name": "q", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Search runbook name/task titles"}
+        ],
+        "responses": {"200": {"description": "Array of runbook summaries"}}
+      },
+      "post": {
+        "summary": "Create a runbook",
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+              "name": {"type": "string"},
+              "description": {"type": "string"},
+              "owner": {"type": "string"},
+              "scheduled_at": {"type": "string", "format": "date-time"},
+              "serviceops_ticket": {"type": "string"}
+            }
+          }}}
+        },
+        "responses": {"201": {"description": "Created runbook document"}}
+      }
+    },
+    "/api/runbooks/{id}": {
+      "get": {
+        "summary": "Retrieve execution plan and history",
+        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}],
+        "responses": {"200": {"description": "Full runbook document: tasks, streams, teams, comments, audit"}}
+      }
+    },
+    "/api/runbooks/{id}/tasks": {
+      "post": {
+        "summary": "Add a dependency-aware task",
+        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}],
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {
+            "type": "object",
+            "required": ["title"],
+            "properties": {
+              "title": {"type": "string"},
+              "duration": {"type": "integer", "description": "Minutes"},
+              "stream": {"type": "string"},
+              "task_type": {"type": "string", "enum": ["normal","milestone","checklist","validation","sms","email","call","automation"]},
+              "depends_on": {"type": "array", "items": {"type": "integer"}, "description": "Task IDs this task depends on"}
+            }
+          }}}
+        },
+        "responses": {"201": {"description": "Updated runbook document"}}
+      }
+    },
+    "/api/tasks/{id}": {
+      "patch": {
+        "summary": "Apply a controlled task transition",
+        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}],
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {
+            "type": "object",
+            "properties": {"status": {"type": "string", "enum": ["running","complete","failed","skipped","blocked","pending"]}}
+          }}}
+        },
+        "responses": {"200": {"description": "Updated runbook document"}, "409": {"description": "Dependency or lifecycle gate not satisfied"}}
+      }
+    },
+    "/api/runbooks/{id}/transition": {
+      "post": {
+        "summary": "Apply a runbook transition",
+        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}],
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {
+            "type": "object",
+            "required": ["status"],
+            "properties": {"status": {"type": "string", "enum": ["draft","ready","live","paused","complete","cancelled"]}}
+          }}}
+        },
+        "responses": {"200": {"description": "Updated runbook document"}}
+      }
+    },
+    "/api/runbooks/{id}/serviceops-sync": {
+      "post": {
+        "summary": "Retrieve linked ServiceOps ticket",
+        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}],
+        "responses": {"200": {"description": "Runbook document with refreshed ServiceOps ticket projection"}}
+      }
+    },
+    "/api/events": {
+      "get": {
+        "summary": "Authenticated real-time workspace event stream (SSE)",
+        "responses": {"200": {"description": "text/event-stream of runbook/task change events", "content": {"text/event-stream": {}}}}
+      }
+    }
+  }
+}
