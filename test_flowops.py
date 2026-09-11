@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -312,6 +313,97 @@ class FlowOpsTest(unittest.TestCase):
         _,parentAfter=self.req(f'/api/runbooks/{parent_id}')
         self.assertEqual(parentAfter['data']['aggregate_progress'],round(1*100/3))
         self.assertEqual(parentAfter['data']['aggregate_status'],'live')
+    def test_linked_runbooks_reject_more_than_one_level_of_nesting(self):
+        _,grandparent=self.req('/api/runbooks','POST',{'name':'Grandparent'}); grandparent_id=grandparent['data']['id']
+        _,parent=self.req('/api/runbooks','POST',{'name':'Middle'}); parent_id=parent['data']['id']
+        _,leaf=self.req('/api/runbooks','POST',{'name':'Leaf'}); leaf_id=leaf['data']['id']
+        self.assertEqual(self.req(f'/api/runbooks/{parent_id}','PATCH',{'parent_runbook_id':grandparent_id})[0],200)
+        # parent_id already has a parent (grandparent) -- cannot also become a parent of leaf
+        code,rejected=self.req(f'/api/runbooks/{leaf_id}','PATCH',{'parent_runbook_id':parent_id})
+        self.assertEqual(code,400)
+        self.assertIn('one level',rejected['error'])
+        # a runbook that already HAS children cannot itself become someone else's child
+        _,has_children=self.req('/api/runbooks','POST',{'name':'Has children'}); has_children_id=has_children['data']['id']
+        _,its_child=self.req('/api/runbooks','POST',{'name':'Its child'}); its_child_id=its_child['data']['id']
+        self.assertEqual(self.req(f'/api/runbooks/{its_child_id}','PATCH',{'parent_runbook_id':has_children_id})[0],200)
+        _,other_parent=self.req('/api/runbooks','POST',{'name':'Other parent'}); other_parent_id=other_parent['data']['id']
+        code,rejected2=self.req(f'/api/runbooks/{has_children_id}','PATCH',{'parent_runbook_id':other_parent_id})
+        self.assertEqual(code,400)
+        self.assertIn('one level',rejected2['error'])
+    def test_automation_task_executes_and_reports_success(self):
+        import http.server as http_server_module
+        received=[]
+        class Receiver(http_server_module.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length=int(self.headers.get('Content-Length','0'))
+                received.append(json.loads(self.rfile.read(length)))
+                self.send_response(200); self.end_headers(); self.wfile.write(b'{"ok":true}')
+            def log_message(self,*a): pass
+        receiver=http_server_module.HTTPServer(('127.0.0.1',0),Receiver)
+        threading.Thread(target=receiver.serve_forever,daemon=True).start()
+        try:
+            _,created=self.req('/api/runbooks','POST',{'name':'Automation success'}); rid=created['data']['id']
+            _,task=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Call webhook','task_type':'automation','automation_url':f'http://127.0.0.1:{receiver.server_port}/hook'}); tid=task['data']['tasks'][0]['id']
+            self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'}); self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+            code,started=self.req(f'/api/tasks/{tid}','PATCH',{'status':'running'})
+            self.assertEqual(code,200)
+            started_task=next(t for t in started['data']['tasks'] if t['id']==tid)
+            self.assertEqual(started_task['status'],'running')
+            self.assertEqual(started_task['automation_status'],'queued')
+            for _ in range(50):
+                _,doc=self.req(f'/api/runbooks/{rid}')
+                task_now=next(t for t in doc['data']['tasks'] if t['id']==tid)
+                if task_now['status']=='complete': break
+                time.sleep(0.1)
+            self.assertEqual(task_now['status'],'complete')
+            self.assertEqual(task_now['automation_status'],'success')
+            self.assertEqual(task_now['automation_attempts'],1)
+            self.assertEqual(len(received),1)
+            self.assertEqual(received[0]['task_id'],tid)
+        finally:
+            receiver.shutdown()
+    def test_automation_task_failure_allows_retry_and_audited_skip(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Automation failure'}); rid=created['data']['id']
+        _,task=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Call dead endpoint','task_type':'automation','automation_url':'http://127.0.0.1:1/nowhere'}); tid=task['data']['tasks'][0]['id']
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'}); self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        self.req(f'/api/tasks/{tid}','PATCH',{'status':'running'})
+        task_now=None
+        for _ in range(50):
+            _,doc=self.req(f'/api/runbooks/{rid}')
+            task_now=next(t for t in doc['data']['tasks'] if t['id']==tid)
+            if task_now['status']=='failed': break
+            time.sleep(0.1)
+        self.assertEqual(task_now['status'],'failed')
+        self.assertEqual(task_now['automation_status'],'failed')
+        self.assertIsNotNone(task_now['automation_result'])
+        code,rejected=self.req(f'/api/tasks/{tid}','PATCH',{'status':'skipped'})
+        self.assertEqual(code,400)
+        self.assertIn('reason',rejected['error'])
+        code,skipped=self.req(f'/api/tasks/{tid}','PATCH',{'status':'skipped','skip_reason':'Endpoint permanently decommissioned'})
+        self.assertEqual(code,200)
+        skipped_task=next(t for t in skipped['data']['tasks'] if t['id']==tid)
+        self.assertEqual(skipped_task['status'],'skipped')
+        self.assertEqual(skipped_task['skip_reason'],'Endpoint permanently decommissioned')
+    def test_automation_task_requires_editor_permission_not_just_assignment(self):
+        _,users=self.req('/api/admin/users'); operator_id=next(u['id'] for u in users['data'] if u['username']=='operator')
+        _,created=self.req('/api/runbooks','POST',{'name':'Automation authorization'}); rid=created['data']['id']
+        _,team=self.req(f'/api/runbooks/{rid}/teams','POST',{'name':'Automation Team','user_ids':[operator_id]}); team_id=team['data']['id']
+        _,task=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Restricted automation','task_type':'automation','automation_url':'http://127.0.0.1:1/nowhere','owner_team_id':team_id}); tid=task['data']['tasks'][0]['id']
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'}); self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        admin_opener,admin_csrf=self.opener,self.csrf
+        self.__class__.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())); self.__class__.csrf=''
+        _,login=self.req('/api/auth/login','POST',{'username':'operator','password':'Operator!Preview2026'}); self.__class__.csrf=login['data']['csrf_token']
+        code,rejected=self.req(f'/api/tasks/{tid}','PATCH',{'status':'running'})
+        self.assertEqual(code,403)
+        self.assertIn('editor-level',rejected['error'])
+        self.__class__.opener,self.__class__.csrf=admin_opener,admin_csrf
+    def test_automation_task_requires_url_before_starting(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Automation missing url'}); rid=created['data']['id']
+        _,task=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'No URL set','task_type':'automation'}); tid=task['data']['tasks'][0]['id']
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'}); self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        code,rejected=self.req(f'/api/tasks/{tid}','PATCH',{'status':'running'})
+        self.assertEqual(code,400)
+        self.assertIn('automation URL',rejected['error'])
     def test_custom_fields_typed_definitions_and_values_on_runbooks_and_tasks(self):
         code,textField=self.req('/api/custom-fields','POST',{'name':'Change ticket','entity_type':'runbook','field_type':'text'})
         self.assertEqual(code,201); text_field_id=textField['data']['id']
@@ -375,6 +467,7 @@ class FlowOpsTest(unittest.TestCase):
         # same events and each would deliver them -- so the real assertion
         # here is that every claimed audit id appears in exactly one
         # thread's result, never both.
+        while server.claim_new_audit_events(): pass  # drain any backlog so the cursor starts caught up, regardless of how many audit rows earlier tests produced
         _,before=self.req('/api/admin/audit/export'); start_id=before['data']['events'][-1]['id']
         for i in range(20): self.req('/api/runbooks','POST',{'name':f'Race event {i}'})
         results=[None,None]
