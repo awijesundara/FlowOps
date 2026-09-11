@@ -510,9 +510,39 @@ webhooks authenticate via the secrecy of the destination URL itself, not a
 verifiable signature, so signing them would be meaningless overhead, not
 extra security. Regression test posts to a real local receiver for each
 provider and asserts the provider-specific shape and the absence of a
-signature header. ServiceNow change tracking (P2/L) remains `BACKLOG`.
-ServiceOps remains the first-party complementary connector for the deeper,
-scoped REST integration Epic 3.1 already covers.
+signature header. ServiceOps remains the first-party complementary
+connector for the deeper, scoped REST integration Epic 3.1 already covers.
+
+ServiceNow change tracking (P2/L): `DONE` (2026-09-11). Modeled directly
+on the ServiceOps connector's shape (`serviceops_request`/
+`apply_serviceops_sync`/`sync_serviceops`), not copied -- real
+adaptations for ServiceNow's actual Table API: Basic Auth (username +
+password) rather than a bearer token, since credential storage reuses
+the existing `integration_credentials` table (`provider='servicenow'`)
+with the username as a plain `servicenow_username` setting and the
+password as the stored secret -- a bespoke credential store, not a named
+connection (deferred, see Epic 3.1); response envelope is
+`{"result":...}`, not `{"data":...}`; state is ServiceNow's numeric
+`change_request` state code (`-1` Implement, `3` Closed by default OOB
+configuration), not a string match like ServiceOps's `"Approved"`.
+`GET /api/now/table/change_request?sysparm_query=number=...` links a
+change by number; `PATCH .../change_request/{sys_id}` pushes state on the
+same `live`/`complete` transition hooks ServiceOps already uses,
+independently and in addition to it (`runbooks.servicenow_change_number`/
+`_sys_id`/`_state`/`_synced_at`, parallel to the existing `serviceops_*`
+columns). All ServiceNow HTTP calls go through the new SSRF-hardened
+`safe_urlopen()` (`allow_private_network=True`, since a ServiceNow
+instance is expected to be a trusted, admin-configured destination like
+ServiceOps, not an arbitrary user-supplied URL). Administration →
+Connections gained a ServiceNow policy form (URL, username, password,
+enabled, sync-on-live/complete) alongside the existing ServiceOps one; the
+runbook detail view has a "ServiceNow change" sidebar card (Link/Sync
+action) mirroring the ServiceOps record card. Covered by
+`test_servicenow_connector_syncs_change_and_pushes_lifecycle_state`
+(a real local `http.server`-based double returning ServiceNow-shaped
+JSON -- not `unittest.mock` -- proving GET sync, the `live` transition's
+PATCH with the correct state code, and that the credential is never
+echoed back) and `test_servicenow_integration_requires_username_and_url`.
 
 ### Epic 3.4 — Public REST API
 

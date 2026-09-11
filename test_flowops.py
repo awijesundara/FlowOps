@@ -264,6 +264,53 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(len(matching),1)
         self.assertEqual(matching[0]['owner'],'Nova Reyes')
         self.assertEqual(matching[0]['serviceops_ctask_team'],'Unix')
+    def test_servicenow_connector_syncs_change_and_pushes_lifecycle_state(self):
+        import http.server as http_server_module
+        requests_seen=[]
+        class ServiceNowDouble(http_server_module.BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests_seen.append(('GET',self.path,None))
+                self.send_response(200); self.send_header('Content-Type','application/json'); self.end_headers()
+                self.wfile.write(json.dumps({'result':[{'number':'CHG0001234','sys_id':'abc123def456','state':'-5'}]}).encode())
+            def do_PATCH(self):
+                length=int(self.headers.get('Content-Length','0'))
+                body=json.loads(self.rfile.read(length))
+                requests_seen.append(('PATCH',self.path,body))
+                self.send_response(200); self.send_header('Content-Type','application/json'); self.end_headers()
+                self.wfile.write(json.dumps({'result':{'number':'CHG0001234','sys_id':'abc123def456','state':body.get('state')}}).encode())
+            def log_message(self,*a): pass
+        double=http_server_module.HTTPServer(('127.0.0.1',0),ServiceNowDouble)
+        threading.Thread(target=double.serve_forever,daemon=True).start()
+        try:
+            base=f'http://127.0.0.1:{double.server_port}'
+            with patch('server.safe_urlopen',unrestricted_urlopen):
+                code,saved=self.req('/api/admin/integrations','POST',{'provider':'servicenow','url':base,'username':'svc_flowops','credential':'sn_pw','enabled':True})
+                self.assertEqual(code,200)
+                code,tested=self.req('/api/admin/integrations/test','POST',{'provider':'servicenow'})
+                self.assertEqual(code,200); self.assertTrue(tested['data']['ok'])
+                _,created=self.req('/api/runbooks','POST',{'name':'ServiceNow-tracked change'}); rid=created['data']['id']
+                code,synced=self.req(f'/api/runbooks/{rid}/servicenow-sync','POST',{'ticket':'CHG0001234'})
+                self.assertEqual(code,200)
+                self.assertEqual(synced['data']['servicenow_change_number'],'CHG0001234')
+                self.assertEqual(synced['data']['servicenow_state'],'-5')
+                self.assertEqual(synced['servicenow']['sys_id'],'abc123def456')
+                self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})
+                code,transitioned=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+                self.assertEqual(code,200)
+                self.assertEqual(transitioned['data']['servicenow_state'],'-1')  # Implement
+                patch_requests=[r for r in requests_seen if r[0]=='PATCH']
+                self.assertEqual(len(patch_requests),1)
+                self.assertEqual(patch_requests[0][2],{'state':'-1'})
+            # non-mock, real request path -- credential is never echoed back
+            _,connections=self.req('/api/admin/integrations')
+            self.assertNotIn('credential',connections['data']['servicenow'])
+            self.assertNotIn('password',connections['data']['servicenow'])
+        finally:
+            double.shutdown()
+    def test_servicenow_integration_requires_username_and_url(self):
+        self.req('/api/admin/integrations','POST',{'provider':'servicenow','url':'','username':'','revoke_credential':True})
+        code,body=self.req('/api/admin/integrations/test','POST',{'provider':'servicenow'})
+        self.assertEqual(code,400)
     def test_completing_a_task_pushes_its_ctask_state_back_to_serviceops(self):
         self.req('/api/admin/integrations','POST',{'provider':'serviceops','url':'https://serviceops.example','credential':'sop_ctask_push','enabled':True})
         _,created=self.req('/api/runbooks','POST',{'name':'Push-back change','serviceops_ticket':'CHG0000044'});rid=created['data']['id']
