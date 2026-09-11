@@ -1479,6 +1479,42 @@ class FlowOpsTest(unittest.TestCase):
                 self.assertEqual(len(tables),1)
                 listed=server.list_backups()
                 self.assertTrue(any(b['filename']==result['filename'] and b['encrypted'] for b in listed))
+    def test_dashboard_email_render_includes_runbook_and_completion_data(self):
+        with server.connect() as db:
+            instance_id=db.execute("SELECT id FROM instances WHERE slug='flowops'").fetchone()[0]
+        _,created=self.req('/api/runbooks','POST',{'name':'Digest visibility check'})
+        with server.connect() as db:
+            subject,body=server.render_dashboard_email(db,instance_id)
+        self.assertIn('FlowOps digest',subject)
+        self.assertIn('Active runbooks',body)
+        self.assertIn('Task completion',body)
+        self.assertIn('Late or at-risk tasks',body)
+    def test_dashboard_email_scheduling_gate_sends_only_once_per_configured_interval(self):
+        self.req('/api/admin/settings','POST',{'dashboard_email_frequency':'daily','dashboard_email_hour':'9','dashboard_email_recipients':'ops@example.com, lead@example.com'})
+        with server.connect() as db:
+            instance_id=db.execute("SELECT id FROM instances WHERE slug='flowops'").fetchone()[0]
+        wrong_hour=server.datetime(2026,1,1,8,0,tzinfo=server.timezone.utc)
+        with patch('server.send_mail') as send:
+            with server.connect() as db:
+                sent=server.maybe_send_dashboard_email(db,instance_id,current_time=wrong_hour)
+            self.assertFalse(sent); send.assert_not_called()
+        first_run=server.datetime(2026,1,1,9,5,tzinfo=server.timezone.utc)
+        with patch('server.send_mail') as send:
+            with server.connect() as db:
+                sent=server.maybe_send_dashboard_email(db,instance_id,current_time=first_run)
+            self.assertTrue(sent); self.assertEqual(send.call_count,2)  # two configured recipients
+        # same day, same hour again -- must NOT re-send (daily gate not yet elapsed)
+        later_same_day=server.datetime(2026,1,1,9,10,tzinfo=server.timezone.utc)
+        with patch('server.send_mail') as send:
+            with server.connect() as db:
+                sent=server.maybe_send_dashboard_email(db,instance_id,current_time=later_same_day)
+            self.assertFalse(sent); send.assert_not_called()
+        # 25 hours later, same configured hour -- daily gate has elapsed, due again
+        next_day=server.datetime(2026,1,2,9,5,tzinfo=server.timezone.utc)
+        with patch('server.send_mail') as send:
+            with server.connect() as db:
+                sent=server.maybe_send_dashboard_email(db,instance_id,current_time=next_day)
+            self.assertTrue(sent)
     def test_api_explorer_openapi_doc_paths_resolve_to_real_routes(self):
         code,body=self.req('/openapi.json')
         self.assertEqual(code,200)
