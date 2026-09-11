@@ -492,12 +492,36 @@ compliance-grade evidence.
 |---|---:|---:|
 | Dependency and scheduling engine automated coverage | P0 | PARTIAL |
 | Real-time load test before each phase | P0 | DONE for Phase 1 |
-| Structured API/background-job logging and error tracking | P0 | BACKLOG |
-| Database backup and point-in-time recovery | P0 | BACKLOG |
-| Public API rate limiting | P1 | BACKLOG |
+| Structured API/background-job logging and error tracking | P0 | DONE |
+| Database backup and point-in-time recovery | P0 | DONE (snapshot backup, not continuous PITR) |
+| Public API rate limiting | P1 | DONE |
 | Core execution UI accessibility review | P1 | PARTIAL |
 | Internationalization scaffolding | P2 | BACKLOG |
 | FlowOps platform disaster-recovery plan | P1 | BACKLOG |
+
+Foundational hygiene (2026-09-11): every `do_GET`/`do_POST`/`do_PATCH`/
+`do_DELETE` dispatcher is now wrapped so an unhandled exception can no
+longer crash the connection silently — it's logged as a structured JSON
+line (`error_id`, exception type, full traceback) and the client gets a
+500 with that same `error_id` for correlation, instead of a bare
+connection reset. Database backups run automatically every
+`FLOWOPS_BACKUP_INTERVAL_HOURS` (default 6h) via SQLite's own hot-backup
+API (safe against a live database), retaining the last
+`FLOWOPS_BACKUP_RETAIN` (default 14) snapshots under `<data dir>/backups`
+— inside the same persistent volume as the live database, so it survives
+pod restarts. This is honestly a snapshot backup, not continuous
+WAL-shipping PITR: recovery granularity is the backup interval, not
+per-transaction. `Administration → Platform & security → Database
+backups` lists existing backups and can trigger one on demand;
+`GET`/`POST /api/admin/backups` back it. Public API tokens (`Bearer
+fo_...`) are now rate-limited to `FLOWOPS_API_RATE_LIMIT` (default 120)
+requests per rolling minute per token, returning `429` with a
+`Retry-After` header when exceeded — session-cookie browser traffic
+(the SPA's own polling) is unaffected. Covered by
+`test_unhandled_exception_returns_structured_500_instead_of_crashing`,
+`test_admin_can_trigger_and_list_database_backups`,
+`test_backup_retention_deletes_oldest_beyond_retain_limit`, and
+`test_api_token_requests_are_rate_limited`.
 
 Accessibility review evidence (2026-09-10): this pass was a manual code review
 of `static/index.html`/`app.js` (no headless-browser/axe-core tooling was
@@ -562,7 +586,7 @@ FlowOps, but remain subordinate to the phase and P0 ordering above.
 | Workspace list/table/timeline views, sorting, filters, saved views | QS p8-p13 | 2.2 | BACKLOG |
 | Folders, nested folders, sticky/applied filters | QS p13 | 2.2 | BACKLOG |
 | Runbook type selection and blank/template creation | QS p19-p20 | 2.2, 2.3 | PARTIAL |
-| Central teams propagate membership into linked runbook teams | QS p10-p11, p22 | 2.4 | BACKLOG |
+| Central teams propagate membership into linked runbook teams | QS p10-p11, p22 | 2.4 | DONE |
 | Interactive dependency node map with critical path | QS p17 | 2.6 | PARTIAL |
 | Runbook home/pages for operational instructions and links | QS p16 | 2.2 | BACKLOG |
 | CSV task import, filtered export, Excel/timezone options | QS p23 | 2.5 | BACKLOG |

@@ -15,6 +15,7 @@ import ssl
 import subprocess
 import threading
 import time
+import traceback
 import base64
 import urllib.error
 import urllib.parse
@@ -78,6 +79,9 @@ class SettingsCipher:
 
 VERSION = (Path(__file__).with_name("VERSION").read_text().strip() if Path(__file__).with_name("VERSION").exists() else "0.0.0")
 DB_PATH = os.getenv("FLOWOPS_DB", str(Path(__file__).with_name("flowops.db")))
+BACKUP_DIR = Path(os.getenv("FLOWOPS_BACKUP_DIR", str(Path(DB_PATH).parent / "backups")))
+BACKUP_RETAIN = int(os.getenv("FLOWOPS_BACKUP_RETAIN", "14"))
+BACKUP_INTERVAL_HOURS = float(os.getenv("FLOWOPS_BACKUP_INTERVAL_HOURS", "6"))
 STATIC = Path(__file__).with_name("static")
 MAX_BODY = 1_000_000
 SESSION_SECONDS = 8 * 60 * 60
@@ -108,6 +112,68 @@ def connect() -> sqlite3.Connection:
     db.execute("PRAGMA foreign_keys=ON")
     db.execute("PRAGMA journal_mode=WAL")
     return db
+
+
+def list_backups() -> list[dict[str, Any]]:
+    if not BACKUP_DIR.exists(): return []
+    items=[]
+    for path in sorted(BACKUP_DIR.glob("flowops-*.db"), reverse=True):
+        stat=path.stat()
+        items.append({"filename":path.name,"size_bytes":stat.st_size,"created_at":datetime.fromtimestamp(stat.st_mtime,tz=timezone.utc).isoformat(timespec="seconds")})
+    return items
+
+
+def backup_database() -> dict[str, Any]:
+    """Hot, consistent snapshot backup using SQLite's own backup API (safe to
+    run against a live database, unlike a plain file copy). This is
+    point-in-time *snapshot* backup, not continuous/WAL-shipping PITR --
+    recovery granularity is the backup interval, not per-transaction."""
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + f"{datetime.now(timezone.utc).microsecond:06d}Z"
+    dest_path = BACKUP_DIR / f"flowops-{stamp}.db"
+    source = sqlite3.connect(DB_PATH)
+    try:
+        dest = sqlite3.connect(str(dest_path))
+        try:
+            source.backup(dest)
+        finally:
+            dest.close()
+    finally:
+        source.close()
+    backups = sorted(BACKUP_DIR.glob("flowops-*.db"), reverse=True)
+    for stale in backups[BACKUP_RETAIN:]:
+        stale.unlink(missing_ok=True)
+    return {"filename": dest_path.name, "size_bytes": dest_path.stat().st_size}
+
+
+API_RATE_LIMIT = int(os.getenv("FLOWOPS_API_RATE_LIMIT", "120"))  # requests per window, per API token
+API_RATE_WINDOW_SECONDS = 60
+_rate_limit_state: dict[str, tuple[float, int]] = {}
+_rate_limit_lock = threading.Lock()
+
+
+def check_rate_limit(key: str) -> int | None:
+    """Fixed-window limiter. Returns None if the request is allowed, or the
+    number of seconds the caller should wait (Retry-After) if it isn't."""
+    now_ts = time.monotonic()
+    with _rate_limit_lock:
+        window_start, count = _rate_limit_state.get(key, (now_ts, 0))
+        if now_ts - window_start >= API_RATE_WINDOW_SECONDS:
+            window_start, count = now_ts, 0
+        count += 1
+        _rate_limit_state[key] = (window_start, count)
+        if count > API_RATE_LIMIT:
+            return max(1, int(API_RATE_WINDOW_SECONDS - (now_ts - window_start)))
+    return None
+
+
+def backup_loop() -> None:
+    while True:
+        time.sleep(BACKUP_INTERVAL_HOURS * 3600)
+        try:
+            backup_database()
+        except Exception as exc:
+            print(json.dumps({"ts":now(),"level":"error","message":f"scheduled backup failed: {exc}"},separators=(",",":")))
 
 
 def init_db() -> None:
@@ -780,6 +846,20 @@ class Handler(BaseHTTPRequestHandler):
     def log_error(self, fmt, *args):
         print(json.dumps({"ts":now(),"level":"error","client":self.address_string(),"message":fmt%args},separators=(",",":")))
 
+    def _handle_unexpected_error(self, exc: Exception):
+        error_id=uuid.uuid4().hex[:12]
+        print(json.dumps({
+            "ts":now(),"level":"error","error_id":error_id,"client":self.address_string(),
+            "method":self.command,"path":self.path.split("?")[0] if getattr(self,"path",None) else None,
+            "exception":f"{type(exc).__name__}: {exc}",
+            "traceback":traceback.format_exc(),
+        },separators=(",",":")))
+        try:
+            if not self.wfile.closed:
+                self.send_json({"error":"An unexpected error occurred.","error_id":error_id},500)
+        except Exception:
+            pass
+
     def send_json(self, payload: Any, status=200, headers: dict[str,str] | None=None):
         body=json.dumps(payload, separators=(",", ":")).encode()
         self.send_response(status); self.send_header("Content-Type","application/json; charset=utf-8")
@@ -817,6 +897,10 @@ class Handler(BaseHTTPRequestHandler):
         user=self.current_user(db)
         if not user:
             self.send_json({"error":"Authentication required"},401); return None
+        if user.get("auth_method")=="token":
+            retry_after=check_rate_limit(f"token:{user['username']}")
+            if retry_after:
+                self.send_json({"error":"Rate limit exceeded. Slow down and try again shortly."},429,{"Retry-After":str(retry_after)}); return None
         if permission not in user["permissions"]:
             self.send_json({"error":f"Your {user['role']} role does not allow this action"},403); return None
         if user.get("auth_method")=="session" and self.command in {"POST","PATCH","PUT","DELETE"} and self.headers.get("X-CSRF-Token","") != user["csrf_token"]:
@@ -925,6 +1009,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_GET(self):
+        try: return self._do_GET()
+        except Exception as exc: return self._handle_unexpected_error(exc)
+
+    def _do_GET(self):
         path=urllib.parse.urlparse(self.path).path
         if path=="/": return self.static("index.html","text/html; charset=utf-8")
         if path=="/app.js": return self.static("app.js","application/javascript; charset=utf-8")
@@ -1030,6 +1118,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not actor:return
                 counts=db.execute("SELECT (SELECT COUNT(*) FROM users WHERE instance_id=? AND active=1),(SELECT COUNT(*) FROM workspaces WHERE instance_id=? AND active=1),(SELECT COUNT(*) FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE w.instance_id=?),(SELECT COUNT(*) FROM sessions s JOIN users u ON u.id=s.user_id WHERE u.instance_id=? AND s.expires_at>?)",(actor["instance_id"],actor["instance_id"],actor["instance_id"],actor["instance_id"],int(time.time()))).fetchone()
                 return self.send_json({"data":{"status":"healthy","version":VERSION,"database":db.execute("PRAGMA integrity_check").fetchone()[0],"active_users":counts[0],"workspaces":counts[1],"runbooks":counts[2],"active_sessions":counts[3],"email_configured":mail_configuration()["configured"],"credential_encryption_configured":bool(os.getenv("FLOWOPS_SETTINGS_ENCRYPTION_KEY")),"realtime":"SSE"}})
+            if path=="/api/admin/backups":
+                actor=self.require(db,"admin:access")
+                if not actor:return
+                return self.send_json({"data":{"backups":list_backups(),"retain":BACKUP_RETAIN,"interval_hours":BACKUP_INTERVAL_HOURS}})
             if path=="/api/workspaces":
                 actor=self.require(db,"runbooks:view")
                 if not actor: return
@@ -1180,6 +1272,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
     def do_POST(self):
+        try: return self._do_POST()
+        except Exception as exc: return self._handle_unexpected_error(exc)
+
+    def _do_POST(self):
         path=urllib.parse.urlparse(self.path).path
         try: payload=self.body()
         except (ValueError,json.JSONDecodeError) as exc: return self.send_json({"error":str(exc)},400)
@@ -1265,6 +1361,13 @@ class Handler(BaseHTTPRequestHandler):
                 try: db.execute("INSERT INTO users(username,display_name,email,role,team,password_hash,created_at,instance_id) VALUES(?,?,?,?,?,?,?,?)",(username,display,str(payload.get("email",""))[:180],role,str(payload.get("team",""))[:120],password_hash(password),now(),actor["instance_id"]))
                 except sqlite3.IntegrityError:return self.send_json({"error":"That username already exists"},409)
                 append_audit(db,None,"admin.user_created",f"{username} as {role}",actor["display_name"],actor["instance_id"]); db.commit(); return self.send_json({"data":{"ok":True}},201)
+            if path=="/api/admin/backups":
+                actor=self.require(db,"admin:access")
+                if not actor:return
+                try: result=backup_database()
+                except Exception as exc:return self.send_json({"error":f"Backup failed: {exc}"},500)
+                append_audit(db,None,"admin.backup_created",result["filename"],actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":result},201)
             if path=="/api/admin/workspace-managers":
                 actor=self.require(db,"admin:users")
                 if not actor:return
@@ -1730,6 +1833,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"error":"Not found"},404)
 
     def do_PATCH(self):
+        try: return self._do_PATCH()
+        except Exception as exc: return self._handle_unexpected_error(exc)
+
+    def _do_PATCH(self):
         path=urllib.parse.urlparse(self.path).path; parts=path.strip("/").split("/")
         try: payload=self.body()
         except (ValueError,json.JSONDecodeError) as exc: return self.send_json({"error":str(exc)},400)
@@ -1891,6 +1998,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"data":doc})
 
     def do_DELETE(self):
+        try: return self._do_DELETE()
+        except Exception as exc: return self._handle_unexpected_error(exc)
+
+    def _do_DELETE(self):
         path=urllib.parse.urlparse(self.path).path; parts=path.strip("/").split("/")
         if len(parts)==5 and parts[:3]==["api","admin","workspace-managers"]:
             with connect() as db:
@@ -2171,6 +2282,7 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     init_db()
     threading.Thread(target=webhook_dispatcher_loop, daemon=True).start()
+    threading.Thread(target=backup_loop, daemon=True).start()
     host=os.getenv("FLOWOPS_HOST","127.0.0.1"); port=int(os.getenv("FLOWOPS_PORT","8080"))
     print(f"FlowOps listening on http://{host}:{port}")
     ThreadingHTTPServer((host,port),Handler).serve_forever()
