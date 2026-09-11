@@ -921,11 +921,56 @@ already in place one level up in the same file. Covered by
 horizontal page overflow, and asserts every visible task action button's
 real bounding box is at least 44×44px.
 
-Push notifications for assignment/overdue work (P2/M): `BACKLOG`, in
-progress — interpreted as standards-based Web Push (VAPID, no encrypted
-payload — an empty wake-up ping plus an authenticated content fetch),
+Push notifications for assignment/overdue work (P2/M): `DONE` (2026-09-11)
+for task assignment; overdue-work push is not wired in this pass (see
+scope note below) — interpreted as standards-based Web Push (VAPID),
 since native APNs/FCM push requires a paid mobile developer account not
-available in this environment.
+available in this environment. RFC 8291 payload encryption needs ECDH
+over P-256 + AES-GCM + HKDF, none of which exist in the Python stdlib
+(unlike the RSA modexp trick that makes the hand-rolled JWT verifier
+possible) — resolved with the RFC-8030-compliant no-payload wake-up-ping
+pattern instead: `static/sw.js`'s `push` handler shows a generic "you have
+new activity" notification with no content, and clicking it opens the
+app, where the existing real-time SSE activity feed (`/api/events`,
+already shipped) takes over. VAPID JWT signing (ES256 / ECDSA P-256, also
+absent from the stdlib) shells out to `openssl`, the same external-process
+pattern `SettingsCipher` already establishes and this codebase already
+trusts — `generate_vapid_keypair()`, `vapid_jwt()`, and a hand-rolled
+`_der_ecdsa_signature_to_raw()` (openssl's signature output is DER, JOSE's
+ES256 needs fixed-width raw r‖s). One VAPID keypair is generated lazily
+per instance and its private key encrypted at rest with the existing
+`SettingsCipher` (`vapid_keys` table). `GET /api/push/vapid-public-key`,
+`POST`/`DELETE /api/push/subscribe` (`push_subscriptions` table, one row
+per browser/device); a 404/410 from the push service during delivery
+prunes the stale subscription automatically instead of retrying forever.
+Wired into task assignment (`PATCH /api/tasks/{id}` with a changed
+`owner_user_id` triggers `notify_task_assignment()`) — **narrower than the
+epic's full name**: overdue-work detection is not wired in this pass (no
+new background loop consuming it); assignment via the bulk-edit endpoint
+and task-creation-with-owner are also not wired, only the single-task edit
+path is, since that's the primary real assignment flow exercised by the
+UI. Stated here explicitly as a scope decision, not an oversight. Frontend:
+a "🔔 Enable push notifications" button in the profile Privacy tab
+registers `/sw.js` and calls `PushManager.subscribe()`. Tests:
+`test_vapid_jwt_is_a_real_ec_signature_verifiable_by_openssl_itself`
+(generates a real keypair, signs a real JWT, and asks `openssl` itself —
+independently of this app's own signer — to verify the signature),
+`test_push_subscribe_stores_and_unsubscribe_removes_a_real_subscription`,
+`test_task_assignment_sends_a_real_web_push_and_expired_subscription_is_pruned`
+(a real local HTTP double receives the push, asserting the real `vapid
+t=…, k=…` Authorization header shape, empty body, and TTL header; a
+second double returning 410 confirms the stale subscription is deleted).
+`test_browser.py`'s
+`test_enabling_push_notifications_registers_a_real_service_worker_and_subscribes`
+verifies real service-worker registration and a real 65-byte P-256 VAPID
+key shape in an actual browser, then attempts a real
+`pushManager.subscribe()` call — this step needs the browser to reach a
+real push service (Google's, in Chrome), which this sandboxed headless
+test environment cannot do (`AbortError: Registration failed`), so it
+skips with an explicit, honest reason rather than reporting false success;
+full subscribe-through-delivery remains a manual verification step in a
+real browser, exactly as anticipated. Verified live in the Docker preview:
+`/api/push/vapid-public-key` returns a real, correctly-shaped key.
 
 ### Epic 4.6 — Multi-Region and Scale
 

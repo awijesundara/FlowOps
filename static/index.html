@@ -20,6 +20,7 @@
 </div>
 <div id="profileTabPrivacy" class="profile-pane">
 <p class="muted">Download a copy of your profile, sign-in and activity history, and assigned task history as JSON.</p><button class="secondary" id="exportMyData">⇩ Download my data</button>
+<hr><p class="muted">Get a browser notification when a task is assigned to you, even when FlowOps isn't open.</p><button class="secondary" id="enablePush">🔔 Enable push notifications</button>
 </div>
 </dialog>
 <dialog id="userModal"><form id="userForm"><div class="modalhead"><div><span class="eyebrow">IDENTITY & ACCESS</span><h2>Add workspace user</h2></div><button type="button" class="close-user" aria-label="Close">×</button></div><div class="formgrid"><label>Username<input name="username" required></label><label>Display name<input name="display_name" required></label></div><label>Email<input name="email" type="email"></label><div class="formgrid"><label>Role<select name="role"><option>Viewer</option><option>Operator</option><option>Runbook Manager</option><option>Administrator</option></select></label><label>Team<input name="team"></label></div><label>Temporary password<input name="password" type="password" minlength="12" required></label><div class="modalactions"><button type="button" class="secondary close-user">Cancel</button><button class="primary">Create user</button></div></form></dialog>

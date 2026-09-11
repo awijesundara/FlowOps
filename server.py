@@ -16,6 +16,7 @@ import sqlite3
 import smtplib
 import ssl
 import subprocess
+import tempfile
 import threading
 import time
 import traceback
@@ -765,6 +766,15 @@ def init_db() -> None:
           redirect_to TEXT NOT NULL, instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
           expires_at INTEGER NOT NULL, created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS vapid_keys (
+          instance_id INTEGER PRIMARY KEY REFERENCES instances(id) ON DELETE CASCADE,
+          private_key_pem_encrypted TEXT NOT NULL, public_key_b64url TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS push_subscriptions (
+          id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+          endpoint TEXT NOT NULL UNIQUE, p256dh TEXT NOT NULL, auth TEXT NOT NULL, created_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS folder_creator_grants (
           user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           folder_id INTEGER NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
@@ -1071,6 +1081,107 @@ def settings_cipher() -> SettingsCipher:
     if not key: raise RuntimeError("FLOWOPS_SETTINGS_ENCRYPTION_KEY is required for administrator-managed credentials")
     try:return SettingsCipher(key)
     except (ValueError,TypeError) as exc:raise RuntimeError("FLOWOPS_SETTINGS_ENCRYPTION_KEY is invalid") from exc
+
+
+# --- Web Push (VAPID, RFC 8030/8292) ------------------------------------
+# The Web Push payload-encryption spec (RFC 8291) needs ECDH over P-256 +
+# AES-GCM + HKDF -- none of which exist in Python's stdlib, unlike the RSA
+# modexp trick that makes the hand-rolled JWT verifier above possible.
+# Resolution: ship push with NO encrypted payload -- an empty-body wake-up
+# ping (a legitimate, RFC-8030-compliant pattern), and the service worker
+# fetches real content from FlowOps's own authenticated API once woken.
+# VAPID JWT signing (ES256 / ECDSA P-256) still has no stdlib primitive,
+# so it shells out to `openssl`, the exact same external-process pattern
+# SettingsCipher already establishes and this codebase already trusts.
+def _der_ecdsa_signature_to_raw(der: bytes, size: int = 32) -> bytes:
+    """Converts an openssl DER-encoded ECDSA signature (SEQUENCE of two
+    INTEGERs) into the fixed-width raw r||s format JOSE's ES256 requires."""
+    if der[0] != 0x30: raise ValueError("Not a DER SEQUENCE")
+    idx = 2
+    if der[idx] != 0x02: raise ValueError("Expected INTEGER (r)")
+    rlen = der[idx+1]; r = der[idx+2:idx+2+rlen]; idx = idx+2+rlen
+    if der[idx] != 0x02: raise ValueError("Expected INTEGER (s)")
+    slen = der[idx+1]; s = der[idx+2:idx+2+slen]
+    def fixed(component: bytes) -> bytes:
+        component = component.lstrip(b"\x00")
+        if len(component) < size: component = b"\x00" * (size - len(component)) + component
+        return component[-size:]
+    return fixed(r) + fixed(s)
+
+
+def generate_vapid_keypair() -> tuple[str, str]:
+    """Generates a real P-256 EC keypair via openssl. Returns
+    (private_key_pem, public_key_b64url) -- the public key is the raw
+    65-byte uncompressed point, exactly the shape browsers' PushManager
+    expects for applicationServerKey."""
+    with tempfile.TemporaryDirectory() as tmp:
+        priv_path = os.path.join(tmp, "vapid.pem")
+        subprocess.run(["openssl","ecparam","-genkey","-name","prime256v1","-noout","-out",priv_path], check=True, capture_output=True)
+        private_key_pem = Path(priv_path).read_text()
+        pub_der = subprocess.run(["openssl","ec","-in",priv_path,"-pubout","-conv_form","uncompressed","-outform","DER"], check=True, capture_output=True).stdout
+        raw_point = pub_der[-65:]
+        if raw_point[0] != 0x04: raise RuntimeError("Unexpected EC public key encoding")
+        return private_key_pem, base64.urlsafe_b64encode(raw_point).rstrip(b"=").decode()
+
+
+def vapid_keypair(db: sqlite3.Connection, instance_id: int) -> tuple[str, str]:
+    """Lazily generates and persists one VAPID keypair per instance (the
+    private key encrypted at rest with the same SettingsCipher already
+    used for admin-managed credentials elsewhere in this file)."""
+    row = db.execute("SELECT private_key_pem_encrypted,public_key_b64url FROM vapid_keys WHERE instance_id=?", (instance_id,)).fetchone()
+    if row:
+        private_key_pem = settings_cipher().decrypt(row["private_key_pem_encrypted"].encode()).decode()
+        return private_key_pem, row["public_key_b64url"]
+    private_key_pem, public_key_b64url = generate_vapid_keypair()
+    encrypted = settings_cipher().encrypt(private_key_pem.encode()).decode()
+    db.execute("INSERT INTO vapid_keys(instance_id,private_key_pem_encrypted,public_key_b64url,created_at) VALUES(?,?,?,?)", (instance_id, encrypted, public_key_b64url, now()))
+    return private_key_pem, public_key_b64url
+
+
+def vapid_jwt(private_key_pem: str, audience: str, subject: str = "mailto:admin@flowops.local") -> str:
+    """Signs a VAPID authentication JWT (RFC 8292) for a single push
+    request -- ES256, 12-hour expiry, audience is the push service's own
+    origin (not the subscriber's origin)."""
+    header = base64.urlsafe_b64encode(json.dumps({"typ":"JWT","alg":"ES256"}, separators=(",",":")).encode()).rstrip(b"=").decode()
+    payload = base64.urlsafe_b64encode(json.dumps({"aud":audience,"exp":int(time.time())+43200,"sub":subject}, separators=(",",":")).encode()).rstrip(b"=").decode()
+    signing_input = f"{header}.{payload}".encode()
+    with tempfile.TemporaryDirectory() as tmp:
+        priv_path = os.path.join(tmp, "vapid.pem")
+        Path(priv_path).write_text(private_key_pem)
+        sig_der = subprocess.run(["openssl","dgst","-sha256","-sign",priv_path], input=signing_input, check=True, capture_output=True).stdout
+    raw_sig = _der_ecdsa_signature_to_raw(sig_der)
+    signature = base64.urlsafe_b64encode(raw_sig).rstrip(b"=").decode()
+    return f"{header}.{payload}.{signature}"
+
+
+def send_web_push(db: sqlite3.Connection, subscription: dict[str, Any], instance_id: int) -> None:
+    """Sends a no-payload wake-up ping (RFC 8030) to one push subscription.
+    Never raises -- a push-service outage or an expired subscription must
+    not block whatever real action (task assignment, etc.) triggered it;
+    a 404/410 from the push service means the subscription is gone and is
+    cleaned up here instead of retried forever."""
+    try:
+        private_key_pem, public_key_b64url = vapid_keypair(db, instance_id)
+        endpoint = subscription["endpoint"]
+        audience = f"{urllib.parse.urlsplit(endpoint).scheme}://{urllib.parse.urlsplit(endpoint).netloc}"
+        token = vapid_jwt(private_key_pem, audience)
+        headers = {"TTL": "2419200", "Authorization": f"vapid t={token}, k={public_key_b64url}", "Content-Length": "0"}
+        try:
+            response = safe_urlopen(endpoint, data=b"", headers=headers, method="POST", timeout=8, allow_private_network=False)
+            with response:
+                status = response.status
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        if status in (404, 410):
+            db.execute("DELETE FROM push_subscriptions WHERE endpoint=?", (endpoint,)); db.commit()
+    except Exception as exc:
+        print(json.dumps({"ts":now(),"level":"warn","message":f"web push delivery failed: {exc}"}), flush=True)
+
+
+def notify_task_assignment(db: sqlite3.Connection, instance_id: int, user_id: int | None) -> None:
+    if not user_id: return
+    for row in db.execute("SELECT * FROM push_subscriptions WHERE user_id=? AND instance_id=?", (user_id, instance_id)).fetchall():
+        send_web_push(db, dict(row), instance_id)
 
 
 def integration_credential(db: sqlite3.Connection, instance_id: int, provider: str) -> tuple[str,str]:
@@ -1695,6 +1806,7 @@ class Handler(BaseHTTPRequestHandler):
         if path=="/": return self.static("index.html","text/html; charset=utf-8")
         if path=="/app.js": return self.static("app.js","application/javascript; charset=utf-8")
         if path=="/strings.js": return self.static("strings.js","application/javascript; charset=utf-8")
+        if path=="/sw.js": return self.static("sw.js","application/javascript; charset=utf-8")
         if path=="/styles.css": return self.static("styles.css","text/css; charset=utf-8")
         if path=="/api-explorer": return self.static("api-explorer.html","text/html; charset=utf-8")
         if path=="/api-explorer.js": return self.static("api-explorer.js","application/javascript; charset=utf-8")
@@ -1751,6 +1863,11 @@ class Handler(BaseHTTPRequestHandler):
                 user["dashboard_widgets"]=widgets if widgets is not None else ["runbook_activity","today_readiness","delay_summary"]
                 settings=instance_settings(db,user["instance_id"])
                 return self.send_json({"data":{"user":user,"settings":settings}})
+            if path=="/api/push/vapid-public-key":
+                actor=self.current_user(db)
+                if not actor: return self.send_json({"error":"Authentication required"},401)
+                _,public_key=vapid_keypair(db,actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"public_key":public_key}})
             if path=="/api/admin/users":
                 actor=self.require(db,"admin:users")
                 if not actor: return
@@ -2058,6 +2175,19 @@ class Handler(BaseHTTPRequestHandler):
                 db.execute("DELETE FROM sessions WHERE expires_at<=?",(int(time.time()),)); db.execute("INSERT INTO sessions(token_hash,csrf_token,user_id,expires_at,created_at,ip_address,user_agent) VALUES(?,?,?,?,?,?,?)",(hashlib.sha256(raw.encode()).hexdigest(),csrf,user["id"],expires,now(),self.client_address[0][:64],self.headers.get("User-Agent","")[:300])); db.execute("UPDATE users SET last_login_at=? WHERE id=?",(now(),user["id"])); append_audit(db,None,"auth.sso_login",f"{user['username']} signed in via Cloudflare Access ({email})",user["display_name"],user["instance_id"]); db.commit()
                 safe={k:user[k] for k in ("id","username","display_name","email","role","team")}; safe["permissions"]=sorted(ROLE_PERMISSIONS[user["role"]]); safe["csrf_token"]=csrf
                 return self.send_json({"data":safe},headers={"Set-Cookie":f"flowops_session={raw}; Path=/; HttpOnly; SameSite=Strict; Max-Age={session_seconds}"})
+            if path=="/api/push/subscribe":
+                actor=self.current_user(db)
+                if not actor: return self.send_json({"error":"Authentication required"},401)
+                if actor.get("auth_method")=="session" and self.headers.get("X-CSRF-Token","") != actor["csrf_token"]: return self.send_json({"error":"Invalid or missing CSRF token"},403)
+                endpoint=str(payload.get("endpoint","")).strip()
+                keys=payload.get("keys") or {}
+                p256dh=str(keys.get("p256dh","")).strip(); auth_key=str(keys.get("auth","")).strip()
+                if not endpoint or not (endpoint.startswith("http://") or endpoint.startswith("https://")): return self.send_json({"error":"A valid push subscription endpoint is required"},400)
+                if not p256dh or not auth_key: return self.send_json({"error":"Subscription is missing its p256dh/auth keys"},400)
+                db.execute("INSERT INTO push_subscriptions(user_id,instance_id,endpoint,p256dh,auth,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth",
+                    (actor["id"],actor["instance_id"],endpoint[:1000],p256dh[:400],auth_key[:400],now()))
+                db.commit()
+                return self.send_json({"data":{"ok":True}},201)
             if path=="/api/profile/avatar":
                 actor=self.current_user(db)
                 if not actor: return self.send_json({"error":"Authentication required"},401)
@@ -2892,10 +3022,13 @@ class Handler(BaseHTTPRequestHandler):
                     if field=="duration": value=max(0,min(int(value),10080))
                     if value==task[field]: continue
                     changes.append(f"{field}: {task[field]!r} → {value!r}"); sets.append(f"{field}=?"); values.append(value)
+                newly_assigned_user_id=None
                 if "owner_user_id" in payload:
                     owner_user_id=int(payload["owner_user_id"]) if payload.get("owner_user_id") else None
                     if owner_user_id and not db.execute("SELECT 1 FROM users WHERE id=? AND active=1 AND instance_id=?",(owner_user_id,actor["instance_id"])).fetchone():return self.send_json({"error":"Assigned user is invalid"},400)
-                    if owner_user_id!=task["owner_user_id"]: changes.append("owner_user_id changed"); sets.append("owner_user_id=?"); values.append(owner_user_id)
+                    if owner_user_id!=task["owner_user_id"]:
+                        changes.append("owner_user_id changed"); sets.append("owner_user_id=?"); values.append(owner_user_id)
+                        if owner_user_id: newly_assigned_user_id=owner_user_id
                 if "owner_team_id" in payload:
                     owner_team_id=int(payload["owner_team_id"]) if payload.get("owner_team_id") else None
                     if owner_team_id and not db.execute("SELECT 1 FROM runbook_teams WHERE id=? AND runbook_id=?",(owner_team_id,task["runbook_id"])).fetchone():return self.send_json({"error":"Assigned team is invalid"},400)
@@ -2915,6 +3048,7 @@ class Handler(BaseHTTPRequestHandler):
                     db.execute(f"UPDATE tasks SET {','.join(sets)} WHERE id=?",values)
                 append_audit(db,task["runbook_id"],"task.edited",f"{task['title']}: "+"; ".join(changes+field_changes),actor["display_name"])
                 db.execute("UPDATE runbooks SET updated_at=? WHERE id=?",(now(),task["runbook_id"])); doc=runbook_document(db,task["runbook_id"],actor); db.commit()
+                if newly_assigned_user_id: notify_task_assignment(db,actor["instance_id"],newly_assigned_user_id)
                 return self.send_json({"data":doc})
         with connect() as db:
             actor=self.require(db,"runbooks:execute")
@@ -2957,8 +3091,16 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc: return self._handle_unexpected_error(exc)
 
     def _do_DELETE(self):
-        path=urllib.parse.urlparse(self.path).path; parts=path.strip("/").split("/")
+        parsed=urllib.parse.urlparse(self.path); path=parsed.path; parts=path.strip("/").split("/")
         if path.startswith("/scim/v2/"): return self.scim_dispatch()
+        if path=="/api/push/subscribe":
+            with connect() as db:
+                actor=self.current_user(db)
+                if not actor: return self.send_json({"error":"Authentication required"},401)
+                if actor.get("auth_method")=="session" and self.headers.get("X-CSRF-Token","") != actor["csrf_token"]: return self.send_json({"error":"Invalid or missing CSRF token"},403)
+                endpoint=(urllib.parse.parse_qs(parsed.query).get("endpoint") or [""])[0]
+                db.execute("DELETE FROM push_subscriptions WHERE endpoint=? AND user_id=?",(endpoint,actor["id"])); db.commit()
+                return self.send_json({"data":{"ok":True}})
         if len(parts)==3 and parts[:2]==["api","saved-views"]:
             with connect() as db:
                 actor=self.require(db,"runbooks:view")
