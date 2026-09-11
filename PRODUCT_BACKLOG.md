@@ -678,10 +678,37 @@ readiness, Delay summary) via a "Customize" button on the home view,
 persisted server-side per-user (`users.dashboard_widgets`, `PATCH
 /api/me/dashboard`) and applied on every login. The new Delay summary
 widget surfaces the same `/api/reports/delay` data used by the full
-report, directly on the dashboard. Scheduled-email delivery of the
-dashboard is not implemented -- FlowOps has no outbound email scheduler
-today and adding one is out of proportion to this story; the CSV/PDF
-export routes already give a manual path to the same data.
+report, directly on the dashboard.
+
+Scheduled-email delivery of the dashboard: `DONE` (2026-09-11). A new
+`dashboard_email_loop()` background thread (structurally identical to the
+existing `backup_loop()`/`webhook_dispatcher_loop()` daemon-thread
+pattern) checks every 15 minutes whether any instance is due its
+configured digest, across every instance, not just the default one.
+Platform settings gained `dashboard_email_frequency` (`off`/`daily`/
+`weekly`), `dashboard_email_hour` (0-23 UTC), and a comma-separated
+`dashboard_email_recipients` list -- no cron-expression parser, since
+daily/weekly-at-a-configured-hour doesn't need one. `render_dashboard_email()`
+produces a plain-text digest (active runbooks, live count, completions,
+task-completion percentage, up to 25 late/at-risk tasks) reusing the same
+data the dashboard widgets and `/api/reports/delay` already compute, sent
+via the existing `send_mail()` -- matching this app's all-plaintext email
+design (invitations, password resets), no HTML template engine. A
+`dashboard_email_last_sent_at` checkpoint per instance ensures at most one
+send per configured period. The due-check/send logic is factored into
+`maybe_send_dashboard_email(db, instance_id, current_time)`, callable
+directly with an injected reference time, so the scheduling gate itself is
+deterministically testable without waiting on the loop's real 15-minute
+sleep or standing up a live SMTP server. Covered by
+`test_dashboard_email_render_includes_runbook_and_completion_data`
+(isolated from SMTP -- asserts the render function's content directly) and
+`test_dashboard_email_scheduling_gate_sends_only_once_per_configured_interval`
+(wrong hour → no send; first due run → sends to every recipient; same day
+again → correctly suppressed; 24h later at the same hour → due again).
+Real SMTP delivery against a real mail relay is a manual Docker-preview
+verification step (set real `FLOWOPS_SMTP_*` env vars, confirm an email
+arrives) -- stated here explicitly rather than silently assumed, since it
+depends on infrastructure this automated suite can't stand up.
 
 Post-implementation review (2026-09-11): `PATCH /api/runbooks/{id}/review`
 records `what_went_well`/`what_went_wrong`/`follow_up_actions` plus
@@ -943,7 +970,7 @@ FlowOps, but remain subordinate to the phase and P0 ordering above.
 | Data-source view maps CMDB applications/services to templates | QS p10 | 3.1, 3.2 | BACKLOG |
 | Parent runbook controls one level of linked child runbooks | QS p25 | 4.1 | DONE (reconciled 2026-09-11 — see Epic 4.1: parent/child linking, one-level-only enforced, `test_linked_runbooks_reject_more_than_one_level_of_nesting`) |
 | Linked-runbook dashboard aggregates child progress live | QS p25 | 4.1, 4.2 | DONE (reconciled 2026-09-11 — see Epic 4.1: `aggregate_progress`/`aggregate_status` on the parent, live via `runbook_document()`) |
-| Multi-runbook dashboard with filters and scheduled email sharing | QS p31 | 4.2 | PARTIAL (reconciled 2026-09-11 — per-user configurable dashboard DONE, see Epic 4.2; scheduled-email sharing is the genuine remaining gap, planned) |
+| Multi-runbook dashboard with filters and scheduled email sharing | QS p31 | 4.2 | DONE (reconciled 2026-09-11 — per-user configurable dashboard and scheduled-email sharing both DONE, see Epic 4.2) |
 | Post-implementation review after completion | QS p32 | 4.2 | DONE |
 | Downloadable, filterable audit evidence | QS p29 | 4.3 | PARTIAL (reconciled 2026-09-11 — checksummed, hash-chain-verified download DONE via `GET /api/admin/audit/export`, see Epic 4.3; server-side filtering by date/actor/action is the genuine remaining gap — the endpoint always returns the full tenant history) |
 
