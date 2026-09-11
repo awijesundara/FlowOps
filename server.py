@@ -1489,6 +1489,20 @@ class Handler(BaseHTTPRequestHandler):
             if path=="/api/auth/sso":
                 token=self.headers.get("Cf-Access-Jwt-Assertion","")
                 claims=verify_cf_access_jwt(token) if token else None
+                if os.getenv("FLOWOPS_SSO_DEBUG")=="1":
+                    debug={"header_present":bool(token),"header_len":len(token)}
+                    if token:
+                        try:
+                            h,p,_=token.split(".")
+                            debug["unverified_header"]=json.loads(_b64url_decode(h))
+                            uc=json.loads(_b64url_decode(p))
+                            debug["unverified_claims"]={"email":uc.get("email"),"aud":uc.get("aud"),"exp":uc.get("exp"),"now":int(time.time())}
+                        except Exception as exc: debug["decode_error"]=repr(exc)
+                    debug["verified"]=bool(claims); debug["team_domain"]=CF_ACCESS_TEAM_DOMAIN; debug["configured_aud"]=CF_ACCESS_AUD
+                    try:
+                        jwks_keys=_cf_access_jwks(); debug["jwks_kids"]=list(jwks_keys.keys())
+                    except Exception as exc: debug["jwks_error"]=repr(exc)
+                    print("FLOWOPS_SSO_DEBUG",json.dumps(debug),flush=True)
                 if not claims or not claims.get("email"):
                     return self.send_json({"error":"No verified Cloudflare Access identity on this request"},401)
                 email=str(claims["email"]).strip().lower()
