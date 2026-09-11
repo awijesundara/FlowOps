@@ -360,6 +360,22 @@ def init_db() -> None:
           depends_on_template_task_id INTEGER NOT NULL REFERENCES template_tasks(id) ON DELETE CASCADE,
           PRIMARY KEY(template_task_id, depends_on_template_task_id)
         );
+        CREATE TABLE IF NOT EXISTS snippets (
+          id INTEGER PRIMARY KEY, workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          UNIQUE(workspace_id, name)
+        );
+        CREATE TABLE IF NOT EXISTS snippet_tasks (
+          id INTEGER PRIMARY KEY, snippet_id INTEGER NOT NULL REFERENCES snippets(id) ON DELETE CASCADE,
+          title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', stream TEXT NOT NULL DEFAULT 'General',
+          duration INTEGER NOT NULL DEFAULT 15, sort_order INTEGER NOT NULL DEFAULT 0,
+          automation_url TEXT, task_type TEXT NOT NULL DEFAULT 'normal', scheduled_offset INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS snippet_dependencies (
+          snippet_task_id INTEGER NOT NULL REFERENCES snippet_tasks(id) ON DELETE CASCADE,
+          depends_on_snippet_task_id INTEGER NOT NULL REFERENCES snippet_tasks(id) ON DELETE CASCADE,
+          PRIMARY KEY(snippet_task_id, depends_on_snippet_task_id)
+        );
         CREATE TABLE IF NOT EXISTS instance_settings (
           instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
           key TEXT NOT NULL, value TEXT NOT NULL, updated_at TEXT NOT NULL,
@@ -1212,6 +1228,14 @@ class Handler(BaseHTTPRequestHandler):
                 params=[actor["instance_id"]]+([int(workspace_id)] if workspace_id else [])
                 items=rows(db.execute(f"SELECT t.*,COUNT(tt.id) task_count FROM templates t JOIN workspaces w ON w.id=t.workspace_id LEFT JOIN template_tasks tt ON tt.template_id=t.id WHERE w.instance_id=? {clause} GROUP BY t.id ORDER BY t.category,t.name",params))
                 return self.send_json({"data":items})
+            if path=="/api/snippets":
+                actor=self.require(db,"runbooks:view")
+                if not actor: return
+                workspace_id=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("workspace_id",[None])[0]
+                clause="AND s.workspace_id=?" if workspace_id else ""
+                params=[actor["instance_id"]]+([int(workspace_id)] if workspace_id else [])
+                items=rows(db.execute(f"SELECT s.*,COUNT(st.id) task_count FROM snippets s JOIN workspaces w ON w.id=s.workspace_id LEFT JOIN snippet_tasks st ON st.snippet_id=s.id WHERE w.instance_id=? {clause} GROUP BY s.id ORDER BY s.name",params))
+                return self.send_json({"data":items})
             if path=="/api/runbooks":
                 actor=self.require(db,"runbooks:view")
                 if not actor: return
@@ -1885,6 +1909,54 @@ class Handler(BaseHTTPRequestHandler):
                             db.execute("INSERT INTO template_dependencies VALUES(?,?)",(id_map[dep["task_id"]],id_map[dep["depends_on_id"]]))
                     append_audit(db,rid,"template.saved",name,actor["display_name"]); db.commit()
                     return self.send_json({"data":{"id":template_id,"name":name}},201)
+                if len(parts)==4 and parts[3]=="save-as-snippet":
+                    actor=self.require_workspace_scoped_edit(db,runbook_id=rid)
+                    if not actor:return
+                    name=str(payload.get("name","")).strip()
+                    if not name or len(name)>160: return self.send_json({"error":"Snippet name is required (maximum 160 characters)"},400)
+                    task_ids=[int(x) for x in payload.get("task_ids",[]) if str(x).isdigit()]
+                    if not task_ids: return self.send_json({"error":"Select at least one task to save as a snippet"},400)
+                    if len(task_ids)>100: return self.send_json({"error":"A snippet may contain at most 100 tasks"},400)
+                    selected=rows(db.execute(f"SELECT * FROM tasks WHERE runbook_id=? AND id IN ({','.join('?'*len(task_ids))}) ORDER BY sort_order",[rid]+task_ids))
+                    if len(selected)!=len(set(task_ids)): return self.send_json({"error":"One or more selected tasks were not found in this runbook"},400)
+                    source=db.execute("SELECT * FROM runbooks WHERE id=?",(rid,)).fetchone()
+                    stamp=now()
+                    try: cur=db.execute("INSERT INTO snippets(workspace_id,name,description,created_by,created_at) VALUES(?,?,?,?,?)",(source["workspace_id"],name,str(payload.get("description",""))[:2000],actor["display_name"],stamp))
+                    except sqlite3.IntegrityError: return self.send_json({"error":"A snippet with that name already exists in this workspace"},409)
+                    snippet_id=cur.lastrowid
+                    id_map={}
+                    for t in selected:
+                        new_tid=db.execute("INSERT INTO snippet_tasks(snippet_id,title,description,stream,duration,sort_order,automation_url,task_type,scheduled_offset) VALUES(?,?,?,?,?,?,?,?,?)",(snippet_id,t["title"],t["description"],t["stream"],t["duration"],t["sort_order"],t["automation_url"],t["task_type"],t["scheduled_offset"])).lastrowid
+                        id_map[t["id"]]=new_tid
+                    for dep in db.execute(f"SELECT d.task_id,d.depends_on_id FROM dependencies d WHERE d.task_id IN ({','.join('?'*len(task_ids))})",task_ids):
+                        if dep["task_id"] in id_map and dep["depends_on_id"] in id_map:
+                            db.execute("INSERT INTO snippet_dependencies VALUES(?,?)",(id_map[dep["task_id"]],id_map[dep["depends_on_id"]]))
+                    append_audit(db,rid,"snippet.saved",f"{name} ({len(selected)} tasks)",actor["display_name"]); db.commit()
+                    return self.send_json({"data":{"id":snippet_id,"name":name,"task_count":len(selected)}},201)
+                if len(parts)==4 and parts[3]=="insert-snippet":
+                    actor=self.require_workspace_scoped_edit(db,runbook_id=rid)
+                    if not actor:return
+                    runbook=db.execute("SELECT * FROM runbooks WHERE id=?",(rid,)).fetchone()
+                    if runbook["status"] in {"complete","cancelled"}: return self.send_json({"error":f"Cannot edit a {runbook['status']} runbook"},409)
+                    try: snippet_id=int(payload.get("snippet_id") or 0)
+                    except (TypeError,ValueError): return self.send_json({"error":"Not found"},404)
+                    snippet=db.execute("SELECT * FROM snippets WHERE id=? AND workspace_id=?",(snippet_id,runbook["workspace_id"])).fetchone()
+                    if not snippet: return self.send_json({"error":"Not found"},404)
+                    stamp=now()
+                    for s in db.execute("SELECT DISTINCT stream FROM snippet_tasks WHERE snippet_id=? ORDER BY sort_order",(snippet_id,)):
+                        if not db.execute("SELECT 1 FROM streams WHERE runbook_id=? AND name=?",(rid,s["stream"])).fetchone():
+                            order=db.execute("SELECT COALESCE(MAX(sort_order),-1)+1 FROM streams WHERE runbook_id=?",(rid,)).fetchone()[0]
+                            db.execute("INSERT INTO streams(runbook_id,name,sort_order,created_at) VALUES(?,?,?,?)",(rid,s["stream"],order,stamp))
+                    base_order=db.execute("SELECT COALESCE(MAX(sort_order),-1)+1 FROM tasks WHERE runbook_id=?",(rid,)).fetchone()[0]
+                    id_map={}
+                    for i,t in enumerate(db.execute("SELECT * FROM snippet_tasks WHERE snippet_id=? ORDER BY sort_order",(snippet_id,))):
+                        new_tid=db.execute("INSERT INTO tasks(runbook_id,title,description,stream,owner,duration,sort_order,automation_url,task_type,scheduled_offset) VALUES(?,?,?,?,?,?,?,?,?,?)",(rid,t["title"],t["description"],t["stream"],"",t["duration"],base_order+i,t["automation_url"],t["task_type"],t["scheduled_offset"])).lastrowid
+                        id_map[t["id"]]=new_tid
+                    for dep in db.execute("SELECT snippet_task_id,depends_on_snippet_task_id FROM snippet_dependencies sd JOIN snippet_tasks st ON st.id=sd.snippet_task_id WHERE st.snippet_id=?",(snippet_id,)):
+                        if dep["snippet_task_id"] in id_map and dep["depends_on_snippet_task_id"] in id_map:
+                            db.execute("INSERT INTO dependencies VALUES(?,?)",(id_map[dep["snippet_task_id"]],id_map[dep["depends_on_snippet_task_id"]]))
+                    append_audit(db,rid,"snippet.inserted",f"{snippet['name']} ({len(id_map)} tasks)",actor["display_name"]); db.execute("UPDATE runbooks SET updated_at=? WHERE id=?",(stamp,rid)); doc=runbook_document(db,rid,actor); db.commit()
+                    return self.send_json({"data":doc},201)
                 if len(parts)==4 and parts[3]=="archive":
                     actor=self.require_workspace_scoped_edit(db,runbook_id=rid)
                     if not actor:return
@@ -2181,6 +2253,16 @@ class Handler(BaseHTTPRequestHandler):
                 if db.execute("SELECT COUNT(*) FROM runbooks WHERE folder_id=?",(folder_id,)).fetchone()[0]:
                     return self.send_json({"error":"Move or remove this folder's runbooks before deleting it"},409)
                 db.execute("DELETE FROM folders WHERE id=?",(folder_id,)); append_audit(db,None,"folder.deleted",folder["name"],actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"ok":True}})
+        if len(parts)==3 and parts[:2]==["api","snippets"]:
+            try: snippet_id=int(parts[2])
+            except ValueError: return self.send_json({"error":"Not found"},404)
+            with connect() as db:
+                actor=self.require(db,"runbooks:edit")
+                if not actor:return
+                snippet=db.execute("SELECT s.* FROM snippets s JOIN workspaces w ON w.id=s.workspace_id WHERE s.id=? AND w.instance_id=?",(snippet_id,actor["instance_id"])).fetchone()
+                if not snippet: return self.send_json({"error":"Not found"},404)
+                db.execute("DELETE FROM snippets WHERE id=?",(snippet_id,)); append_audit(db,None,"snippet.deleted",snippet["name"],actor["display_name"],actor["instance_id"]); db.commit()
                 return self.send_json({"data":{"ok":True}})
         if len(parts)==3 and parts[:2]==["api","runbook-types"]:
             try: type_id=int(parts[2])
