@@ -41,6 +41,13 @@ class FlowOpsTest(unittest.TestCase):
         function=source.split('async function syncServiceOps()',1)[1].split('function openModal',1)[0]
         self.assertIn("await api(`/api/runbooks/${state.current.id}/serviceops-sync`",function)
         self.assertNotIn('await fetch(',function)
+    def test_browser_api_refreshes_stale_csrf_and_retries_once(self):
+        source=(server.STATIC/'app.js').read_text()
+        helper=source.split('async function api(',1)[1].split('function toast',1)[0]
+        self.assertIn("body.error==='Invalid or missing CSRF token'",helper)
+        self.assertIn("fetch('/api/auth/me'",helper)
+        self.assertIn('state.csrf=freshToken',helper)
+        self.assertIn('csrfRetried:true',helper)
     def test_customer_instance_registration_and_cross_tenant_isolation(self):
         _,original=self.req('/api/runbooks','POST',{'name':'Default tenant private runbook'});original_runbook=original['data']['id']
         _,original_doc=self.req(f'/api/runbooks/{original_runbook}/tasks','POST',{'title':'Private task'});original_task=original_doc['data']['tasks'][0]['id']
@@ -139,6 +146,18 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(code,200);self.assertTrue(result['data']['tested_unsaved_credential'])
         self.assertEqual(captured[0].get_header('Authorization'),f'Bearer {candidate}')
         with server.connect() as db:self.assertFalse(db.execute("SELECT 1 FROM integration_credentials WHERE provider='serviceops'").fetchone())
+    def test_connection_test_against_a_real_url_never_uses_the_mock_shortcut(self):
+        # Only a literal mock:// URL gets the canned test-harness result;
+        # any real http(s):// URL -- even with a bad credential -- must
+        # perform a genuine round trip and surface a real error, not the
+        # mocked "verified" response.
+        def fake_open(request,timeout=0):
+            raise urllib.error.HTTPError('https://serviceops.example/api/v1/tickets?limit=1',401,'Unauthorized',{},None)
+        with patch('server.urllib.request.urlopen',fake_open):
+            code,result=self.req('/api/admin/integrations/test','POST',{'provider':'serviceops','url':'https://serviceops.example','credential':'sop_bad_key'})
+        self.assertEqual(code,502)
+        self.assertIn('rejected the API key',result['error'])
+        self.assertNotIn('latency_ms',result)
     def test_login_sources_use_local_administrator_and_configured_directory_domain(self):
         _,sources=self.req('/api/auth/sources');self.assertEqual(sources['data']['sources'],[{'id':'local','label':'Local administrator','placeholder':'Username'}])
         self.req('/api/admin/settings','POST',{'directory_enabled':'true','directory_domain':'corp.example.com'})
@@ -200,6 +219,40 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(body['ctasks_imported'],0)
         runbook=self.req(f'/api/runbooks/{rid}')[1]['data']
         self.assertEqual(len([t for t in runbook['tasks'] if t['stream']=='Change tasks']),2)
+    def test_serviceops_ctask_sync_stores_team_and_assignee_separately_and_updates_on_resync(self):
+        self.req('/api/admin/integrations','POST',{'provider':'serviceops','url':'https://serviceops.example','credential':'sop_ctask_team','enabled':True})
+        _,created=self.req('/api/runbooks','POST',{'name':'Team-tracked change','serviceops_ticket':'CHG0000050'});rid=created['data']['id']
+        class Response:
+            status=200
+            headers={'X-Request-ID':'r'}
+            def __init__(self,body):self.body=body
+            def __enter__(self):return self
+            def __exit__(self,*_):return False
+            def read(self,*_):return self.body
+        def ctasks_response(rows):
+            def fake_open(request,timeout=0):
+                if request.full_url.endswith('/ctasks'):
+                    return Response(json.dumps({'data':rows}).encode())
+                return Response(b'{"data":{"number":"CHG0000050","type":"change","title":"Team-tracked change","state":"Approved","priority":"P2"}}')
+            return fake_open
+        first=[{'number':'CTASK0000020','title':'Wipe servers','state':'Open','sequence':1,'assignmentGroup':'Unix','assignee':None}]
+        with patch('server.urllib.request.urlopen',ctasks_response(first)):
+            self.req(f'/api/runbooks/{rid}/serviceops-sync','POST',{})
+        runbook=self.req(f'/api/runbooks/{rid}')[1]['data']
+        task=next(t for t in runbook['tasks'] if t['serviceops_ctask']=='CTASK0000020')
+        self.assertEqual(task['serviceops_ctask_team'],'Unix')
+        self.assertEqual(task['owner'],'')
+        # ServiceOps now shows an assignee picked up the task -- re-sync must
+        # update the existing task, not silently skip it.
+        second=[{'number':'CTASK0000020','title':'Wipe servers','state':'Open','sequence':1,'assignmentGroup':'Unix','assignee':'Nova Reyes'}]
+        with patch('server.urllib.request.urlopen',ctasks_response(second)):
+            code,body=self.req(f'/api/runbooks/{rid}/serviceops-sync','POST',{})
+        self.assertEqual(code,200)
+        runbook=self.req(f'/api/runbooks/{rid}')[1]['data']
+        matching=[t for t in runbook['tasks'] if t['serviceops_ctask']=='CTASK0000020']
+        self.assertEqual(len(matching),1)
+        self.assertEqual(matching[0]['owner'],'Nova Reyes')
+        self.assertEqual(matching[0]['serviceops_ctask_team'],'Unix')
     def test_completing_a_task_pushes_its_ctask_state_back_to_serviceops(self):
         self.req('/api/admin/integrations','POST',{'provider':'serviceops','url':'https://serviceops.example','credential':'sop_ctask_push','enabled':True})
         _,created=self.req('/api/runbooks','POST',{'name':'Push-back change','serviceops_ticket':'CHG0000044'});rid=created['data']['id']
@@ -276,13 +329,39 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(exported['data']['checksum'],recomputed)
         _,recent=self.req('/api/admin/audit')
         self.assertTrue(any(e['action']=='audit.exported' for e in recent['data']))
+    def test_audit_verify_endpoint_confirms_chain_without_requiring_export(self):
+        self.req('/api/runbooks','POST',{'name':'Verify-only check'})
+        code,body=self.req('/api/admin/audit/verify')
+        self.assertEqual(code,200)
+        self.assertTrue(body['data']['chain_verified'])
+        self.assertGreater(body['data']['events_checked'],0)
+    def test_audit_rows_are_immutable_by_policy_at_the_database_level(self):
+        self.req('/api/runbooks','POST',{'name':'Immutability check'})
+        with server.connect() as db:
+            row_id=db.execute("SELECT MAX(id) FROM audit").fetchone()[0]
+            with self.assertRaises(server.sqlite3.IntegrityError):
+                db.execute("UPDATE audit SET detail='forged' WHERE id=?",(row_id,))
+            with self.assertRaises(server.sqlite3.IntegrityError):
+                db.execute("DELETE FROM audit WHERE id=?",(row_id,))
+            # a raw delete outside the sanctioned purge path (which toggles
+            # audit_purge_lock around its DELETE) must still be rejected even
+            # when a retention period happens to be configured.
+            still_there=db.execute("SELECT 1 FROM audit WHERE id=?",(row_id,)).fetchone()
+            self.assertIsNotNone(still_there)
     def test_configurable_audit_retention_purges_old_events_and_keeps_chain_verifiable(self):
         _,created=self.req('/api/runbooks','POST',{'name':'Retention prefix check'})
         with server.connect() as db:
             instance_id=db.execute("SELECT id FROM instances WHERE slug='flowops'").fetchone()[0]
             oldest_id=db.execute("SELECT MIN(id) FROM audit WHERE instance_id=?",(instance_id,)).fetchone()[0]
             old_stamp=(__import__('datetime').datetime.now(__import__('datetime').timezone.utc)-__import__('datetime').timedelta(days=400)).isoformat(timespec='seconds')
-            db.execute("UPDATE audit SET created_at=? WHERE id=?",(old_stamp,oldest_id)); db.commit()
+            # Audit rows are immutable by policy (audit_no_update trigger) --
+            # simulating an old event for this retention test legitimately
+            # requires bypassing that trigger the same way a DBA would for a
+            # one-off test fixture, not something the running app can do.
+            db.execute("DROP TRIGGER audit_no_update")
+            db.execute("UPDATE audit SET created_at=? WHERE id=?",(old_stamp,oldest_id))
+            db.execute("CREATE TRIGGER audit_no_update BEFORE UPDATE ON audit BEGIN SELECT RAISE(ABORT, 'audit rows are immutable'); END;")
+            db.commit()
         self.assertEqual(self.req('/api/admin/audit/purge','POST',{})[0],400)
         self.assertEqual(self.req('/api/admin/settings','POST',{'audit_retention_days':'365'})[0],200)
         code,purged=self.req('/api/admin/audit/purge','POST',{})
@@ -962,6 +1041,59 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(self.req(f'/api/tasks/{c_id}','PATCH',{'status':'running'})[0],409)
         self.req(f'/api/tasks/{b_id}','PATCH',{'status':'running'});self.req(f'/api/tasks/{b_id}','PATCH',{'status':'complete'})
         self.assertEqual(self.req(f'/api/tasks/{c_id}','PATCH',{'status':'running'})[0],200)
+    def test_diamond_dependency_waits_for_the_later_of_two_branches(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Diamond release'}); rid=created['data']['id']
+        _,a=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'A','duration':10}); a_id=a['data']['tasks'][-1]['id']
+        _,b=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'B','duration':5,'depends_on':[a_id]}); b_id=b['data']['tasks'][-1]['id']
+        _,c=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'C','duration':20,'depends_on':[a_id]}); c_id=c['data']['tasks'][-1]['id']
+        _,d=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'D','duration':5,'depends_on':[b_id,c_id]})
+        doc=d['data']
+        by_id={t['id']:t for t in doc['tasks']}
+        # A finishes at 10; B finishes at 15 (10+5); C finishes at 30 (10+20).
+        # D must wait for the LATER branch (C, finishing at 30), not just B.
+        self.assertEqual(by_id[b_id]['planned_start_offset'],10)
+        self.assertEqual(by_id[c_id]['planned_start_offset'],10)
+        d_id=next(t['id'] for t in doc['tasks'] if t['title']=='D')
+        self.assertEqual(by_id[d_id]['planned_start_offset'],30)
+        # The critical path is the longer branch (A -> C -> D), not A -> B -> D.
+        self.assertEqual(doc['critical_path'],[a_id,c_id,d_id])
+    def test_combined_fan_out_fan_in_computes_correct_join_offset(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Fan-out fan-in release'}); rid=created['data']['id']
+        _,a=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'A','duration':5}); a_id=a['data']['tasks'][-1]['id']
+        _,b=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'B','duration':5,'depends_on':[a_id]}); b_id=b['data']['tasks'][-1]['id']
+        _,c=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'C','duration':15,'depends_on':[a_id]}); c_id=c['data']['tasks'][-1]['id']
+        _,dd=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'D','duration':1,'depends_on':[a_id]}); dd_id=dd['data']['tasks'][-1]['id']
+        _,e=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'E','duration':5,'depends_on':[b_id,c_id,dd_id]})
+        doc=e['data']
+        e_id=next(t['id'] for t in doc['tasks'] if t['title']=='E')
+        by_id={t['id']:t for t in doc['tasks']}
+        # A ends at 5; branches end at 10 (B), 20 (C), 6 (D) -- E must wait for
+        # the slowest of all three fanned-out branches (C, ending at 20).
+        self.assertEqual(by_id[e_id]['planned_start_offset'],20)
+    def test_deep_sequential_chain_accumulates_offsets_without_error(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Deep chain release'}); rid=created['data']['id']
+        previous_id=None
+        for i in range(12):
+            body={'title':f'Step {i}','duration':5}
+            if previous_id: body['depends_on']=[previous_id]
+            _,resp=self.req(f'/api/runbooks/{rid}/tasks','POST',body)
+            previous_id=resp['data']['tasks'][-1]['id']
+        doc=self.req(f'/api/runbooks/{rid}')[1]['data']
+        last=next(t for t in doc['tasks'] if t['title']=='Step 11')
+        self.assertEqual(last['planned_start_offset'],55)  # 11 predecessors * 5 minutes each
+        self.assertEqual(len(doc['critical_path']),12)
+    def test_cross_stream_dependency_still_gates_task_start(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Cross-stream release'}); rid=created['data']['id']
+        _,prep=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Prep database','duration':5,'stream':'Prep'}); prep_id=prep['data']['tasks'][-1]['id']
+        _,deploy=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Deploy app','duration':5,'stream':'Deploy','depends_on':[prep_id]})
+        deploy_id=deploy['data']['tasks'][-1]['id']
+        streams={s['name'] for s in deploy['data']['streams']}
+        self.assertEqual(streams,{'Prep','Deploy'})
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'});self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        # Different stream than its dependency -- must still be gated by it.
+        self.assertEqual(self.req(f'/api/tasks/{deploy_id}','PATCH',{'status':'running'})[0],409)
+        self.req(f'/api/tasks/{prep_id}','PATCH',{'status':'running'});self.req(f'/api/tasks/{prep_id}','PATCH',{'status':'complete'})
+        self.assertEqual(self.req(f'/api/tasks/{deploy_id}','PATCH',{'status':'running'})[0],200)
     def test_runbook_lifecycle_rejects_invalid_jump(self):
         _,created=self.req('/api/runbooks','POST',{'name':'Lifecycle'}); rid=created['data']['id']
         self.assertEqual(self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})[0],409)
@@ -1131,6 +1263,26 @@ class FlowOpsTest(unittest.TestCase):
             with patch('server.BACKUP_DIR', __import__('pathlib').Path(backup_dir)), patch('server.BACKUP_RETAIN', 2):
                 for _ in range(4): server.backup_database()
                 self.assertEqual(len(server.list_backups()), 2)
+    def test_database_backups_are_encrypted_at_rest_and_round_trip_decrypt(self):
+        with tempfile.TemporaryDirectory() as backup_dir:
+            with patch('server.BACKUP_DIR', __import__('pathlib').Path(backup_dir)):
+                result=server.backup_database()
+                self.assertTrue(result['filename'].endswith('.db.enc'))
+                enc_path=__import__('pathlib').Path(backup_dir)/result['filename']
+                ciphertext=enc_path.read_bytes()
+                # must NOT be a readable SQLite file on disk
+                self.assertFalse(ciphertext.startswith(b'SQLite format 3'))
+                with self.assertRaises(server.sqlite3.DatabaseError):
+                    server.sqlite3.connect(str(enc_path)).execute('SELECT 1').fetchone()
+                # round-trips back to a valid SQLite database via the same cipher
+                plaintext=server.settings_cipher().decrypt(ciphertext)
+                self.assertTrue(plaintext.startswith(b'SQLite format 3'))
+                restored_path=__import__('pathlib').Path(backup_dir)/'restored.db'
+                restored_path.write_bytes(plaintext)
+                tables=server.sqlite3.connect(str(restored_path)).execute("SELECT name FROM sqlite_master WHERE type='table' AND name='audit'").fetchall()
+                self.assertEqual(len(tables),1)
+                listed=server.list_backups()
+                self.assertTrue(any(b['filename']==result['filename'] and b['encrypted'] for b in listed))
     def test_api_token_requests_are_rate_limited(self):
         code,token=self.req('/api/admin/api-tokens','POST',{'name':'Rate limit probe','scopes':['runbooks:read']})
         self.assertEqual(code,201)

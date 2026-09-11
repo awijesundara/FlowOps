@@ -387,6 +387,27 @@ audit evidence, and ticket projection are implemented. ServiceOps API client
 creation/revocation remains owned by ServiceOps; inbound signed events and
 asynchronous delivery retry remain under Epic 3.5.
 
+CTASK sub-task visibility (2026-09-11): `DONE`. A linked change ticket's
+CTASKs now surface their owning team and assigned person as distinct
+fields — previously `sync_serviceops_ctasks()` collapsed ServiceOps's
+`assignmentGroup` (team) and `assignee` (person) into one generic `owner`
+string, and re-syncing an already-imported CTASK was silently skipped
+(`if number in existing: continue`), so team/assignee changes made later
+in ServiceOps never reached FlowOps. Fixed: `tasks.serviceops_ctask_team`
+stores the team separately from `owner` (the assignee), and re-sync now
+**updates** the existing task's title/description/owner/team instead of
+skipping it. The task list shows each CTASK's own ticket number as a chip
+on the title and "Team · Assignee" in place of the old single owner field;
+the runbook detail view's "ServiceOps record" sidebar card gained a
+"Sub-tasks" list (number, title, team, assignee) for every linked CTASK.
+Covered by
+`test_serviceops_ctask_sync_stores_team_and_assignee_separately_and_updates_on_resync`,
+which also proves the stale-re-sync bug is fixed (a second sync with a
+newly-assigned person updates the existing task, not just the first
+import). Existing no-duplicate-on-resync coverage
+(`test_serviceops_v1_ticket_sync_uses_scoped_bearer_and_stores_projection`)
+still passes unchanged.
+
 ### Epic 3.2 — Custom Fields
 
 Typed, scoped custom-field definitions (P0/M) and values on tasks/runbooks
@@ -543,7 +564,27 @@ same immutable history as everything else on the runbook. Covered by
 
 ### Epic 4.3 — Compliance Audit
 
-Immutable-by-policy audit (P0/L): `PARTIAL`. Checksummed export (P1/M):
+Immutable-by-policy audit (P0/L): `DONE` (2026-09-11). The hash chain and
+export-time verification already existed; this closes the remaining gap
+with real, database-level enforcement rather than convention alone.
+`audit_no_update`/`audit_no_delete` triggers (`init_db()`) reject *any*
+`UPDATE` on the `audit` table unconditionally, and reject `DELETE` unless
+the sanctioned retention-purge path has set `audit_purge_lock.active=1`
+around its own `DELETE` (cleared again immediately after) — so nothing
+else in the codebase, now or added later, can silently rewrite or erase
+audit history, while the existing configurable-retention purge keeps
+working exactly as before. The chain-walk previously inlined in
+`GET /api/admin/audit/export` is now `verify_audit_chain()`, shared with a
+new standalone `GET /api/admin/audit/verify` (chain integrity check
+without paying the cost of a full export — suitable for a periodic
+monitoring probe). Covered by
+`test_audit_rows_are_immutable_by_policy_at_the_database_level` (a raw
+`UPDATE`/`DELETE` against the `audit` table, bypassing the app entirely,
+must raise `sqlite3.IntegrityError`) and
+`test_audit_verify_endpoint_confirms_chain_without_requiring_export`; the
+existing retention-purge test
+(`test_configurable_audit_retention_purges_old_events_and_keeps_chain_verifiable`)
+still passes, confirming the sanctioned purge path is unaffected. Checksummed export (P1/M):
 `DONE`. `GET /api/admin/audit/export` returns every audit event for the
 tenant, walks the existing hash chain server-side before returning
 (`previous_hash`/`event_hash`, already used for tamper-evidence) and
@@ -574,18 +615,61 @@ works, not just that deletion happened.
 
 ### Epic 4.4 — Security Hardening
 
-SAML/OIDC SSO (P0/L), SCIM (P1/L), managed encryption at rest/in transit
-(P0/L), and independent penetration test (P0/L): `BACKLOG`.
+SAML/OIDC SSO (P0/L): `BACKLOG`, in progress — scoped to a standards-
+compliant OIDC relying party validated against a throwaway local Keycloak
+container (no real customer IdP is available in this environment; SAML
+itself is not attempted this pass).
+
+SCIM (P1/L): `BACKLOG`, in progress — SCIM 2.0 Users/Groups provisioning
+over the existing bearer-token mechanism.
+
+Managed encryption at rest/in transit (P0/L): `DONE` (2026-09-11),
+interpreted for this self-hosted deployment as self-managed rather than a
+cloud KMS. At rest: `backup_database()` now encrypts every snapshot with
+the existing `SettingsCipher` (authenticated AES-256-CTR via `openssl`,
+already protecting admin-managed credentials) immediately after SQLite's
+hot-backup API writes it, before the plaintext intermediate file is
+deleted — confirmed genuinely plaintext-before/opaque-after by a test that
+opens the resulting file directly as SQLite (must fail) and round-trips it
+back through `settings_cipher().decrypt()` to a valid database (must
+succeed). In transit: confirmed, not assumed, by reading the actual tunnel
+manifest (`k8s/terraform/cloudflared.yaml`) — `cloudflared` runs as a
+genuine Cloudflare Tunnel (`tunnel run --token`), which by architecture
+terminates public TLS at Cloudflare's edge before proxying over its own
+encrypted tunnel connection into the cluster; this is a structural
+property of Cloudflare Tunnels, not inferred from the separately-configured
+Access identity layer. Covered by
+`test_database_backups_are_encrypted_at_rest_and_round_trip_decrypt`. A
+cloud-KMS
+integration is out of scope unless the deployment target changes.
+
+Independent penetration test (P0/L): `BACKLOG` — **excluded from the
+current implementation pass**; requires an external, third-party
+penetration-testing engagement not available in this environment.
 
 ### Epic 4.5 — Mobile and Field Access
 
-Responsive assigned-task execution (P1/L): `PARTIAL`. Push notifications for
-assignment/overdue work (P2/M): `BACKLOG`.
+Responsive assigned-task execution (P1/L): `PARTIAL`, in progress —
+targeted CSS pass for the 375-414px viewport range (320px reflow already
+proven, see Cross-Cutting table).
+
+Push notifications for assignment/overdue work (P2/M): `BACKLOG`, in
+progress — interpreted as standards-based Web Push (VAPID, no encrypted
+payload — an empty wake-up ping plus an authenticated content fetch),
+since native APNs/FCM push requires a paid mobile developer account not
+available in this environment.
 
 ### Epic 4.6 — Multi-Region and Scale
 
-Regional residency (P1/L) and validated hundreds-of-users/thousands-of-tasks
-real-time performance (P0/L): `BACKLOG`.
+Regional residency (P1/L): `BACKLOG` — **excluded from the current
+implementation pass**; requires real infrastructure in a second geographic
+region, not available on this single-LAN, 2-node MicroK8s deployment.
+
+Validated hundreds-of-users/thousands-of-tasks real-time performance
+(P0/L): `BACKLOG`, in progress — extending the existing
+`tools/load_test_realtime.py` (already proven at 150 concurrent viewers,
+see Epic 1.5) to 300 and 500 concurrent viewers against the Docker
+preview.
 
 Exit: regulated enterprises can run large multi-region operations with
 compliance-grade evidence.
@@ -594,14 +678,34 @@ compliance-grade evidence.
 
 | Item | Priority | Status |
 |---|---:|---:|
-| Dependency and scheduling engine automated coverage | P0 | PARTIAL |
+| Dependency and scheduling engine automated coverage | P0 | DONE |
 | Real-time load test before each phase | P0 | DONE for Phase 1 |
 | Structured API/background-job logging and error tracking | P0 | DONE |
 | Database backup and point-in-time recovery | P0 | DONE (snapshot backup, not continuous PITR) |
 | Public API rate limiting | P1 | DONE |
-| Core execution UI accessibility review | P1 | PARTIAL |
+| Core execution UI accessibility review | P1 | DONE for Phase 1 |
 | Internationalization scaffolding | P2 | BACKLOG |
 | FlowOps platform disaster-recovery plan | P1 | BACKLOG |
+
+Dependency and scheduling engine coverage (2026-09-11): `DONE`. The
+existing `earliest_start()`/`critical_path()` logic (`runbook_document()`)
+already implements dependency-aware scheduling correctly; this closes the
+gap by adding regression coverage for the scenarios that weren't
+previously exercised: a diamond dependency (confirming the join task waits
+for the *later* of two branches, and that the critical path follows the
+longer branch, not creation order), combined fan-out/fan-in across three
+branches, a 12-task deep sequential chain (no recursion-depth issue), and
+a cross-stream dependency (confirming stream boundaries don't implicitly
+gate task start). Also confirmed, by reading every `INSERT INTO
+dependencies` call site, that dependency cycles are structurally
+impossible through the current API: a task's dependencies are fixed at
+creation time and may only reference already-existing tasks, and no
+endpoint ever edits an existing task's dependency list afterward — so no
+cycle-rejection guard was needed. Covered by
+`test_diamond_dependency_waits_for_the_later_of_two_branches`,
+`test_combined_fan_out_fan_in_computes_correct_join_offset`,
+`test_deep_sequential_chain_accumulates_offsets_without_error`, and
+`test_cross_stream_dependency_still_gates_task_start`.
 
 Foundational hygiene (2026-09-11): every `do_GET`/`do_POST`/`do_PATCH`/
 `do_DELETE` dispatcher is now wrapped so an unhandled exception can no
@@ -627,20 +731,21 @@ requests per rolling minute per token, returning `429` with a
 `test_backup_retention_deletes_oldest_beyond_retain_limit`, and
 `test_api_token_requests_are_rate_limited`.
 
-Accessibility review evidence (2026-09-10): this pass was a manual code review
-of `static/index.html`/`app.js` (no headless-browser/axe-core tooling was
-available in this environment, so this is not a full automated WCAG 2.2 AA
-scan). Confirmed already-compliant: form labels are real `<label>` elements
-(not placeholder-only), status is always conveyed as text via `chip()` (not
-color alone), and modal dialogs use native `<dialog>`/`.showModal()`, which
-gives built-in focus trapping and Escape-to-close. Found and fixed two real
-gaps: the three modal close buttons (×) and the sign-out button were
-icon-only with no accessible name (`aria-label` added to all four); the new
-stream rename/delete control was mouse-only (dblclick, no keyboard path) --
-replaced with a separate, independently focusable "✎" button per stream.
-Not done: color-contrast measurement, screen-reader walkthrough, keyboard-only
-full-app traversal, and zoom/reflow testing all require actual browser
-rendering and remain open.
+Accessibility review evidence (2026-09-10 through 2026-09-11): the initial
+manual semantic review fixed unnamed icon controls and a mouse-only stream
+action. A subsequent real-Chrome Playwright/axe-core pass now covers the
+command center, runbook inventory, and runbook execution detail against WCAG
+2 A/AA and WCAG 2.1 AA rules, with no serious or critical violations. It also
+proved keyboard activation of runbook rows and 320 CSS-pixel reflow without
+horizontal page scrolling. The fixes add native button semantics to runbook
+cards/rows, accessible filter names, a skip link, a polite toast live region,
+proper tab and notification-drawer state, visible keyboard focus paths,
+measured contrast corrections, and reduced-motion handling. Regression:
+`test_axe_has_no_serious_or_critical_execution_ui_violations`,
+`test_runbook_rows_are_keyboard_operable`, and
+`test_execution_ui_reflows_without_horizontal_page_scroll` in
+`test_browser.py`. This closes the Phase 1 core execution UI review; future
+screens still require the same gate as they are introduced.
 
 ## Suggested Team Shape
 
@@ -654,7 +759,7 @@ rendering and remain open.
 1. ~~Finish Phase 1 Epic 1.3 P0: first-class stream creation and stream edits.~~ Done 2026-09-10: dedicated `streams` table, create/rename/delete API and UI, existing task streams backfilled.
 2. ~~Finish Phase 1 Epic 1.6 P0: audit every task and runbook edit, not only transitions.~~ Done 2026-09-10: added field-edit endpoints (`PATCH /api/tasks/{id}` without `status`, `PATCH /api/runbooks/{id}`) audited as `task.edited`/`runbook.edited`, usable independent of live/status gating; dedicated edit UI (vs. API-only) remains a follow-up.
 3. ~~Validate Phase 1 with dependency/scheduling breadth and real-time load evidence.~~ Load evidence done 2026-09-10 (see Epic 1.5 real-time acceptance note); dependency/scheduling breadth beyond the existing fan-in/chain regression tests remains open.
-4. Complete the core execution UI accessibility review before Phase 1 exit.
+4. ~~Complete the core execution UI accessibility review before Phase 1 exit.~~ Done 2026-09-11: Chrome/axe-core command-center, inventory, and execution-detail scan; keyboard row activation; and 320px reflow regressions pass.
 5. ~~Add a self-service profile page matching ServiceOps's feature depth.~~ Done 2026-09-11: `PATCH /api/profile` (display name, email, title, timezone, date format), `POST /api/profile/avatar` (base64 PNG/JPEG upload, magic-byte validated, served from `/avatar/{id}`), `POST /api/profile/change-password` (current-password re-auth, revokes every other session for the account), `GET /api/profile/export` (downloadable JSON: profile, audit history, assigned tasks) — full frontend in `static/index.html`/`static/app.js` (sidebar avatar click opens a tabbed Details/Password/Privacy modal). Tests: `test_self_service_profile_update_edits_allowed_fields_only`, `test_self_service_avatar_upload_validates_and_serves_image`, `test_self_service_change_password_requires_current_password_and_revokes_other_sessions`, `test_profile_export_downloads_own_audit_and_task_history`, plus a negative auth test. All 80 tests pass; manually verified end-to-end against a running instance (login, patch, avatar upload/fetch, export, password change all returned expected responses).
 
 ## Guide Requirements Traceability
@@ -692,21 +797,21 @@ FlowOps, but remain subordinate to the phase and P0 ordering above.
 | Folders, nested folders, sticky/applied filters | QS p13 | 2.2 | DONE |
 | Runbook type selection and blank/template creation | QS p19-p20 | 2.2, 2.3 | PARTIAL |
 | Central teams propagate membership into linked runbook teams | QS p10-p11, p22 | 2.4 | DONE |
-| Interactive dependency node map with critical path | QS p17 | 2.6 | PARTIAL |
-| Runbook home/pages for operational instructions and links | QS p16 | 2.2 | BACKLOG |
-| CSV task import, filtered export, Excel/timezone options | QS p23 | 2.5 | BACKLOG |
-| Approved reusable snippets, maximum 100 tasks | QS p10, p24 | 2.3 | BACKLOG |
+| Interactive dependency node map with critical path | QS p17 | 2.6 | DONE (reconciled 2026-09-11 — see Epic 2.6: depth-based column layout, critical-path badge) |
+| Runbook home/pages for operational instructions and links | QS p16 | 2.2 | DONE (reconciled 2026-09-11 — see Epic 2.2: `runbooks.home_content`, `test_runbook_home_content_is_editable_and_returned_in_document`) |
+| CSV task import, filtered export, Excel/timezone options | QS p23 | 2.5 | PARTIAL (reconciled 2026-09-11 — CSV import/export DONE, see Epic 2.5; Excel-format export and per-column timezone options are the genuine remaining gap) |
+| Approved reusable snippets, maximum 100 tasks | QS p10, p24 | 2.3 | DONE (reconciled 2026-09-11 — see Epic 2.3: `POST /api/runbooks/{id}/save-as-snippet`/`insert-snippet`, 100-task cap enforced) |
 
 ### Phase 3 and 4 guide requirements
 
 | Requirement | Source | Backlog mapping | Status |
 |---|---|---|---|
 | Data-source view maps CMDB applications/services to templates | QS p10 | 3.1, 3.2 | BACKLOG |
-| Parent runbook controls one level of linked child runbooks | QS p25 | 4.1 | BACKLOG |
-| Linked-runbook dashboard aggregates child progress live | QS p25 | 4.1, 4.2 | BACKLOG |
-| Multi-runbook dashboard with filters and scheduled email sharing | QS p31 | 4.2 | BACKLOG |
+| Parent runbook controls one level of linked child runbooks | QS p25 | 4.1 | DONE (reconciled 2026-09-11 — see Epic 4.1: parent/child linking, one-level-only enforced, `test_linked_runbooks_reject_more_than_one_level_of_nesting`) |
+| Linked-runbook dashboard aggregates child progress live | QS p25 | 4.1, 4.2 | DONE (reconciled 2026-09-11 — see Epic 4.1: `aggregate_progress`/`aggregate_status` on the parent, live via `runbook_document()`) |
+| Multi-runbook dashboard with filters and scheduled email sharing | QS p31 | 4.2 | PARTIAL (reconciled 2026-09-11 — per-user configurable dashboard DONE, see Epic 4.2; scheduled-email sharing is the genuine remaining gap, planned) |
 | Post-implementation review after completion | QS p32 | 4.2 | DONE |
-| Downloadable, filterable audit evidence | QS p29 | 4.3 | BACKLOG |
+| Downloadable, filterable audit evidence | QS p29 | 4.3 | PARTIAL (reconciled 2026-09-11 — checksummed, hash-chain-verified download DONE via `GET /api/admin/audit/export`, see Epic 4.3; server-side filtering by date/actor/action is the genuine remaining gap — the endpoint always returns the full tenant history) |
 
 ### Video-derived integration requirements
 
@@ -719,7 +824,7 @@ reviewed from the full 5:22 transcript on 2026-09-06.
 | Admin tests a connection without exposing its credential to the browser | 4:38-5:15 | 3.1 | DONE |
 | ServiceOps API compatibility test validates JSON, authentication, and `tickets:read`, and explains additional lifecycle scopes | ServiceOps REST API v1 contract | 3.1 | DONE |
 | Test Connection validates the URL and API key currently entered in the browser before saving, rather than silently testing a stale deployment fallback | ServiceOps administrator workflow regression 2026-09-10 | 3.1 | DONE |
-| Browser-triggered ServiceOps synchronization uses the authenticated CSRF-aware API client and refreshes the runbook projection without a page reload | ServiceOps runbook synchronization regression 2026-09-10 | 3.1 | DONE |
+| Browser-triggered ServiceOps synchronization uses the authenticated CSRF-aware API client, recovers a stale in-memory CSRF token from the authenticated session with one safe retry, and refreshes the runbook projection without a page reload | ServiceOps runbook synchronization regressions 2026-09-10 and 2026-09-11 | 3.1 | DONE |
 | Integration tasks execute only in Live; rehearsal safely skips them | 1:28-1:39 | 3.1 | DONE (no distinct rehearsal mode exists; all task types already gate on live-only execution) |
 | Directory sign-in delegates AD/LDAP verification to ServiceOps and displays the configured AD domain | ServiceOps login behavior | 4.4 | DONE |
 | Queued/running progress and percentage update the task in real time | 1:42-2:25 | 1.5, 3.1 | DONE |

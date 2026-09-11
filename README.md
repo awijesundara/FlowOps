@@ -48,6 +48,15 @@ FLOWOPS_PORT=8088 python3 server.py
 - Administration home for users, roles, workspaces, sessions, audit evidence, system health, email readiness, and connected systems
 - Administrator-managed ServiceOps connection policy with encrypted API-key set/rotate/revoke and compatibility testing
 - SMTP-delivered invitations and password resets with preview-only token display
+- Accessible core execution UI with semantic runbook controls, skip navigation,
+  live-region updates, reduced-motion behavior, and 320px responsive reflow
+
+The browser acceptance suite can use an installed Chrome and axe-core:
+
+```bash
+FLOWOPS_BROWSER_CHANNEL=chrome FLOWOPS_AXE_CORE_PATH=/path/to/axe.min.js \
+  python -m unittest -v test_browser
+```
 
 This is a production-shaped MVP, not a copy of Cutover's proprietary software.
 It implements common operational-orchestration concepts with original FlowOps
@@ -63,6 +72,10 @@ branding, code, information architecture, and visual design.
 3. Recreate the FlowOps container and link a ServiceOps ticket number when
    creating a runbook.
 4. Use **Sync ServiceOps** in the runbook view.
+
+The browser refreshes a stale in-memory FlowOps CSRF token from the existing
+authenticated session and retries a failed mutation once. The ServiceOps API
+key is never used as a browser CSRF token and remains server-side.
 
 The bearer token stays server-side. ServiceOps' tenant, user, team, role, and
 lifecycle controls still apply. Bidirectional updates use the existing

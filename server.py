@@ -120,33 +120,42 @@ def connect() -> sqlite3.Connection:
 def list_backups() -> list[dict[str, Any]]:
     if not BACKUP_DIR.exists(): return []
     items=[]
-    for path in sorted(BACKUP_DIR.glob("flowops-*.db"), reverse=True):
+    # .db.enc is the current (encrypted) format; bare .db is only listed for
+    # backward compatibility with backups taken before encryption-at-rest
+    # shipped -- new backups are never written in that format again.
+    for path in sorted(list(BACKUP_DIR.glob("flowops-*.db.enc"))+list(BACKUP_DIR.glob("flowops-*.db")), key=lambda p: p.stat().st_mtime, reverse=True):
         stat=path.stat()
-        items.append({"filename":path.name,"size_bytes":stat.st_size,"created_at":datetime.fromtimestamp(stat.st_mtime,tz=timezone.utc).isoformat(timespec="seconds")})
+        items.append({"filename":path.name,"size_bytes":stat.st_size,"created_at":datetime.fromtimestamp(stat.st_mtime,tz=timezone.utc).isoformat(timespec="seconds"),"encrypted":path.suffix==".enc"})
     return items
 
 
 def backup_database() -> dict[str, Any]:
     """Hot, consistent snapshot backup using SQLite's own backup API (safe to
-    run against a live database, unlike a plain file copy). This is
-    point-in-time *snapshot* backup, not continuous/WAL-shipping PITR --
-    recovery granularity is the backup interval, not per-transaction."""
+    run against a live database, unlike a plain file copy), then encrypted
+    at rest with the same authenticated cipher (SettingsCipher) already
+    used for admin-managed credentials -- the on-disk backup is never left
+    as a readable SQLite file. This is point-in-time *snapshot* backup, not
+    continuous/WAL-shipping PITR -- recovery granularity is the backup
+    interval, not per-transaction."""
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + f"{datetime.now(timezone.utc).microsecond:06d}Z"
-    dest_path = BACKUP_DIR / f"flowops-{stamp}.db"
+    plain_path = BACKUP_DIR / f"flowops-{stamp}.db"
+    enc_path = BACKUP_DIR / f"flowops-{stamp}.db.enc"
     source = sqlite3.connect(DB_PATH)
     try:
-        dest = sqlite3.connect(str(dest_path))
+        dest = sqlite3.connect(str(plain_path))
         try:
             source.backup(dest)
         finally:
             dest.close()
     finally:
         source.close()
-    backups = sorted(BACKUP_DIR.glob("flowops-*.db"), reverse=True)
+    enc_path.write_bytes(settings_cipher().encrypt(plain_path.read_bytes()))
+    plain_path.unlink(missing_ok=True)
+    backups = sorted(list(BACKUP_DIR.glob("flowops-*.db.enc"))+list(BACKUP_DIR.glob("flowops-*.db")), key=lambda p: p.stat().st_mtime, reverse=True)
     for stale in backups[BACKUP_RETAIN:]:
         stale.unlink(missing_ok=True)
-    return {"filename": dest_path.name, "size_bytes": dest_path.stat().st_size}
+    return {"filename": enc_path.name, "size_bytes": enc_path.stat().st_size}
 
 
 API_RATE_LIMIT = int(os.getenv("FLOWOPS_API_RATE_LIMIT", "120"))  # requests per window, per API token
@@ -251,6 +260,15 @@ def init_db() -> None:
           id INTEGER PRIMARY KEY, runbook_id INTEGER, action TEXT NOT NULL, detail TEXT NOT NULL,
           actor TEXT NOT NULL, created_at TEXT NOT NULL, previous_hash TEXT NOT NULL, event_hash TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS audit_purge_lock (
+          id INTEGER PRIMARY KEY CHECK(id=1), active INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT OR IGNORE INTO audit_purge_lock(id,active) VALUES(1,0);
+        CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON audit
+        BEGIN SELECT RAISE(ABORT, 'audit rows are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit
+        WHEN (SELECT active FROM audit_purge_lock WHERE id=1)=0
+        BEGIN SELECT RAISE(ABORT, 'audit rows are immutable except via retention purge'); END;
         CREATE TABLE IF NOT EXISTS users (
           id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE,
           display_name TEXT NOT NULL, email TEXT NOT NULL DEFAULT '', role TEXT NOT NULL DEFAULT 'Viewer',
@@ -442,7 +460,7 @@ def init_db() -> None:
           "task_type":"TEXT NOT NULL DEFAULT 'normal'", "scheduled_offset":"INTEGER NOT NULL DEFAULT 0",
           "owner_user_id":"INTEGER REFERENCES users(id)", "owner_team_id":"INTEGER REFERENCES runbook_teams(id)",
           "validation_result":"TEXT", "validation_comment":"TEXT", "blocked_reason":"TEXT",
-          "serviceops_ctask":"TEXT",
+          "serviceops_ctask":"TEXT", "serviceops_ctask_team":"TEXT",
           "automation_status":"TEXT NOT NULL DEFAULT 'idle'", "automation_result":"TEXT",
           "automation_attempts":"INTEGER NOT NULL DEFAULT 0", "skip_reason":"TEXT"
         }
@@ -730,6 +748,24 @@ def append_audit(db: sqlite3.Connection, runbook_id: int | None, action: str, de
                (runbook_id, action, detail, actor, stamp, previous_hash, digest, instance_id))
 
 
+def verify_audit_chain(db: sqlite3.Connection, instance_id: int) -> tuple[bool, int]:
+    """Walks the tenant's audit hash chain from its last retention
+    checkpoint (or GENESIS) and confirms every row's event_hash matches
+    what append_audit() would have computed. Returns (chain_verified,
+    events_checked). Shared by the export route and the standalone
+    verify endpoint so both report the same result."""
+    events = rows(db.execute("SELECT runbook_id,action,detail,actor,created_at,previous_hash,event_hash FROM audit WHERE instance_id=? ORDER BY id ASC", (instance_id,)))
+    previous = instance_settings(db, instance_id).get("audit_retention_checkpoint", "GENESIS")
+    for event in events:
+        if event["previous_hash"] != previous:
+            return False, len(events)
+        expected = hashlib.sha256(f"{previous}|{event['runbook_id']}|{event['action']}|{event['detail']}|{event['actor']}|{event['created_at']}".encode()).hexdigest()
+        if expected != event["event_hash"]:
+            return False, len(events)
+        previous = event["event_hash"]
+    return True, len(events)
+
+
 def rows(items) -> list[dict[str, Any]]:
     return [dict(row) for row in items]
 
@@ -854,43 +890,48 @@ def runbook_document(db: sqlite3.Connection, rid: int, user: dict[str,Any] | Non
     doc["review"] = json.loads(raw_review) if raw_review else None
     doc["runbook_type_requires_approval"] = bool(db.execute("SELECT requires_approval FROM runbook_types WHERE id=?",(doc["runbook_type_id"],)).fetchone()[0]) if doc.get("runbook_type_id") else False
     all_tasks = rows(db.execute("SELECT t.*,u.display_name owner_user_name,rt.name owner_team_name FROM tasks t LEFT JOIN users u ON u.id=t.owner_user_id LEFT JOIN runbook_teams rt ON rt.id=t.owner_team_id WHERE t.runbook_id=? ORDER BY t.sort_order,t.id", (rid,)))
+    deps = rows(db.execute("SELECT d.task_id,d.depends_on_id FROM dependencies d JOIN tasks t ON t.id=d.task_id WHERE t.runbook_id=?", (rid,)))
+    dep_map: dict[int,list[int]] = {}
+    for dep in deps:
+        dep_map.setdefault(dep["task_id"], []).append(dep["depends_on_id"])
+    for task in all_tasks:
+        task["depends_on"] = dep_map.get(task["id"], [])
+        task["blocked"] = task["status"] == "pending" and any(next((x["status"] for x in all_tasks if x["id"] == d), "pending") not in {"complete","skipped"} for d in task["depends_on"])
+        task["owner_display"] = task["owner_user_name"] or task["owner_team_name"] or task["owner"] or "Unassigned"
     tasks=all_tasks
     if user and user.get("role")=="Member":
         team_ids={row[0] for row in db.execute("SELECT team_id FROM team_members WHERE user_id=?",(user["id"],))}
         team_ids|={row[0] for row in db.execute("SELECT rt.id FROM runbook_teams rt JOIN central_team_members ctm ON ctm.team_id=rt.central_team_id WHERE rt.runbook_id=? AND ctm.user_id=?",(rid,user["id"]))}
         tasks=[t for t in all_tasks if t["owner_user_id"]==user["id"] or t["owner_team_id"] in team_ids]
-    deps = rows(db.execute("SELECT d.task_id,d.depends_on_id FROM dependencies d JOIN tasks t ON t.id=d.task_id WHERE t.runbook_id=?", (rid,)))
-    dep_map: dict[int,list[int]] = {}
-    for dep in deps:
-        dep_map.setdefault(dep["task_id"], []).append(dep["depends_on_id"])
-    for task in tasks:
-        task["depends_on"] = dep_map.get(task["id"], [])
-        task["blocked"] = task["status"] == "pending" and any(next((x["status"] for x in all_tasks if x["id"] == d), "pending") not in {"complete","skipped"} for d in task["depends_on"])
-        task["owner_display"] = task["owner_user_name"] or task["owner_team_name"] or task["owner"] or "Unassigned"
-    # Earliest-possible-start offset per task, derived from its longest
-    # predecessor chain (not the unused, always-zero scheduled_offset column):
+    # Earliest-possible-start offset per task is the later of its explicit
+    # schedule offset and the finish of its longest predecessor branch.
     # a task blocked behind 90 minutes of prior work cannot be late the
     # instant the runbook's overall start time passes -- it becomes late
     # only once its own dependency chain's planned finish time passes.
-    by_id = {t["id"]: t for t in tasks}
+    by_id = {t["id"]: t for t in all_tasks}
     earliest_start_memo: dict[int, int] = {}
     def earliest_start(tid: int) -> int:
         if tid in earliest_start_memo: return earliest_start_memo[tid]
         task = by_id.get(tid)
         if not task: return 0
-        earliest_start_memo[tid] = 0
-        offset = max((earliest_start(dep) + by_id[dep]["duration"] for dep in task["depends_on"] if dep in by_id), default=0)
+        earliest_start_memo[tid] = max(0, int(task.get("scheduled_offset") or 0))
+        offset = max(
+            max(0, int(task.get("scheduled_offset") or 0)),
+            max((earliest_start(dep) + by_id[dep]["duration"] for dep in task["depends_on"] if dep in by_id), default=0),
+        )
         earliest_start_memo[tid] = offset
         return offset
     runbook_live = rb["mode"] == "live" or bool(rb["actual_started_at"])
     for task in tasks:
+        task["planned_start_offset"] = earliest_start(task["id"])
+        task["planned_end_offset"] = task["planned_start_offset"] + task["duration"]
         task["late"] = False
         task["delay_minutes"] = 0
         if rb["scheduled_at"] and not task["blocked"]:
             try:
                 scheduled=datetime.fromisoformat(rb["scheduled_at"])
                 if scheduled.tzinfo is None: scheduled=scheduled.replace(tzinfo=timezone.utc)
-                offset = earliest_start(task["id"])
+                offset = task["planned_start_offset"]
                 deadline = scheduled.timestamp() + (offset+task["duration"])*60
                 if runbook_live and task["status"] not in {"complete","skipped"}:
                     task["late"] = datetime.now(timezone.utc).timestamp() > deadline
@@ -920,8 +961,8 @@ def runbook_document(db: sqlite3.Connection, rid: int, user: dict[str,Any] | Non
     doc["audit"] = rows(db.execute("SELECT * FROM audit WHERE runbook_id=? ORDER BY id DESC LIMIT 100", (rid,)))
     done = sum(t["status"] == "complete" for t in tasks)
     doc["progress"] = round(done * 100 / len(tasks)) if tasks else 0
-    doc["duration"] = sum(t["duration"] for t in tasks)
-    doc["critical_path"] = critical_path(tasks)
+    doc["duration"] = max((earliest_start(t["id"]) + t["duration"] for t in all_tasks), default=0)
+    doc["critical_path"] = critical_path(all_tasks)
     current_time = datetime.now(timezone.utc)
     def instant(value: str | None) -> datetime | None:
         if not value:
@@ -970,7 +1011,7 @@ def critical_path(tasks: list[dict[str, Any]]) -> list[int]:
     def visit(tid: int) -> tuple[int,list[int]]:
         if tid in memo: return memo[tid]
         if tid in visiting: return (0, [])
-        visiting.add(tid); task=by_id[tid]; best=(0,[])
+        visiting.add(tid); task=by_id[tid]; best=(max(0,int(task.get("scheduled_offset") or 0)),[])
         for dep in task["depends_on"]:
             if dep in by_id:
                 candidate=visit(dep)
@@ -1274,17 +1315,16 @@ class Handler(BaseHTTPRequestHandler):
                 actor=self.require(db,"admin:access")
                 if not actor:return
                 events=rows(db.execute("SELECT id,runbook_id,action,detail,actor,created_at,previous_hash,event_hash FROM audit WHERE instance_id=? ORDER BY id ASC",(actor["instance_id"],)))
-                chain_verified=True
-                previous=instance_settings(db,actor["instance_id"]).get("audit_retention_checkpoint","GENESIS")
-                for event in events:
-                    if event["previous_hash"]!=previous: chain_verified=False; break
-                    expected=hashlib.sha256(f"{previous}|{event['runbook_id']}|{event['action']}|{event['detail']}|{event['actor']}|{event['created_at']}".encode()).hexdigest()
-                    if expected!=event["event_hash"]: chain_verified=False; break
-                    previous=event["event_hash"]
+                chain_verified,_=verify_audit_chain(db,actor["instance_id"])
                 export_body=json.dumps(events,sort_keys=True,separators=(",",":"))
                 checksum=hashlib.sha256(export_body.encode()).hexdigest()
                 append_audit(db,None,"audit.exported",f"{len(events)} events, chain_verified={chain_verified}",actor["display_name"],actor["instance_id"]); db.commit()
                 return self.send_json({"data":{"events":events,"count":len(events),"exported_at":now(),"chain_verified":chain_verified,"checksum":f"sha256:{checksum}"}})
+            if path=="/api/admin/audit/verify":
+                actor=self.require(db,"admin:access")
+                if not actor:return
+                chain_verified,events_checked=verify_audit_chain(db,actor["instance_id"])
+                return self.send_json({"data":{"chain_verified":chain_verified,"events_checked":events_checked,"verified_at":now()}})
             if path=="/api/admin/health":
                 actor=self.require(db,"admin:access")
                 if not actor:return
@@ -1737,7 +1777,9 @@ class Handler(BaseHTTPRequestHandler):
                 remaining_after=db.execute("SELECT previous_hash FROM audit WHERE instance_id=? AND created_at>=? ORDER BY id ASC LIMIT 1",(actor["instance_id"],cutoff)).fetchone()
                 checkpoint=remaining_after["previous_hash"] if remaining_after else "GENESIS"
                 purge_ids=[e["id"] for e in to_purge]
+                db.execute("UPDATE audit_purge_lock SET active=1 WHERE id=1")
                 db.execute(f"DELETE FROM audit WHERE id IN ({','.join('?'*len(purge_ids))})",purge_ids)
+                db.execute("UPDATE audit_purge_lock SET active=0 WHERE id=1")
                 db.execute("INSERT INTO instance_settings(instance_id,key,value,updated_at) VALUES(?,?,?,?) ON CONFLICT(instance_id,key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",(actor["instance_id"],"audit_retention_checkpoint",checkpoint,now()))
                 append_audit(db,None,"audit.retention_purged",f"Purged {len(purge_ids)} events older than {retention_days} days",actor["display_name"],actor["instance_id"]); db.commit()
                 return self.send_json({"data":{"purged":len(purge_ids)}})
@@ -2573,22 +2615,27 @@ class Handler(BaseHTTPRequestHandler):
         if ctasks and not db.execute("SELECT 1 FROM streams WHERE runbook_id=? AND name='Change tasks'",(rid,)).fetchone():
             stream_order=db.execute("SELECT COALESCE(MAX(sort_order),-1)+1 FROM streams WHERE runbook_id=?",(rid,)).fetchone()[0]
             db.execute("INSERT INTO streams(runbook_id,name,sort_order,created_at) VALUES(?,?,?,?)",(rid,"Change tasks",stream_order,now()))
-        created=[];previous_id=None
+        created=[];updated=[];previous_id=None
         for ctask in ctasks:
             number=str(ctask.get("number") or "").strip()
             if not number: continue
-            if number in existing:
-                previous_id=existing[number];continue
-            max_order+=1
-            owner=str(ctask.get("assignee") or ctask.get("assignmentGroup") or "")[:120]
+            team=str(ctask.get("assignmentGroup") or "")[:120]
+            assignee=str(ctask.get("assignee") or "")[:120]
             description=str(ctask.get("workNotes") or "")[:2000]
             title=str(ctask.get("title") or number)[:200]
-            cur=db.execute("INSERT INTO tasks(runbook_id,title,description,stream,owner,duration,status,sort_order,serviceops_ctask) VALUES(?,?,?,?,?,?,?,?,?)",
-                (rid,title,description,"Change tasks",owner,15,"pending",max_order,number))
+            if number in existing:
+                task_id=existing[number]
+                db.execute("UPDATE tasks SET title=?,description=?,owner=?,serviceops_ctask_team=? WHERE id=?",
+                    (title,description,assignee,team,task_id))
+                updated.append(task_id);previous_id=task_id;continue
+            max_order+=1
+            cur=db.execute("INSERT INTO tasks(runbook_id,title,description,stream,owner,serviceops_ctask_team,duration,status,sort_order,serviceops_ctask) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (rid,title,description,"Change tasks",assignee,team,15,"pending",max_order,number))
             task_id=cur.lastrowid;created.append(task_id)
             if previous_id: db.execute("INSERT OR IGNORE INTO dependencies(task_id,depends_on_id) VALUES(?,?)",(task_id,previous_id))
             previous_id=task_id
         if created: append_audit(db,rid,"serviceops.ctasks_imported",f"Imported {len(created)} change task(s) from {ticket_number}")
+        if updated: append_audit(db,rid,"serviceops.ctasks_synced",f"Updated {len(updated)} change task(s) from {ticket_number}")
         return created
 
     def push_serviceops_ctask_state(self, db, rid, ctask_number, target):
