@@ -82,6 +82,8 @@ DB_PATH = os.getenv("FLOWOPS_DB", str(Path(__file__).with_name("flowops.db")))
 BACKUP_DIR = Path(os.getenv("FLOWOPS_BACKUP_DIR", str(Path(DB_PATH).parent / "backups")))
 BACKUP_RETAIN = int(os.getenv("FLOWOPS_BACKUP_RETAIN", "14"))
 BACKUP_INTERVAL_HOURS = float(os.getenv("FLOWOPS_BACKUP_INTERVAL_HOURS", "6"))
+CF_ACCESS_TEAM_DOMAIN = os.getenv("FLOWOPS_CF_ACCESS_TEAM_DOMAIN", "")
+CF_ACCESS_AUD = os.getenv("FLOWOPS_CF_ACCESS_AUD", "")
 STATIC = Path(__file__).with_name("static")
 MAX_BODY = 1_000_000
 SESSION_SECONDS = 8 * 60 * 60
@@ -498,6 +500,84 @@ def init_db() -> None:
         for key,value in defaults.items():
             legacy=db.execute("SELECT value FROM settings WHERE key=?",(key,)).fetchone()
             db.execute("INSERT OR IGNORE INTO instance_settings(instance_id,key,value,updated_at) VALUES(?,?,?,?)",(default_instance,key,legacy[0] if legacy else value,now()))
+
+
+_cf_access_jwks_cache: dict[str, Any] = {"fetched_at": 0.0, "keys": {}}
+_cf_access_jwks_lock = threading.Lock()
+
+
+def _b64url_decode(segment: str) -> bytes:
+    padding = "=" * (-len(segment) % 4)
+    return base64.urlsafe_b64decode(segment + padding)
+
+
+def _cf_access_jwks() -> dict[str, tuple[int, int]]:
+    """Fetches (and caches for 1 hour) Cloudflare Access's RS256 public keys
+    for this team, keyed by kid, as (n, e) integer tuples -- no external
+    crypto dependency, matching this app's stdlib-only design."""
+    with _cf_access_jwks_lock:
+        if time.monotonic() - _cf_access_jwks_cache["fetched_at"] < 3600 and _cf_access_jwks_cache["keys"]:
+            return _cf_access_jwks_cache["keys"]
+        url = f"https://{CF_ACCESS_TEAM_DOMAIN}/cdn-cgi/access/certs"
+        with urllib.request.urlopen(url, timeout=5) as response:
+            document = json.loads(response.read())
+        keys = {}
+        for jwk in document.get("keys", []):
+            if jwk.get("kty") != "RSA":
+                continue
+            n = int.from_bytes(_b64url_decode(jwk["n"]), "big")
+            e = int.from_bytes(_b64url_decode(jwk["e"]), "big")
+            keys[jwk["kid"]] = (n, e)
+        _cf_access_jwks_cache["keys"] = keys
+        _cf_access_jwks_cache["fetched_at"] = time.monotonic()
+        return keys
+
+
+def _rsa_pkcs1_sha256_verify(message: bytes, signature: bytes, n: int, e: int) -> bool:
+    """RS256 (RSASSA-PKCS1-v1_5 with SHA-256) verification using only
+    built-in big-integer exponentiation -- no cryptography library."""
+    digest_info_prefix = bytes.fromhex("3031300d060960864801650304020105000420")
+    digest = hashlib.sha256(message).digest()
+    key_bytes = (n.bit_length() + 7) // 8
+    sig_int = int.from_bytes(signature, "big")
+    if sig_int >= n:
+        return False
+    decrypted = pow(sig_int, e, n).to_bytes(key_bytes, "big")
+    padded_len = key_bytes - 3 - len(digest_info_prefix) - len(digest)
+    if padded_len < 8:
+        return False
+    expected = b"\x00\x01" + b"\xff" * padded_len + b"\x00" + digest_info_prefix + digest
+    return hmac.compare_digest(decrypted, expected)
+
+
+def verify_cf_access_jwt(token: str) -> dict[str, Any] | None:
+    """Verifies a Cloudflare Access-issued JWT (from the
+    Cf-Access-Jwt-Assertion header) against this team's public keys,
+    checking signature, audience, and expiry. Returns the claims on
+    success, None on any failure -- never raises, since a missing/invalid
+    header must fall back to normal login, not error out."""
+    if not CF_ACCESS_TEAM_DOMAIN or not CF_ACCESS_AUD:
+        return None
+    try:
+        header_b64, payload_b64, sig_b64 = token.split(".")
+        header = json.loads(_b64url_decode(header_b64))
+        claims = json.loads(_b64url_decode(payload_b64))
+        signature = _b64url_decode(sig_b64)
+        if header.get("alg") != "RS256":
+            return None
+        keys = _cf_access_jwks()
+        key = keys.get(header.get("kid"))
+        if not key:
+            return None
+        if not _rsa_pkcs1_sha256_verify(f"{header_b64}.{payload_b64}".encode(), signature, *key):
+            return None
+        if CF_ACCESS_AUD not in (claims.get("aud") or []):
+            return None
+        if int(claims.get("exp", 0)) < int(time.time()):
+            return None
+        return claims
+    except Exception:
+        return None
 
 
 def password_hash(password: str, salt: bytes | None=None) -> str:
@@ -1375,6 +1455,20 @@ class Handler(BaseHTTPRequestHandler):
                 except sqlite3.IntegrityError:
                     db.rollback(); return self.send_json({"error":"That organization, username, or email is already registered"},409)
                 return self.send_json({"data":{"instance_id":instance_id,"user_id":user_id,"slug":slug}},201)
+            if path=="/api/auth/sso":
+                token=self.headers.get("Cf-Access-Jwt-Assertion","")
+                claims=verify_cf_access_jwt(token) if token else None
+                if not claims or not claims.get("email"):
+                    return self.send_json({"error":"No verified Cloudflare Access identity on this request"},401)
+                email=str(claims["email"]).strip().lower()
+                user=db.execute("SELECT * FROM users WHERE LOWER(email)=? AND active=1",(email,)).fetchone()
+                if not user:
+                    return self.send_json({"error":"No active FlowOps account matches your Cloudflare Access identity"},404)
+                hours=max(1,min(24,int(instance_settings(db,user["instance_id"]).get("session_hours","8")))); session_seconds=hours*3600
+                raw=secrets.token_urlsafe(36); csrf=secrets.token_urlsafe(24); expires=int(time.time())+session_seconds
+                db.execute("DELETE FROM sessions WHERE expires_at<=?",(int(time.time()),)); db.execute("INSERT INTO sessions(token_hash,csrf_token,user_id,expires_at,created_at,ip_address,user_agent) VALUES(?,?,?,?,?,?,?)",(hashlib.sha256(raw.encode()).hexdigest(),csrf,user["id"],expires,now(),self.client_address[0][:64],self.headers.get("User-Agent","")[:300])); db.execute("UPDATE users SET last_login_at=? WHERE id=?",(now(),user["id"])); append_audit(db,None,"auth.sso_login",f"{user['username']} signed in via Cloudflare Access ({email})",user["display_name"],user["instance_id"]); db.commit()
+                safe={k:user[k] for k in ("id","username","display_name","email","role","team")}; safe["permissions"]=sorted(ROLE_PERMISSIONS[user["role"]]); safe["csrf_token"]=csrf
+                return self.send_json({"data":safe},headers={"Set-Cookie":f"flowops_session={raw}; Path=/; HttpOnly; SameSite=Strict; Max-Age={session_seconds}"})
             if path=="/api/auth/login":
                 username=str(payload.get("username","")).strip(); password=str(payload.get("password",""));source=str(payload.get("source","local")).lower()
                 instance=db.execute("SELECT id FROM instances WHERE slug=?",(DEFAULT_INSTANCE_SLUG,)).fetchone()
