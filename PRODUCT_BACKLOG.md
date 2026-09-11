@@ -224,7 +224,25 @@ Approved by ...") and an Approve button for admins on gated types.
 | Save runbook as reusable template | P0 | M | DONE |
 | Create runbook from saved template | P0 | S | DONE |
 | Scope template visibility by workspace | P2 | M | DONE |
-| Reusable task snippets (subset of tasks, not a whole runbook), capped at 100 tasks | P2 | M | BACKLOG |
+| Reusable task snippets (subset of tasks, not a whole runbook), capped at 100 tasks | P2 | M | DONE |
+
+Reusable task snippets (2026-09-11): distinct from a template (which
+captures an entire runbook), a snippet captures an explicit, arbitrary
+subset of a runbook's tasks -- `POST /api/runbooks/{id}/save-as-snippet`
+takes `task_ids`, rejects a selection over 100 tasks or containing a task
+that doesn't belong to that runbook, and copies only the internal
+dependencies where *both* endpoints are in the selection (a dependency on
+a task left out of the snippet is silently dropped, not left dangling).
+`POST /api/runbooks/{id}/insert-snippet` appends a snippet's tasks
+(preserving their internal dependency chain) onto the end of a
+*different* runbook's task list, auto-creating any missing streams --
+mirroring how "use template" works, but appending into an existing
+runbook instead of creating a new one. `GET/DELETE /api/snippets`
+round it out. Runbook detail view: "✂ Save snippet" (prompts for task
+numbers, reusing the same numbered-list picker as the existing "Bulk
+edit" action) and "＋ Insert snippet". Covered by
+`test_snippet_captures_selected_tasks_and_internal_dependencies_only`
+and `test_snippet_rejects_more_than_one_hundred_tasks`.
 
 Scoping evidence (2026-09-10): previously any active workspace could be
 passed to `POST /api/templates/{id}/use`, letting a template created in one

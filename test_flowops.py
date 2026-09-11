@@ -587,6 +587,40 @@ class FlowOpsTest(unittest.TestCase):
         _,folders=self.req('/api/folders')
         self.assertTrue(any(f['id']==folder_id and f['runbook_count']==1 for f in folders['data']))
         self.assertEqual(self.req(f'/api/folders/{folder_id}','DELETE')[0],409)
+    def test_snippet_captures_selected_tasks_and_internal_dependencies_only(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Snippet source'}); rid=created['data']['id']
+        _,first=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Notify on-call','stream':'Comms','duration':5}); first_id=first['data']['tasks'][0]['id']
+        _,second=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Page escalation','stream':'Comms','duration':5,'depends_on':[first_id]}); second_id=second['data']['tasks'][1]['id']
+        _,third=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Unrelated task','stream':'Other','duration':5}); third_id=third['data']['tasks'][2]['id']
+        code,snippet=self.req(f'/api/runbooks/{rid}/save-as-snippet','POST',{'name':'Incident comms kickoff','task_ids':[first_id,second_id]})
+        self.assertEqual(code,201)
+        self.assertEqual(snippet['data']['task_count'],2)
+        self.assertEqual(self.req(f'/api/runbooks/{rid}/save-as-snippet','POST',{'name':'Incident comms kickoff','task_ids':[third_id]})[0],409)
+        code,rejected=self.req(f'/api/runbooks/{rid}/save-as-snippet','POST',{'name':'Bad selection','task_ids':[999999]})
+        self.assertEqual(code,400)
+        _,listed=self.req('/api/snippets')
+        self.assertTrue(any(s['name']=='Incident comms kickoff' and s['task_count']==2 for s in listed['data']))
+        _,other=self.req('/api/runbooks','POST',{'name':'Snippet destination'}); other_rid=other['data']['id']
+        code,inserted=self.req(f'/api/runbooks/{other_rid}/insert-snippet','POST',{'snippet_id':snippet['data']['id']})
+        self.assertEqual(code,201)
+        titles={t['title'] for t in inserted['data']['tasks']}
+        self.assertEqual(titles,{'Notify on-call','Page escalation'})
+        by_title={t['title']:t for t in inserted['data']['tasks']}
+        notify_id=by_title['Notify on-call']['id']
+        page=by_title['Page escalation']
+        self.assertEqual(page['depends_on'],[notify_id])
+        self.assertEqual(self.req(f'/api/snippets/{snippet["data"]["id"]}','DELETE')[0],200)
+        _,afterDelete=self.req('/api/snippets')
+        self.assertFalse(any(s['id']==snippet['data']['id'] for s in afterDelete['data']))
+    def test_snippet_rejects_more_than_one_hundred_tasks(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Big snippet source'}); rid=created['data']['id']
+        task_ids=[]
+        for i in range(101):
+            _,t=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':f'Step {i}','duration':1})
+            task_ids.append(t['data']['tasks'][-1]['id'])
+        code,rejected=self.req(f'/api/runbooks/{rid}/save-as-snippet','POST',{'name':'Too big','task_ids':task_ids})
+        self.assertEqual(code,400)
+        self.assertIn('100',rejected['error'])
     def test_runbook_home_content_is_editable_and_returned_in_document(self):
         _,created=self.req('/api/runbooks','POST',{'name':'Home page runbook'}); rid=created['data']['id']
         _,doc=self.req(f'/api/runbooks/{rid}')
