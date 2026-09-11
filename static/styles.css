@@ -53,3 +53,11 @@ dialog{box-shadow:var(--shadow-lg)}
 .admin-cat-row:hover,.admin-tool-card:hover{box-shadow:inset 3px 0 var(--purple)}
 .security-card{box-shadow:var(--shadow-md)}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
+.skip-link{position:fixed;z-index:200;left:12px;top:10px;padding:10px 14px;border-radius:7px;background:#fff;color:#17223b;box-shadow:0 3px 12px #0003;transform:translateY(-150%)}
+.skip-link:focus{transform:none}
+.welcome p,.pagehead p{color:#566178}.profile small{color:#d3dbf4}
+.runbook-card{display:block;width:100%;background:#fff;color:inherit;text-align:left;font:inherit}
+button.trow{width:100%;border:0;background:#fff;color:inherit;text-align:left;font:inherit}
+#toast{visibility:hidden;transition:transform .2s ease;opacity:0}#toast.show{visibility:visible;opacity:1}
+@media(max-width:560px){.toolbar{flex-wrap:wrap}.toolbar label{flex-basis:100%}.toolbar select{max-width:calc(50% - 8px);border-left:0}.runbook-meta{flex-wrap:wrap}.empty{padding:42px 15px}}
+.task.blocked{opacity:1}.task-avatar{background:#2541b8!important;color:#fff}.back,.detail-title p,#timingEnd,button[data-mode="map"]{color:#4b556b!important}.provider-icon{background:#dbe5ff!important;color:#17223b!important}

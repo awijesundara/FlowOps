@@ -30,7 +30,10 @@ class FlowOpsBrowserTest(unittest.TestCase):
         cls.base = f'http://127.0.0.1:{cls.http.server_port}'
         threading.Thread(target=cls.http.serve_forever, daemon=True).start()
         cls.playwright = sync_playwright().start()
-        cls.browser = cls.playwright.chromium.launch()
+        launch_options = {}
+        if os.getenv('FLOWOPS_BROWSER_CHANNEL'):
+            launch_options['channel'] = os.environ['FLOWOPS_BROWSER_CHANNEL']
+        cls.browser = cls.playwright.chromium.launch(**launch_options)
 
     @classmethod
     def tearDownClass(cls):
@@ -56,7 +59,7 @@ class FlowOpsBrowserTest(unittest.TestCase):
         self.assertFalse(badge.is_visible(), "badge must be hidden when there is nothing unread")
 
     def test_runbooks_page_shows_new_runbook_button_exactly_once(self):
-        self.page.click('[data-view="runbooks"]')
+        self.page.click('[data-view="runbooks"]', force=True)
         self.page.wait_for_selector('#runbooks.view.active')
         visible = [
             b for b in self.page.query_selector_all('button:has-text("New runbook")')
@@ -79,6 +82,51 @@ class FlowOpsBrowserTest(unittest.TestCase):
         self.page.wait_for_timeout(500)
         rows = self.page.query_selector_all('.trow[data-id]')
         self.assertGreater(len(rows), 0, "search should return at least one task-title match")
+
+    def test_axe_has_no_serious_or_critical_execution_ui_violations(self):
+        axe_path = os.getenv('FLOWOPS_AXE_CORE_PATH')
+        if not axe_path:
+            self.skipTest('FLOWOPS_AXE_CORE_PATH is not configured')
+        self.page.add_script_tag(path=axe_path)
+        violations = []
+        for view in ('home', 'runbooks'):
+            self.page.click(f'[data-view="{view}"]')
+            result = self.page.evaluate("""async () => await axe.run(document, {
+                runOnly: {type: 'tag', values: ['wcag2a', 'wcag2aa', 'wcag21aa']}
+            })""")
+            violations.extend(
+                f"{view}: {item['id']} ({item['impact']}) "
+                + '; '.join(', '.join(node['target']) for node in item['nodes'])
+                for item in result['violations']
+                if item['impact'] in ('serious', 'critical')
+            )
+        self.page.evaluate("show('runbooks')")
+        self.page.locator('.trow[data-id]').first.click()
+        self.page.wait_for_selector('#detail.view.active')
+        result = self.page.evaluate("""async () => await axe.run(document, {
+            runOnly: {type: 'tag', values: ['wcag2a', 'wcag2aa', 'wcag21aa']}
+        })""")
+        violations.extend(
+            f"detail: {item['id']} ({item['impact']}) "
+            + '; '.join(', '.join(node['target']) for node in item['nodes'])
+            for item in result['violations']
+            if item['impact'] in ('serious', 'critical')
+        )
+        self.assertEqual(violations, [], '\n'.join(violations))
+
+    def test_runbook_rows_are_keyboard_operable(self):
+        self.page.click('[data-view="runbooks"]')
+        row = self.page.locator('.trow[data-id]').first
+        row.focus()
+        self.assertTrue(row.evaluate('(element) => element === document.activeElement'))
+        row.press('Enter')
+        self.page.wait_for_selector('#detail.view.active')
+
+    def test_execution_ui_reflows_without_horizontal_page_scroll(self):
+        self.page.set_viewport_size({'width': 320, 'height': 800})
+        self.page.evaluate("show('runbooks')")
+        overflow = self.page.evaluate('document.documentElement.scrollWidth - window.innerWidth')
+        self.assertLessEqual(overflow, 1, f'page overflows horizontally by {overflow}px')
 
 
 if __name__ == '__main__':
