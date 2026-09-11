@@ -80,6 +80,7 @@ class SettingsCipher:
 VERSION = (Path(__file__).with_name("VERSION").read_text().strip() if Path(__file__).with_name("VERSION").exists() else "0.0.0")
 DB_PATH = os.getenv("FLOWOPS_DB", str(Path(__file__).with_name("flowops.db")))
 BACKUP_DIR = Path(os.getenv("FLOWOPS_BACKUP_DIR", str(Path(DB_PATH).parent / "backups")))
+AVATAR_DIR = Path(os.getenv("FLOWOPS_AVATAR_DIR", str(Path(DB_PATH).parent / "avatars")))
 BACKUP_RETAIN = int(os.getenv("FLOWOPS_BACKUP_RETAIN", "14"))
 BACKUP_INTERVAL_HOURS = float(os.getenv("FLOWOPS_BACKUP_INTERVAL_HOURS", "6"))
 CF_ACCESS_TEAM_DOMAIN = os.getenv("FLOWOPS_CF_ACCESS_TEAM_DOMAIN", "")
@@ -449,6 +450,11 @@ def init_db() -> None:
             if column not in task_columns: db.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
         user_columns={row[1] for row in db.execute("PRAGMA table_info(users)")}
         if "dashboard_widgets" not in user_columns: db.execute("ALTER TABLE users ADD COLUMN dashboard_widgets TEXT")
+        for column,definition in {
+          "avatar_path":"TEXT", "title":"TEXT NOT NULL DEFAULT ''",
+          "timezone":"TEXT NOT NULL DEFAULT 'Asia/Tokyo'", "date_format":"TEXT NOT NULL DEFAULT 'system'",
+        }.items():
+            if column not in user_columns: db.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
         session_columns={row[1] for row in db.execute("PRAGMA table_info(sessions)")}
         for column,definition in {"ip_address":"TEXT NOT NULL DEFAULT ''","user_agent":"TEXT NOT NULL DEFAULT ''"}.items():
             if column not in session_columns:db.execute(f"ALTER TABLE sessions ADD COLUMN {column} {definition}")
@@ -1159,6 +1165,31 @@ class Handler(BaseHTTPRequestHandler):
         if path=="/app.js": return self.static("app.js","application/javascript; charset=utf-8")
         if path=="/styles.css": return self.static("styles.css","text/css; charset=utf-8")
         if path in ("/health","/ready"): return self.send_json({"status":"ok","service":"flowops","version":VERSION})
+        if path.startswith("/avatar/"):
+            with connect() as db:
+                actor=self.current_user(db)
+                if not actor: return self.send_json({"error":"Authentication required"},401)
+                try: uid=int(path.rsplit("/",1)[-1])
+                except ValueError: return self.send_error(404)
+                row=db.execute("SELECT avatar_path FROM users WHERE id=? AND instance_id=?",(uid,actor["instance_id"])).fetchone()
+            if not row or not row["avatar_path"]: return self.send_error(404)
+            avatar_path=AVATAR_DIR/row["avatar_path"]
+            try: data=avatar_path.read_bytes()
+            except FileNotFoundError: return self.send_error(404)
+            content_type="image/png" if row["avatar_path"].endswith(".png") else "image/jpeg"
+            self.send_response(200); self.send_header("Content-Type",content_type); self.send_header("Content-Length",str(len(data))); self.send_header("Cache-Control","private, max-age=3600"); self.end_headers(); self.wfile.write(data); return
+        if path=="/api/profile/export":
+            with connect() as db:
+                actor=self.current_user(db)
+                if not actor: return self.send_json({"error":"Authentication required"},401)
+                profile={k:actor[k] for k in ("id","username","display_name","email","role","team","title","timezone","date_format","created_at","last_login_at") if k in actor.keys()}
+                audit_entries=rows(db.execute("SELECT action,detail,created_at FROM audit WHERE actor=? ORDER BY created_at DESC LIMIT 500",(actor["display_name"],)))
+                owned_tasks=rows(db.execute("SELECT t.title,t.status,r.name runbook_name FROM tasks t JOIN runbooks r ON r.id=t.runbook_id WHERE t.owner_user_id=? ORDER BY t.id DESC LIMIT 500",(actor["id"],)))
+                export={"profile":profile,"audit_history":audit_entries,"assigned_tasks":owned_tasks,"exported_at":now()}
+                body=json.dumps(export,indent=2).encode()
+                self.send_response(200); self.send_header("Content-Type","application/json; charset=utf-8")
+                self.send_header("Content-Disposition",f'attachment; filename="flowops-my-data-{actor["username"]}.json"')
+                self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body); return
         if path=="/api/auth/sources":
             with connect() as db:
                 instance=db.execute("SELECT id FROM instances WHERE slug=?",(DEFAULT_INSTANCE_SLUG,)).fetchone()
@@ -1469,6 +1500,37 @@ class Handler(BaseHTTPRequestHandler):
                 db.execute("DELETE FROM sessions WHERE expires_at<=?",(int(time.time()),)); db.execute("INSERT INTO sessions(token_hash,csrf_token,user_id,expires_at,created_at,ip_address,user_agent) VALUES(?,?,?,?,?,?,?)",(hashlib.sha256(raw.encode()).hexdigest(),csrf,user["id"],expires,now(),self.client_address[0][:64],self.headers.get("User-Agent","")[:300])); db.execute("UPDATE users SET last_login_at=? WHERE id=?",(now(),user["id"])); append_audit(db,None,"auth.sso_login",f"{user['username']} signed in via Cloudflare Access ({email})",user["display_name"],user["instance_id"]); db.commit()
                 safe={k:user[k] for k in ("id","username","display_name","email","role","team")}; safe["permissions"]=sorted(ROLE_PERMISSIONS[user["role"]]); safe["csrf_token"]=csrf
                 return self.send_json({"data":safe},headers={"Set-Cookie":f"flowops_session={raw}; Path=/; HttpOnly; SameSite=Strict; Max-Age={session_seconds}"})
+            if path=="/api/profile/avatar":
+                actor=self.current_user(db)
+                if not actor: return self.send_json({"error":"Authentication required"},401)
+                if actor.get("auth_method")=="session" and self.headers.get("X-CSRF-Token","") != actor["csrf_token"]: return self.send_json({"error":"Invalid or missing CSRF token"},403)
+                raw_b64=str(payload.get("avatar_base64",""))
+                if "," in raw_b64: raw_b64=raw_b64.split(",",1)[1]
+                try: data=base64.b64decode(raw_b64, validate=True)
+                except Exception: return self.send_json({"error":"Invalid image data"},400)
+                if len(data) > 5*1024*1024: return self.send_json({"error":"Profile picture must be smaller than 5 MB"},400)
+                if data[:8]==b"\x89PNG\r\n\x1a\n": ext="png"
+                elif data[:3]==b"\xff\xd8\xff": ext="jpg"
+                else: return self.send_json({"error":"Profile picture must be a PNG or JPEG image"},400)
+                AVATAR_DIR.mkdir(parents=True, exist_ok=True)
+                stored=f"user-{actor['id']}.{ext}"
+                (AVATAR_DIR/stored).write_bytes(data)
+                db.execute("UPDATE users SET avatar_path=? WHERE id=?",(stored,actor["id"]))
+                append_audit(db,None,"profile.avatar_updated","Profile picture updated",actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"avatar_path":stored}})
+            if path=="/api/profile/change-password":
+                actor=self.current_user(db)
+                if not actor: return self.send_json({"error":"Authentication required"},401)
+                if actor.get("auth_method")=="session" and self.headers.get("X-CSRF-Token","") != actor["csrf_token"]: return self.send_json({"error":"Invalid or missing CSRF token"},403)
+                current_password=str(payload.get("current_password","")); new_password=str(payload.get("new_password",""))
+                user=db.execute("SELECT * FROM users WHERE id=?",(actor["id"],)).fetchone()
+                if not password_valid(current_password,user["password_hash"]): return self.send_json({"error":"Current password is incorrect"},401)
+                if len(new_password)<12: return self.send_json({"error":"New password must be at least 12 characters"},400)
+                db.execute("UPDATE users SET password_hash=? WHERE id=?",(password_hash(new_password),actor["id"]))
+                current_token=next((item.strip().split("=",1)[1] for item in self.headers.get("Cookie","").split(";") if item.strip().startswith("flowops_session=")),"")
+                db.execute("DELETE FROM sessions WHERE user_id=? AND token_hash!=?",(actor["id"],hashlib.sha256(current_token.encode()).hexdigest()))
+                append_audit(db,None,"profile.password_changed","Password changed via self-service",actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"ok":True}})
             if path=="/api/auth/login":
                 username=str(payload.get("username","")).strip(); password=str(payload.get("password",""));source=str(payload.get("source","local")).lower()
                 instance=db.execute("SELECT id FROM instances WHERE slug=?",(DEFAULT_INSTANCE_SLUG,)).fetchone()
@@ -2070,6 +2132,33 @@ class Handler(BaseHTTPRequestHandler):
         path=urllib.parse.urlparse(self.path).path; parts=path.strip("/").split("/")
         try: payload=self.body()
         except (ValueError,json.JSONDecodeError) as exc: return self.send_json({"error":str(exc)},400)
+        if parts==["api","profile"]:
+            with connect() as db:
+                actor=self.current_user(db)
+                if not actor: return self.send_json({"error":"Authentication required"},401)
+                if actor.get("auth_method")=="session" and self.headers.get("X-CSRF-Token","") != actor["csrf_token"]: return self.send_json({"error":"Invalid or missing CSRF token"},403)
+                editable={"display_name":120,"email":180,"title":120}
+                sets=[]; values=[]
+                for field,limit in editable.items():
+                    if field not in payload: continue
+                    value=str(payload[field]).strip()[:limit]
+                    if field=="display_name" and not value: return self.send_json({"error":"Display name is required"},400)
+                    sets.append(f"{field}=?"); values.append(value)
+                if "timezone" in payload:
+                    tz=str(payload["timezone"]).strip()[:80] or "Asia/Tokyo"
+                    sets.append("timezone=?"); values.append(tz)
+                if "date_format" in payload:
+                    date_format=str(payload["date_format"]).strip()
+                    if date_format not in {"system","day_first","month_first"}: return self.send_json({"error":"Invalid date format"},400)
+                    sets.append("date_format=?"); values.append(date_format)
+                if sets:
+                    values.append(actor["id"])
+                    db.execute(f"UPDATE users SET {','.join(sets)} WHERE id=?",values)
+                    append_audit(db,None,"profile.updated","Self-service profile updated",actor["display_name"],actor["instance_id"])
+                    db.commit()
+                updated=db.execute("SELECT * FROM users WHERE id=?",(actor["id"],)).fetchone()
+                safe={k:updated[k] for k in ("id","username","display_name","email","role","team","title","timezone","date_format","avatar_path")}
+                return self.send_json({"data":safe})
         if parts==["api","me","dashboard"]:
             with connect() as db:
                 actor=self.current_user(db)

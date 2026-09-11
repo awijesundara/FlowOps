@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import os
@@ -1034,6 +1035,77 @@ class FlowOpsTest(unittest.TestCase):
         self.assertIn(assigned_rid,visible_ids)
         self.assertNotIn(hidden_rid,visible_ids)
         self.__class__.opener,self.__class__.csrf=admin_opener,admin_csrf
+    def test_self_service_profile_update_edits_own_fields_and_is_audited(self):
+        code,updated=self.req('/api/profile','PATCH',{'display_name':'Anushka W','title':'Platform Lead','timezone':'UTC','date_format':'day_first'})
+        self.assertEqual(code,200)
+        self.assertEqual(updated['data']['display_name'],'Anushka W')
+        self.assertEqual(updated['data']['title'],'Platform Lead')
+        self.assertEqual(updated['data']['timezone'],'UTC')
+        self.assertEqual(updated['data']['date_format'],'day_first')
+        code,me=self.req('/api/auth/me')
+        self.assertEqual(me['data']['user']['display_name'],'Anushka W')
+        code,rejected=self.req('/api/profile','PATCH',{'date_format':'nonsense'})
+        self.assertEqual(code,400)
+        # restore for other tests relying on the seeded display name
+        self.req('/api/profile','PATCH',{'display_name':'Anushka','title':''})
+    def test_self_service_profile_update_requires_csrf_token(self):
+        request=urllib.request.Request(self.base+'/api/profile',data=json.dumps({'display_name':'No CSRF'}).encode(),method='PATCH',headers={'Content-Type':'application/json'})
+        try:
+            with self.opener.open(request) as res: code=res.status
+        except urllib.error.HTTPError as err: code=err.code
+        self.assertEqual(code,403)
+    def test_avatar_upload_validates_image_type_and_size_then_serves_it(self):
+        png_1x1=base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=')
+        code,rejected=self.req('/api/profile/avatar','POST',{'avatar_base64':base64.b64encode(b'not an image').decode()})
+        self.assertEqual(code,400)
+        code,uploaded=self.req('/api/profile/avatar','POST',{'avatar_base64':base64.b64encode(png_1x1).decode()})
+        self.assertEqual(code,200)
+        self.assertTrue(uploaded['data']['avatar_path'].endswith('.png'))
+        code,me=self.req('/api/auth/me')
+        user_id=me['data']['user']['id']
+        request=urllib.request.Request(f'{self.base}/avatar/{user_id}')
+        with self.opener.open(request) as res:
+            self.assertEqual(res.status,200)
+            self.assertEqual(res.headers['Content-Type'],'image/png')
+            self.assertEqual(res.read(),png_1x1)
+    def test_self_service_change_password_requires_current_password_and_revokes_other_sessions(self):
+        self.req('/api/admin/users','POST',{'username':'pwtest','display_name':'PW Test','email':'pwtest@example.com','role':'Editor','password':'Temporary!123'})
+        other_opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        login_request=urllib.request.Request(self.base+'/api/auth/login',data=json.dumps({'username':'pwtest','password':'Temporary!123'}).encode(),method='POST',headers={'Content-Type':'application/json'})
+        with other_opener.open(login_request) as res: login_body=json.load(res)
+        csrf=login_body['data']['csrf_token']
+        def pw_req(body):
+            request=urllib.request.Request(self.base+'/api/profile/change-password',data=json.dumps(body).encode(),method='POST',headers={'Content-Type':'application/json','X-CSRF-Token':csrf})
+            try:
+                with other_opener.open(request) as res: return res.status,json.load(res)
+            except urllib.error.HTTPError as err: return err.code,json.load(err)
+        code,rejected=pw_req({'current_password':'WrongPassword123','new_password':'BrandNewPassword123'})
+        self.assertEqual(code,401)
+        code,short=pw_req({'current_password':'Temporary!123','new_password':'short'})
+        self.assertEqual(code,400)
+        # a second concurrent session for the same user, to prove it gets revoked
+        second_opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        with second_opener.open(login_request) as res: pass
+        code,ok=pw_req({'current_password':'Temporary!123','new_password':'BrandNewPassword123'})
+        self.assertEqual(code,200)
+        try:
+            with second_opener.open(urllib.request.Request(self.base+'/api/auth/me')) as res: second_code=res.status
+        except urllib.error.HTTPError as err: second_code=err.code
+        self.assertEqual(second_code,401)
+        with other_opener.open(urllib.request.Request(self.base+'/api/auth/me')) as res:
+            self.assertEqual(res.status,200)
+    def test_profile_export_downloads_own_audit_and_task_history(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Export test runbook'}); rid=created['data']['id']
+        _,me=self.req('/api/auth/me'); my_id=me['data']['user']['id']
+        self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'My task','owner_user_id':my_id})
+        request=urllib.request.Request(f'{self.base}/api/profile/export')
+        with self.opener.open(request) as res:
+            self.assertEqual(res.status,200)
+            self.assertIn('attachment',res.headers['Content-Disposition'])
+            export=json.load(res)
+        self.assertEqual(export['profile']['username'],'admin')
+        self.assertTrue(any(t['title']=='My task' for t in export['assigned_tasks']))
+        self.assertTrue(len(export['audit_history'])>0)
     def test_unhandled_exception_returns_structured_500_instead_of_crashing(self):
         _,created=self.req('/api/runbooks','POST',{'name':'Error path probe'}); rid=created['data']['id']
         with patch('server.runbook_document', side_effect=RuntimeError('boom')):
