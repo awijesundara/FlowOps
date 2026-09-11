@@ -197,6 +197,57 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(body['ctasks_imported'],0)
         runbook=self.req(f'/api/runbooks/{rid}')[1]['data']
         self.assertEqual(len([t for t in runbook['tasks'] if t['stream']=='Change tasks']),2)
+    def test_completing_a_task_pushes_its_ctask_state_back_to_serviceops(self):
+        self.req('/api/admin/integrations','POST',{'provider':'serviceops','url':'https://serviceops.example','credential':'sop_ctask_push','enabled':True})
+        _,created=self.req('/api/runbooks','POST',{'name':'Push-back change','serviceops_ticket':'CHG0000044'});rid=created['data']['id']
+        captured=[]
+        class Response:
+            status=200
+            headers={'X-Request-ID':'r'}
+            def __init__(self,body):self.body=body
+            def __enter__(self):return self
+            def __exit__(self,*_):return False
+            def read(self,*_):return self.body
+        def fake_open(request,timeout=0):
+            captured.append(request)
+            if request.full_url.endswith('/ctasks'):
+                return Response(json.dumps({'data':[
+                    {'number':'CTASK0000010','title':'Drain traffic','state':'Open','sequence':1,'assignee':None},
+                    {'number':'CTASK0000011','title':'Restore traffic','state':'Open','sequence':2,'assignee':None},
+                ]}).encode())
+            if '/ctasks/' in request.full_url:
+                return Response(json.dumps({'data':{'number':'CTASK0000010','state':json.loads(request.data)['state']}}).encode())
+            return Response(b'{"data":{"number":"CHG0000044","type":"change","title":"Push-back change","state":"Approved","priority":"P2"}}')
+        with patch('server.urllib.request.urlopen',fake_open):
+            self.req(f'/api/runbooks/{rid}/serviceops-sync','POST',{})
+        runbook=self.req(f'/api/runbooks/{rid}')[1]['data']
+        task_id=next(t['id'] for t in runbook['tasks'] if t['serviceops_ctask']=='CTASK0000010')
+        task2_id=next(t['id'] for t in runbook['tasks'] if t['serviceops_ctask']=='CTASK0000011')
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})
+        with patch('server.urllib.request.urlopen',fake_open):
+            self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        captured.clear()
+        with patch('server.urllib.request.urlopen',fake_open):
+            code,body=self.req(f'/api/tasks/{task_id}','PATCH',{'status':'running'})
+        self.assertEqual(code,200)
+        running_push=next(r for r in captured if '/ctasks/CTASK0000010' in r.full_url)
+        self.assertEqual(running_push.method,'PATCH')
+        self.assertEqual(json.loads(running_push.data),{'state':'Work in Progress'})
+        captured.clear()
+        with patch('server.urllib.request.urlopen',fake_open):
+            code,body=self.req(f'/api/tasks/{task_id}','PATCH',{'status':'complete'})
+        self.assertEqual(code,200)
+        complete_push=next(r for r in captured if '/ctasks/CTASK0000010' in r.full_url)
+        self.assertEqual(json.loads(complete_push.data),{'state':'Closed Complete'})
+        runbook=self.req(f'/api/runbooks/{rid}')[1]['data']
+        self.assertTrue(any(a['action']=='serviceops.ctask_synced' for a in runbook['audit']))
+        # a ServiceOps outage during a task transition must not block the local transition
+        def broken(request,timeout=0):raise __import__('urllib.error',fromlist=['URLError']).URLError('unreachable')
+        with patch('server.urllib.request.urlopen',broken):
+            code,body=self.req(f'/api/tasks/{task2_id}','PATCH',{'status':'running'})
+        self.assertEqual(code,200)
+        self.assertEqual(next(t['status'] for t in body['data']['tasks'] if t['id']==task2_id),'running')
+        self.req('/api/admin/integrations','POST',{'provider':'serviceops','revoke_credential':True})
     def test_serviceops_change_approval_gate_and_idempotent_live_writeback(self):
         self.req('/api/admin/integrations','POST',{'provider':'serviceops','url':'https://serviceops.example','credential':'sop_lifecycle_test','enabled':True,'require_approved':True,'sync_on_live':True})
         _,created=self.req('/api/runbooks','POST',{'name':'API-governed run','serviceops_ticket':'CHG0000043'});rid=created['data']['id'];self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})
