@@ -173,7 +173,7 @@ Admin/Editor only; `Workspace Manager` does not extend to that layer yet.
 | Creator selects a runbook type and inherits defaults | P0 | S | DONE |
 | Nested folders | P2 | M | DONE |
 | Saved, reusable runbook-list filter views | P2 | M | DONE |
-| Runbook home page for instructions and links | P2 | M | BACKLOG |
+| Runbook home page for instructions and links | P2 | M | DONE |
 
 Nested folders (2026-09-11): `folders.parent_folder_id` (nullable,
 self-referencing) is set at creation time (`POST /api/folders` accepts
@@ -182,6 +182,15 @@ capped at one level like linked runbooks. The runbook-creation folder
 picker renders the tree depth-first with indentation so nesting is
 visible, not just a flat alphabetical list. Covered by
 `test_nested_folders_track_parent_and_reject_invalid_parent`.
+
+Runbook home page (2026-09-11): `runbooks.home_content` is a free-text
+field (up to 8000 chars, newlines and URLs preserved/auto-linked in the
+rendered view) editable through the existing generic runbook field-edit
+endpoint (`PATCH /api/runbooks/{id}`) -- gated the same way every other
+runbook field already is (`runbooks:edit`/workspace-scoped, blocked once
+`complete`/`cancelled`). Rendered as a "Runbook home" sidebar card at the
+top of the detail view with an Edit action for Editors/Admins. Covered
+by `test_runbook_home_content_is_editable_and_returned_in_document`.
 
 Saved runbook-list filter views (2026-09-11): `saved_views` are per-user
 (`POST/GET/DELETE /api/saved-views`), storing an arbitrary `filters`
@@ -501,6 +510,19 @@ dashboard is not implemented -- FlowOps has no outbound email scheduler
 today and adding one is out of proportion to this story; the CSV/PDF
 export routes already give a manual path to the same data.
 
+Post-implementation review (2026-09-11): `PATCH /api/runbooks/{id}/review`
+records `what_went_well`/`what_went_wrong`/`follow_up_actions` plus
+`reviewed_by`/`reviewed_at`, stored as `runbooks.review_json` and
+surfaced as `review` in the runbook document. Deliberately the inverse
+gate of every other runbook field edit: it 409s until the runbook
+reaches `complete` (a normal field edit 409s *after* completion), since
+a review only makes sense once execution is over. A completed runbook
+without a review yet shows an "Add review" action for Editors/Admins;
+once recorded, the sidebar card becomes a read-only summary. The write
+goes through `append_audit` (`runbook.reviewed`), so it's part of the
+same immutable history as everything else on the runbook. Covered by
+`test_post_implementation_review_only_allowed_after_completion`.
+
 ### Epic 4.3 — Compliance Audit
 
 Immutable-by-policy audit (P0/L): `PARTIAL`. Checksummed export (P1/M):
@@ -664,7 +686,7 @@ FlowOps, but remain subordinate to the phase and P0 ordering above.
 | Parent runbook controls one level of linked child runbooks | QS p25 | 4.1 | BACKLOG |
 | Linked-runbook dashboard aggregates child progress live | QS p25 | 4.1, 4.2 | BACKLOG |
 | Multi-runbook dashboard with filters and scheduled email sharing | QS p31 | 4.2 | BACKLOG |
-| Post-implementation review after completion | QS p32 | 4.2 | BACKLOG |
+| Post-implementation review after completion | QS p32 | 4.2 | DONE |
 | Downloadable, filterable audit evidence | QS p29 | 4.3 | BACKLOG |
 
 ### Video-derived integration requirements

@@ -403,6 +403,8 @@ def init_db() -> None:
         if "parent_folder_id" not in folder_columns: db.execute("ALTER TABLE folders ADD COLUMN parent_folder_id INTEGER REFERENCES folders(id)")
         if "runbook_type_id" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN runbook_type_id INTEGER REFERENCES runbook_types(id)")
         if "parent_runbook_id" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN parent_runbook_id INTEGER REFERENCES runbooks(id)")
+        if "home_content" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN home_content TEXT NOT NULL DEFAULT ''")
+        if "review_json" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN review_json TEXT")
         if "approved_at" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN approved_at TEXT")
         if "approved_by" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN approved_by TEXT")
         type_columns={row[1] for row in db.execute("PRAGMA table_info(runbook_types)")}
@@ -746,6 +748,8 @@ def runbook_document(db: sqlite3.Connection, rid: int, user: dict[str,Any] | Non
     if not rb:
         return None
     doc = dict(rb)
+    raw_review = doc.pop("review_json", None)
+    doc["review"] = json.loads(raw_review) if raw_review else None
     doc["runbook_type_requires_approval"] = bool(db.execute("SELECT requires_approval FROM runbook_types WHERE id=?",(doc["runbook_type_id"],)).fetchone()[0]) if doc.get("runbook_type_id") else False
     all_tasks = rows(db.execute("SELECT t.*,u.display_name owner_user_name,rt.name owner_team_name FROM tasks t LEFT JOIN users u ON u.id=t.owner_user_id LEFT JOIN runbook_teams rt ON rt.id=t.owner_team_id WHERE t.runbook_id=? ORDER BY t.sort_order,t.id", (rid,)))
     tasks=all_tasks
@@ -1928,6 +1932,26 @@ class Handler(BaseHTTPRequestHandler):
                 db.execute("UPDATE users SET display_name=?,email=?,role=?,team=?,active=? WHERE id=?",(str(payload.get("display_name",user["display_name"]))[:120],str(payload.get("email",user["email"]))[:180],role,str(payload.get("team",user["team"]))[:120],active,uid))
                 if password is not None: db.execute("UPDATE users SET password_hash=? WHERE id=?",(password_hash(str(password)),uid)); db.execute("DELETE FROM sessions WHERE user_id=?",(uid,))
                 append_audit(db,None,"admin.user_updated",f"{user['username']}: role={role}, active={bool(active)}",actor["display_name"],actor["instance_id"]); db.commit(); return self.send_json({"data":{"ok":True}})
+        if len(parts)==4 and parts[:2]==["api","runbooks"] and parts[3]=="review":
+            try: rid=int(parts[2])
+            except ValueError: return self.send_json({"error":"Not found"},404)
+            with connect() as db:
+                actor=self.require_workspace_scoped_edit(db,runbook_id=rid)
+                if not actor:return
+                runbook=db.execute("SELECT r.* FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE r.id=? AND w.instance_id=?",(rid,actor["instance_id"])).fetchone()
+                if not runbook: return self.send_json({"error":"Not found"},404)
+                if runbook["status"]!="complete": return self.send_json({"error":"A post-implementation review can only be recorded after the runbook is complete"},409)
+                review={
+                    "what_went_well":str(payload.get("what_went_well",""))[:4000],
+                    "what_went_wrong":str(payload.get("what_went_wrong",""))[:4000],
+                    "follow_up_actions":str(payload.get("follow_up_actions",""))[:4000],
+                    "reviewed_by":actor["display_name"],
+                    "reviewed_at":now(),
+                }
+                db.execute("UPDATE runbooks SET review_json=? WHERE id=?",(json.dumps(review),rid))
+                append_audit(db,rid,"runbook.reviewed",f"Post-implementation review recorded by {actor['display_name']}",actor["display_name"])
+                doc=runbook_document(db,rid,actor); db.commit()
+                return self.send_json({"data":doc})
         if len(parts)==3 and parts[:2]==["api","runbooks"]:
             try: rid=int(parts[2])
             except ValueError: return self.send_json({"error":"Not found"},404)
@@ -1937,7 +1961,7 @@ class Handler(BaseHTTPRequestHandler):
                 runbook=db.execute("SELECT r.* FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE r.id=? AND w.instance_id=?",(rid,actor["instance_id"])).fetchone()
                 if not runbook: return self.send_json({"error":"Not found"},404)
                 if runbook["status"] in {"complete","cancelled"}: return self.send_json({"error":f"Cannot edit a {runbook['status']} runbook"},409)
-                editable={"name":160,"description":2000,"owner":120,"serviceops_ticket":40}
+                editable={"name":160,"description":2000,"owner":120,"serviceops_ticket":40,"home_content":8000}
                 changes=[]; sets=[]; values=[]
                 for field,limit in editable.items():
                     if field not in payload: continue
