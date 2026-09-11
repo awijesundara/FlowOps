@@ -411,6 +411,104 @@ class FlowOpsTest(unittest.TestCase):
             with opener.open(request) as res: status=res.status
         except urllib.error.HTTPError as err: status=err.code
         self.assertEqual(status,404,"OIDC login must 404 while disabled, not silently redirect anywhere")
+    def scim_req(self,path,method='GET',token=None,body=None):
+        data=json.dumps(body).encode() if body is not None else None
+        headers={'Content-Type':'application/scim+json'}
+        if token: headers['Authorization']=f'Bearer {token}'
+        request=urllib.request.Request(self.base+path,data=data,method=method,headers=headers)
+        try:
+            with urllib.request.urlopen(request) as res:
+                raw=res.read()
+                return res.status,(json.loads(raw) if raw else None)
+        except urllib.error.HTTPError as err:
+            raw=err.read()
+            return err.code,(json.loads(raw) if raw else None)
+    def test_scim_requires_a_bearer_token_with_the_scim_scope(self):
+        code,body=self.scim_req('/scim/v2/Users')
+        self.assertEqual(code,401); self.assertEqual(body['schemas'],[server.SCIM_ERROR_SCHEMA])
+        _,wrong=self.req('/api/admin/api-tokens','POST',{'name':'Not SCIM','scopes':['runbooks:read']})
+        code,body=self.scim_req('/scim/v2/Users',token=wrong['data']['token'])
+        self.assertEqual(code,403)
+    def test_scim_user_lifecycle_create_get_patch_deactivate(self):
+        _,tok=self.req('/api/admin/api-tokens','POST',{'name':'IdP provisioner','scopes':['scim:provision']})
+        token=tok['data']['token']
+        code,created=self.scim_req('/scim/v2/Users','POST',token,{
+            'schemas':['urn:ietf:params:scim:schemas:core:2.0:User'],
+            'userName':'scim.jsmith','displayName':'SCIM J Smith',
+            'emails':[{'value':'jsmith@example.com','primary':True}],'active':True,
+        })
+        self.assertEqual(code,201,created)
+        self.assertEqual(created['schemas'],[server.SCIM_USER_SCHEMA])
+        self.assertEqual(created['userName'],'scim.jsmith')
+        self.assertTrue(created['active'])
+        uid=created['id']
+        self.assertEqual(created['meta']['location'],f'/scim/v2/Users/{uid}')
+        # duplicate userName must be rejected
+        self.assertEqual(self.scim_req('/scim/v2/Users','POST',token,{'userName':'scim.jsmith','displayName':'dup'})[0],409)
+        # GET single
+        code,fetched=self.scim_req(f'/scim/v2/Users/{uid}',token=token)
+        self.assertEqual(code,200); self.assertEqual(fetched['emails'][0]['value'],'jsmith@example.com')
+        # GET list includes it, real DB row confirms mapping
+        code,listed=self.scim_req('/scim/v2/Users',token=token)
+        self.assertEqual(code,200); self.assertEqual(listed['schemas'],[server.SCIM_LIST_SCHEMA])
+        self.assertIn(uid,[u['id'] for u in listed['Resources']])
+        # PATCH: rename + deactivate via Operations shape
+        code,patched=self.scim_req(f'/scim/v2/Users/{uid}','PATCH',token,{
+            'schemas':['urn:ietf:params:scim:api:messages:2.0:PatchOp'],
+            'Operations':[{'op':'replace','path':'displayName','value':'Renamed Smith'},{'op':'replace','path':'active','value':False}],
+        })
+        self.assertEqual(code,200); self.assertEqual(patched['displayName'],'Renamed Smith'); self.assertFalse(patched['active'])
+        with server.connect() as db:
+            row=db.execute('SELECT display_name,active FROM users WHERE id=?',(int(uid),)).fetchone()
+            self.assertEqual(row['display_name'],'Renamed Smith'); self.assertEqual(row['active'],0)
+        # DELETE deprovisions (soft-delete), not a hard row delete
+        code,_=self.scim_req(f'/scim/v2/Users/{uid}','DELETE',token=token)
+        self.assertEqual(code,204)
+        with server.connect() as db:
+            row=db.execute('SELECT active FROM users WHERE id=?',(int(uid),)).fetchone()
+            self.assertIsNotNone(row,'SCIM DELETE must not hard-delete the user row')
+            self.assertEqual(row['active'],0)
+    def test_scim_filter_supports_eq_co_sw_on_the_documented_attribute_set(self):
+        _,tok=self.req('/api/admin/api-tokens','POST',{'name':'IdP filter test','scopes':['scim:provision']})
+        token=tok['data']['token']
+        self.scim_req('/scim/v2/Users','POST',token,{'userName':'filter.alpha','displayName':'Alpha Filter','emails':[{'value':'alpha@example.com'}]})
+        self.scim_req('/scim/v2/Users','POST',token,{'userName':'filter.beta','displayName':'Beta Filter','emails':[{'value':'beta@example.com'}]})
+        code,body=self.scim_req('/scim/v2/Users?'+urllib.parse.urlencode({'filter':'userName eq "filter.alpha"'}),token=token)
+        self.assertEqual(code,200); self.assertEqual([u['userName'] for u in body['Resources']],['filter.alpha'])
+        code,body=self.scim_req('/scim/v2/Users?'+urllib.parse.urlencode({'filter':'emails.value co "beta"'}),token=token)
+        self.assertEqual(code,200); self.assertEqual([u['userName'] for u in body['Resources']],['filter.beta'])
+        code,body=self.scim_req('/scim/v2/Users?'+urllib.parse.urlencode({'filter':'userName sw "filter."'}),token=token)
+        self.assertEqual(code,200); self.assertEqual(len(body['Resources']),2)
+        code,body=self.scim_req('/scim/v2/Users?'+urllib.parse.urlencode({'filter':'unsupportedAttr eq "x"'}),token=token)
+        self.assertEqual(code,400)
+    def test_scim_group_lifecycle_create_membership_and_deletion_reflects_central_team_members(self):
+        _,tok=self.req('/api/admin/api-tokens','POST',{'name':'IdP group provisioner','scopes':['scim:provision']})
+        token=tok['data']['token']
+        _,alice=self.scim_req('/scim/v2/Users','POST',token,{'userName':'scim.alice','displayName':'Alice'})
+        _,bob=self.scim_req('/scim/v2/Users','POST',token,{'userName':'scim.bob','displayName':'Bob'})
+        code,group=self.scim_req('/scim/v2/Groups','POST',token,{'displayName':'SCIM Provisioned Team','members':[{'value':alice['id']}]})
+        self.assertEqual(code,201,group); self.assertEqual(group['schemas'],[server.SCIM_GROUP_SCHEMA])
+        gid=group['id']
+        self.assertEqual([m['value'] for m in group['members']],[alice['id']])
+        with server.connect() as db:
+            member_ids={row[0] for row in db.execute('SELECT user_id FROM central_team_members WHERE team_id=?',(int(gid),))}
+            self.assertEqual(member_ids,{int(alice['id'])})
+        # PATCH add Bob
+        code,patched=self.scim_req(f'/scim/v2/Groups/{gid}','PATCH',token,{'Operations':[{'op':'add','path':'members','value':[{'value':bob['id']}]}]})
+        self.assertEqual(code,200)
+        self.assertEqual(sorted(m['value'] for m in patched['members']),sorted([alice['id'],bob['id']]))
+        with server.connect() as db:
+            member_ids={row[0] for row in db.execute('SELECT user_id FROM central_team_members WHERE team_id=?',(int(gid),))}
+            self.assertEqual(member_ids,{int(alice['id']),int(bob['id'])})
+        # PATCH remove Alice
+        code,patched=self.scim_req(f'/scim/v2/Groups/{gid}','PATCH',token,{'Operations':[{'op':'remove','path':'members','value':[{'value':alice['id']}]}]})
+        self.assertEqual(code,200)
+        self.assertEqual([m['value'] for m in patched['members']],[bob['id']])
+        # DELETE the group removes it entirely (no runbook is linked to it)
+        code,_=self.scim_req(f'/scim/v2/Groups/{gid}','DELETE',token=token)
+        self.assertEqual(code,204)
+        with server.connect() as db:
+            self.assertIsNone(db.execute('SELECT 1 FROM central_teams WHERE id=?',(int(gid),)).fetchone())
     def test_completing_a_task_pushes_its_ctask_state_back_to_serviceops(self):
         self.req('/api/admin/integrations','POST',{'provider':'serviceops','url':'https://serviceops.example','credential':'sop_ctask_push','enabled':True})
         _,created=self.req('/api/runbooks','POST',{'name':'Push-back change','serviceops_ticket':'CHG0000044'});rid=created['data']['id']

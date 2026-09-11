@@ -833,8 +833,43 @@ Verified live in the Docker preview: `/api/admin/integrations` correctly
 reports the new `oidc` block, and `/auth/oidc/login` 404s while disabled
 rather than redirecting anywhere.
 
-SCIM (P1/L): `BACKLOG`, in progress — SCIM 2.0 Users/Groups provisioning
-over the existing bearer-token mechanism.
+SCIM (P1/L): `DONE` (2026-09-11) — `/scim/v2/Users` and `/scim/v2/Groups`,
+authenticated with the exact existing `api_tokens`/`Bearer fo_...`
+mechanism (`current_user()`), gated by a new `scim:provision` scope added
+to `TOKEN_SCOPE_PERMISSIONS` — no new auth mechanism, no session cookies
+involved (SCIM clients aren't browsers). SCIM `User` maps to the `users`
+table (`userName`→`username`, `displayName`/`name.formatted`→
+`display_name`, `emails[0].value`→`email`, `active`→`users.active`);
+SCIM `Group` maps to `central_teams`/`central_team_members` (the
+cross-runbook membership model, not per-runbook `runbook_teams` — groups
+provision into the instance's first workspace). SSO-first provisioned
+users get an unusable random `password_hash` via the existing PBKDF2
+helper (cosmetic only, satisfies the `NOT NULL` constraint; they
+authenticate via OIDC, never a local password). `DELETE` is implemented as
+deprovisioning (`active=0`), matching FlowOps's existing soft-delete
+convention everywhere else (audit rows and task ownership reference user
+ids) rather than a literal row delete. `PATCH` implements SCIM's
+`Operations` shape (distinct from FlowOps's own plain-field `PATCH` style
+elsewhere) for `active`/`displayName` on Users and `members` add/replace/
+remove on Groups. A minimal hand-rolled filter parser supports `eq`/`co`/
+`sw` against a documented, narrow attribute set (`userName`,
+`emails.value`, `displayName`, `active`) joined with `and` — not the full
+SCIM filter grammar, matching what real IdP SCIM connectors (Okta, Entra)
+actually send in practice; an unsupported attribute or operator returns a
+`400` with a SCIM-shaped error body, not a silent no-op. Pagination via
+`startIndex`/`count` (1-based, per spec). Covered by
+`test_scim_requires_a_bearer_token_with_the_scim_scope` (missing bearer →
+401, wrong scope → 403), `test_scim_user_lifecycle_create_get_patch_deactivate`
+(create → SCIM-shaped JSON with `schemas`/`id`/`userName`/`meta`, GET,
+PATCH rename + deactivate confirmed against the real `users` row, DELETE
+confirmed as a soft-delete not a hard delete),
+`test_scim_filter_supports_eq_co_sw_on_the_documented_attribute_set`,
+`test_scim_group_lifecycle_create_membership_and_deletion_reflects_central_team_members`
+(create with initial members, PATCH add/remove reflected in
+`central_team_members`, delete). Verified live in the Docker preview: a
+real SCIM token provisions a user end to end (`POST /scim/v2/Users` →
+`GET /scim/v2/Users` lists it), and an unauthenticated request correctly
+401s.
 
 Managed encryption at rest/in transit (P0/L): `DONE` (2026-09-11),
 interpreted for this self-hosted deployment as self-managed rather than a
