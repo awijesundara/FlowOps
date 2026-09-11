@@ -591,13 +591,30 @@ audited today -- and POSTs a signed payload (`X-FlowOps-Signature: sha256=…`,
 up to 3 attempts with a fixed backoff on network failure or non-2xx.
 Verified with a real regression test that spins up an actual local HTTP
 receiver (not a mock) and confirms the delivered signature matches an
-independently computed HMAC. Not done: outbound URL SSRF hardening (the
-existing MicroK8s NetworkPolicy already restricts this app's egress to DNS
-and the ServiceOps pod only, meaningfully limiting blast radius, but there
-is no app-level DNS-rebinding-resistant destination validation the way
-ServiceOps has for its own webhooks) and per-webhook granular event-type
-subscriptions (a webhook can filter by action name via its `events` list
-today, but there's no UI for choosing anything other than the "*" default).
+independently computed HMAC.
+
+Outbound URL SSRF hardening: `DONE` (2026-09-11) -- see Epic 3.1 above for
+the full `safe_urlopen()`/DNS-pinning writeup; webhook delivery is one of
+its call sites, alongside automation task URLs and the ServiceNow
+connector.
+
+Per-webhook granular event-type subscriptions: `DONE` (2026-09-11). A new
+`WEBHOOK_EVENT_ACTIONS` constant enumerates every real `append_audit()`
+action (77 distinct events as of this writing), served as
+`available_events` on `GET /api/admin/webhooks`. The webhook creation flow
+now offers a comma-separated event picker against that live list instead
+of always defaulting to `["*"]` -- a text-based picker rather than a
+checkbox grid, a proportionate scope call given this admin panel's
+existing prompt()-based micro-form convention (streams, runbook home,
+automation context all follow the same pattern) rather than introducing a
+new dialog just for this. Each webhook's admin-list row now shows "all
+events" or the subscribed count. Covered by
+`test_webhook_event_actions_list_matches_real_append_audit_call_sites`
+(regex-scans `server.py`'s own real call sites and fails on drift),
+`test_webhook_available_events_lists_canonical_actions`, and
+`test_webhook_only_delivers_to_subscribed_event_types` (a real receiver
+confirms a `folder.created`-only subscriber never receives a
+`runbook.created` event fired in the same batch).
 
 Exit: runbooks trigger external work and external systems safely drive runbooks.
 

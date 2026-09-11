@@ -726,6 +726,44 @@ class FlowOpsTest(unittest.TestCase):
             self.assertFalse(any(w['id']==webhook_id for w in listedAfter['data']))
         finally:
             receiver.shutdown()
+    def test_webhook_event_actions_list_matches_real_append_audit_call_sites(self):
+        import re
+        source=(server.STATIC.parent/'server.py').read_text()
+        real_actions=set(re.findall(r'append_audit\([^)]*?,\s*"([a-z_.]+)"',source))
+        self.assertEqual(set(server.WEBHOOK_EVENT_ACTIONS),real_actions,
+            'WEBHOOK_EVENT_ACTIONS has drifted from the real append_audit() call sites -- update the constant in server.py')
+    def test_webhook_available_events_lists_canonical_actions(self):
+        _,listed=self.req('/api/admin/webhooks')
+        self.assertEqual(set(listed['available_events']),set(server.WEBHOOK_EVENT_ACTIONS))
+        self.assertIn('runbook.created',listed['available_events'])
+    def test_webhook_only_delivers_to_subscribed_event_types(self):
+        import http.server as http_server_module
+        received=[]
+        class Receiver(http_server_module.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length=int(self.headers.get('Content-Length','0'))
+                received.append(json.loads(self.rfile.read(length))['event'])
+                self.send_response(200); self.end_headers()
+            def log_message(self,*a): pass
+        receiver=http_server_module.HTTPServer(('127.0.0.1',0),Receiver)
+        threading.Thread(target=receiver.serve_forever,daemon=True).start()
+        try:
+            code,created=self.req('/api/admin/webhooks','POST',{'name':'Folder-only subscriber','url':f'http://127.0.0.1:{receiver.server_port}/hook','events':['folder.created']})
+            self.assertEqual(code,201)
+            webhook_id=created['data']['id']
+            while server.claim_new_audit_events(): pass  # drain any backlog first
+            self.req('/api/folders','POST',{'name':f'Filter test folder {time.time()}'})  # folder.created -- should match
+            self.req('/api/runbooks','POST',{'name':'Filter test runbook'})  # runbook.created -- should NOT match
+            events=server.claim_new_audit_events()
+            with server.connect() as db:
+                webhook=dict(db.execute("SELECT * FROM webhooks WHERE id=?",(webhook_id,)).fetchone())
+            with patch('server.safe_urlopen',unrestricted_urlopen):
+                for event in events:
+                    if not server.webhook_matches(webhook['events_json'],event['action']): continue
+                    server.deliver_webhook_once(webhook,event)
+            self.assertEqual(received,['folder.created'])
+        finally:
+            receiver.shutdown()
     def test_webhook_test_fire_against_loopback_is_rejected_before_any_connection(self):
         code,created=self.req('/api/admin/webhooks','POST',{'name':'Loopback attempt','url':'http://127.0.0.1:9/hook','events':['*']})
         self.assertEqual(code,201)

@@ -106,6 +106,35 @@ TOKEN_SCOPE_PERMISSIONS = {
     "runbooks:write": {"runbooks:view","runbooks:edit","runbooks:execute"},
 }
 
+# The canonical set of every audit action append_audit() can emit, used to
+# drive the per-webhook granular event-type subscription checklist (a
+# webhook's events_json can already hold any string list -- this is just
+# the UI's source of truth for what's selectable, kept in sync with real
+# append_audit() call sites by test_webhook_event_actions_list_matches_
+# real_append_audit_call_sites, which regex-scans this file itself).
+WEBHOOK_EVENT_ACTIONS = (
+    "admin.backup_created","admin.folder_creator_granted","admin.folder_creator_revoked",
+    "admin.session_revoked","admin.settings_updated","admin.stream_editor_granted",
+    "admin.stream_editor_revoked","admin.user_created","admin.user_deleted","admin.user_invited",
+    "admin.user_updated","admin.workspace_created","admin.workspace_manager_granted",
+    "admin.workspace_manager_revoked","api_token.created","api_token.revoked","audit.exported",
+    "audit.retention_purged","auth.invitation_accepted","auth.login","auth.logout",
+    "auth.password_reset_completed","auth.password_reset_delivery_failed",
+    "auth.password_reset_requested","auth.sso_login","central_team.created","central_team.deleted",
+    "central_team.member_added","central_team.member_removed","comment.added","custom_field.created",
+    "custom_field.deleted","folder.created","folder.deleted","instance.created",
+    "integration.configured","integration.tested","profile.avatar_updated","profile.password_changed",
+    "profile.updated","runbook.approved","runbook.archived","runbook.created","runbook.duplicated",
+    "runbook.edited","runbook.reviewed","runbook.transition","runbook_type.created",
+    "runbook_type.deleted","servicenow.lifecycle","servicenow.synced","serviceops.ctask_sync_failed",
+    "serviceops.ctask_synced","serviceops.ctasks_imported","serviceops.ctasks_synced",
+    "serviceops.lifecycle","serviceops.sync_failed","serviceops.synced","snippet.deleted",
+    "snippet.inserted","snippet.saved","stream.created","stream.deleted","stream.renamed",
+    "task.automation_result","task.automation_running","task.automation_test_fired",
+    "task.bulk_edited","task.created","task.csv_imported","task.edited","task.transition",
+    "team.created","template.deleted","template.saved","webhook.created","webhook.deleted",
+)
+
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -1503,7 +1532,7 @@ class Handler(BaseHTTPRequestHandler):
                     item["events"]=json.loads(item.pop("events_json") or "[]")
                     recent=rows(db.execute("SELECT success,status_code,error,attempted_at FROM webhook_deliveries WHERE webhook_id=? ORDER BY id DESC LIMIT 5",(item["id"],)))
                     item["recent_deliveries"]=recent
-                return self.send_json({"data":items})
+                return self.send_json({"data":items,"available_events":list(WEBHOOK_EVENT_ACTIONS)})
             if path=="/api/admin/settings":
                 actor=self.require(db,"admin:settings")
                 if not actor: return
