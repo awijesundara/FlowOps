@@ -1850,7 +1850,10 @@ class Handler(BaseHTTPRequestHandler):
             validation_result=str(payload.get("validation_result","")).strip()
             if task["task_type"]=="validation" and target=="complete" and validation_result not in {"Pass","Fail","Not Tested"}:return self.send_json({"error":"Validation completion requires Pass, Fail, or Not Tested"},400)
             db.execute("UPDATE tasks SET status=?,started_at=CASE WHEN ? IN ('running','complete') THEN COALESCE(started_at,?) ELSE started_at END,completed_at=CASE WHEN ? IN ('complete','skipped') THEN ? ELSE NULL END,validation_result=CASE WHEN ?!='' THEN ? ELSE validation_result END,validation_comment=CASE WHEN ?!='' THEN ? ELSE validation_comment END,blocked_reason=CASE WHEN ?='blocked' THEN ? ELSE blocked_reason END WHERE id=?",(target,target,now(),target,now(),validation_result,validation_result,str(payload.get("validation_comment","")).strip(),str(payload.get("validation_comment","")).strip(),target,str(payload.get("blocked_reason","")).strip()[:500],tid))
-            append_audit(db,task["runbook_id"],"task.transition",f"{task['title']}: {task['status']} → {target}",actor["display_name"]); db.execute("UPDATE runbooks SET updated_at=? WHERE id=?",(now(),task["runbook_id"])); doc=runbook_document(db,task["runbook_id"],actor); db.commit()
+            append_audit(db,task["runbook_id"],"task.transition",f"{task['title']}: {task['status']} → {target}",actor["display_name"]); db.execute("UPDATE runbooks SET updated_at=? WHERE id=?",(now(),task["runbook_id"]))
+            if task["serviceops_ctask"]:
+                self.push_serviceops_ctask_state(db,task["runbook_id"],task["serviceops_ctask"],target)
+            doc=runbook_document(db,task["runbook_id"],actor); db.commit()
             return self.send_json({"data":doc})
 
     def do_DELETE(self):
@@ -2058,6 +2061,24 @@ class Handler(BaseHTTPRequestHandler):
             previous_id=task_id
         if created: append_audit(db,rid,"serviceops.ctasks_imported",f"Imported {len(created)} change task(s) from {ticket_number}")
         return created
+
+    def push_serviceops_ctask_state(self, db, rid, ctask_number, target):
+        """Best-effort: reflect a FlowOps task's completion back onto the
+        matching ServiceOps CTASK, so the change's own required-task gate
+        (which blocks Resolve while a required CTASK stays open) doesn't
+        surface a confusing conflict once every FlowOps task is done.
+        Never raises -- a ServiceOps outage must not block local task
+        execution, only get audited."""
+        state = {"running": "Work in Progress", "complete": "Closed Complete", "skipped": "Cancelled"}.get(target)
+        if not state: return
+        rb=db.execute("SELECT r.serviceops_ticket,w.instance_id FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE r.id=?",(rid,)).fetchone()
+        ticket=str(rb["serviceops_ticket"] or "").strip() if rb else ""
+        if not ticket: return
+        try:
+            self.serviceops_request(db,rb["instance_id"],"PATCH",f"tickets/{urllib.parse.quote(ticket)}/ctasks/{urllib.parse.quote(ctask_number)}",{"state":state},f"flowops-ctask-{ctask_number}-{target}")
+            append_audit(db,rid,"serviceops.ctask_synced",f"{ctask_number} → {state}")
+        except RuntimeError as exc:
+            append_audit(db,rid,"serviceops.ctask_sync_failed",f"{ctask_number}: {exc}")
 
     def apply_serviceops_sync(self, db, rid, ticket):
         """Fetch a linked change ticket, store its status, and import its CTASKs
