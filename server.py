@@ -235,6 +235,11 @@ def init_db() -> None:
           depends_on_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
           PRIMARY KEY(task_id, depends_on_id), CHECK(task_id != depends_on_id)
         );
+        CREATE TABLE IF NOT EXISTS saved_views (
+          id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, filters_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
+          UNIQUE(user_id, name)
+        );
         CREATE TABLE IF NOT EXISTS comments (
           id INTEGER PRIMARY KEY, runbook_id INTEGER NOT NULL REFERENCES runbooks(id) ON DELETE CASCADE,
           author TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL
@@ -394,6 +399,8 @@ def init_db() -> None:
         if "actual_completed_at" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN actual_completed_at TEXT")
         if "archived" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
         if "folder_id" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN folder_id INTEGER REFERENCES folders(id)")
+        folder_columns={row[1] for row in db.execute("PRAGMA table_info(folders)")}
+        if "parent_folder_id" not in folder_columns: db.execute("ALTER TABLE folders ADD COLUMN parent_folder_id INTEGER REFERENCES folders(id)")
         if "runbook_type_id" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN runbook_type_id INTEGER REFERENCES runbook_types(id)")
         if "parent_runbook_id" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN parent_runbook_id INTEGER REFERENCES runbooks(id)")
         if "approved_at" not in columns: db.execute("ALTER TABLE runbooks ADD COLUMN approved_at TEXT")
@@ -1156,6 +1163,12 @@ class Handler(BaseHTTPRequestHandler):
                 actor=self.require(db,"admin:access")
                 if not actor:return
                 return self.send_json({"data":{"backups":list_backups(),"retain":BACKUP_RETAIN,"interval_hours":BACKUP_INTERVAL_HOURS}})
+            if path=="/api/saved-views":
+                actor=self.require(db,"runbooks:view")
+                if not actor: return
+                items=rows(db.execute("SELECT id,name,filters_json,created_at FROM saved_views WHERE user_id=? ORDER BY name",(actor["id"],)))
+                for item in items: item["filters"]=json.loads(item.pop("filters_json") or "{}")
+                return self.send_json({"data":items})
             if path=="/api/workspaces":
                 actor=self.require(db,"runbooks:view")
                 if not actor: return
@@ -1563,11 +1576,24 @@ class Handler(BaseHTTPRequestHandler):
                 workspace_id=int(payload.get("workspace_id") or db.execute("SELECT id FROM workspaces WHERE active=1 AND instance_id=? ORDER BY id LIMIT 1",(actor["instance_id"],)).fetchone()[0])
                 if not db.execute("SELECT 1 FROM workspaces WHERE id=? AND active=1 AND instance_id=?",(workspace_id,actor["instance_id"])).fetchone():
                     return self.send_json({"error":"Select an active workspace"},400)
+                parent_folder_id=int(payload["parent_folder_id"]) if payload.get("parent_folder_id") else None
+                if parent_folder_id and not db.execute("SELECT 1 FROM folders WHERE id=? AND workspace_id=?",(parent_folder_id,workspace_id)).fetchone():
+                    return self.send_json({"error":"Invalid parent folder"},400)
                 order=db.execute("SELECT COALESCE(MAX(sort_order),-1)+1 FROM folders WHERE workspace_id=?",(workspace_id,)).fetchone()[0]
-                try: cur=db.execute("INSERT INTO folders(workspace_id,name,sort_order,created_at) VALUES(?,?,?,?)",(workspace_id,name,order,now()))
+                try: cur=db.execute("INSERT INTO folders(workspace_id,name,sort_order,created_at,parent_folder_id) VALUES(?,?,?,?,?)",(workspace_id,name,order,now(),parent_folder_id))
                 except sqlite3.IntegrityError: return self.send_json({"error":"That folder already exists"},409)
                 append_audit(db,None,"folder.created",name,actor["display_name"],actor["instance_id"]); db.commit()
-                return self.send_json({"data":{"id":cur.lastrowid,"name":name}},201)
+                return self.send_json({"data":{"id":cur.lastrowid,"name":name,"parent_folder_id":parent_folder_id}},201)
+            if path=="/api/saved-views":
+                actor=self.require(db,"runbooks:view")
+                if not actor:return
+                name=str(payload.get("name","")).strip()
+                if not name or len(name)>120: return self.send_json({"error":"View name is required (maximum 120 characters)"},400)
+                filters=payload.get("filters") if isinstance(payload.get("filters"),dict) else {}
+                try: cur=db.execute("INSERT INTO saved_views(user_id,name,filters_json,created_at) VALUES(?,?,?,?)",(actor["id"],name,json.dumps(filters),now()))
+                except sqlite3.IntegrityError: return self.send_json({"error":"You already have a saved view with that name"},409)
+                db.commit()
+                return self.send_json({"data":{"id":cur.lastrowid,"name":name,"filters":filters}},201)
             if path=="/api/runbook-types":
                 actor=self.require(db,"runbooks:edit")
                 if not actor:return
@@ -2050,6 +2076,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _do_DELETE(self):
         path=urllib.parse.urlparse(self.path).path; parts=path.strip("/").split("/")
+        if len(parts)==3 and parts[:2]==["api","saved-views"]:
+            with connect() as db:
+                actor=self.require(db,"runbooks:view")
+                if not actor:return
+                try: view_id=int(parts[2])
+                except ValueError: return self.send_json({"error":"Not found"},404)
+                db.execute("DELETE FROM saved_views WHERE id=? AND user_id=?",(view_id,actor["id"])); db.commit()
+                return self.send_json({"data":{"ok":True}})
         if len(parts)==5 and parts[:3]==["api","admin","workspace-managers"]:
             with connect() as db:
                 actor=self.require(db,"admin:users")
