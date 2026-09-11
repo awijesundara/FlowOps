@@ -1516,8 +1516,11 @@ class Handler(BaseHTTPRequestHandler):
                 values=instance_settings(db,actor["instance_id"])
                 try:serviceops_token,serviceops_source=integration_credential(db,actor["instance_id"],"serviceops")
                 except RuntimeError:serviceops_token,serviceops_source="","Encrypted credential unavailable"
+                try:servicenow_token,servicenow_source=integration_credential(db,actor["instance_id"],"servicenow")
+                except RuntimeError:servicenow_token,servicenow_source="","Encrypted credential unavailable"
                 data={
-                  "serviceops":{"enabled":values.get("serviceops_enabled","true"),"url":values.get("serviceops_url",os.getenv("SERVICEOPS_URL","")),"credential_configured":bool(serviceops_token),"credential_source":serviceops_source,"credential_editable":bool(os.getenv("FLOWOPS_SETTINGS_ENCRYPTION_KEY")),"sync_on_live":values.get("serviceops_sync_on_live","true"),"sync_on_complete":values.get("serviceops_sync_on_complete","true"),"require_approved":values.get("serviceops_require_approved","true"),"trigger_workflow":values.get("serviceops_trigger_workflow","false"),"api_version":"v1","required_scopes":["tickets:read","tickets:update","workflows:execute"]}
+                  "serviceops":{"enabled":values.get("serviceops_enabled","true"),"url":values.get("serviceops_url",os.getenv("SERVICEOPS_URL","")),"credential_configured":bool(serviceops_token),"credential_source":serviceops_source,"credential_editable":bool(os.getenv("FLOWOPS_SETTINGS_ENCRYPTION_KEY")),"sync_on_live":values.get("serviceops_sync_on_live","true"),"sync_on_complete":values.get("serviceops_sync_on_complete","true"),"require_approved":values.get("serviceops_require_approved","true"),"trigger_workflow":values.get("serviceops_trigger_workflow","false"),"api_version":"v1","required_scopes":["tickets:read","tickets:update","workflows:execute"]},
+                  "servicenow":{"enabled":values.get("servicenow_enabled","false"),"url":values.get("servicenow_url",""),"username":values.get("servicenow_username",""),"credential_configured":bool(servicenow_token),"credential_source":servicenow_source,"credential_editable":bool(os.getenv("FLOWOPS_SETTINGS_ENCRYPTION_KEY")),"sync_on_live":values.get("servicenow_sync_on_live","true"),"sync_on_complete":values.get("servicenow_sync_on_complete","true")}
                 }
                 return self.send_json({"data":data})
             if path=="/api/admin/workspaces":
@@ -2028,10 +2031,13 @@ class Handler(BaseHTTPRequestHandler):
                 actor=self.require(db,"admin:settings")
                 if not actor:return
                 provider=str(payload.get("provider","")).lower()
-                if provider != "serviceops":return self.send_json({"error":"Provider must be serviceops"},400)
+                if provider not in {"serviceops","servicenow"}:return self.send_json({"error":"Provider must be serviceops or servicenow"},400)
                 if path.endswith("/test"):
+                    if provider=="servicenow": return self.test_servicenow_integration(db,actor,payload)
                     return self.test_integration(db,provider,actor,payload)
-                allowed={"enabled","url","sync_on_live","sync_on_complete","require_approved","trigger_workflow"}
+                allowed={"enabled","url","sync_on_live","sync_on_complete"}
+                if provider=="serviceops": allowed|={"require_approved","trigger_workflow"}
+                if provider=="servicenow": allowed|={"username"}
                 if "secret" in payload or "token" in payload:return self.send_json({"error":"Use the one-way credential field; secrets are never returned to the browser"},400)
                 submitted=str(payload.get("credential","")).strip();revoke=payload.get("revoke_credential") is True
                 if submitted and revoke:return self.send_json({"error":"Set or revoke a credential, not both"},400)
@@ -2301,6 +2307,7 @@ class Handler(BaseHTTPRequestHandler):
                             return self.send_json({"error":f"{rtype['name']} runbooks require approval before going live"},409)
                     try:
                         serviceops_result=self.serviceops_lifecycle(db,rid,target)
+                        servicenow_result=self.servicenow_lifecycle(db,rid,target)
                     except PermissionError as exc:
                         return self.send_json({"error":str(exc)},409)
                     except RuntimeError as exc:
@@ -2313,7 +2320,7 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         db.execute("UPDATE runbooks SET status=?,mode=?,updated_at=? WHERE id=?",(target,"live" if target=="paused" else "plan",stamp,rid))
                     append_audit(db,rid,"runbook.transition",f"{current} → {target}",actor["display_name"]); doc=runbook_document(db,rid,actor); db.commit()
-                    return self.send_json({"data":doc,"serviceops":serviceops_result})
+                    return self.send_json({"data":doc,"serviceops":serviceops_result,"servicenow":servicenow_result})
                 if len(parts)==4 and parts[3]=="approve":
                     actor=self.require(db,"admin:access")
                     if not actor:return
@@ -2326,6 +2333,9 @@ class Handler(BaseHTTPRequestHandler):
                 if len(parts)==4 and parts[3]=="serviceops-sync":
                     if not self.require(db,"integrations:sync"):return
                     return self.sync_serviceops(db,rid,payload)
+                if len(parts)==4 and parts[3]=="servicenow-sync":
+                    if not self.require(db,"integrations:sync"):return
+                    return self.sync_servicenow(db,rid,payload)
                 if len(parts)==4 and parts[3]=="duplicate":
                     actor=self.require_workspace_scoped_edit(db,runbook_id=rid)
                     if not actor:return
@@ -2924,6 +2934,111 @@ class Handler(BaseHTTPRequestHandler):
         except RuntimeError as exc:return self.send_json({"error":str(exc)},502)
         doc=runbook_document(db,rid);db.commit()
         return self.send_json({"data":doc,"serviceops":remote,"request_id":request_id,"ctasks_imported":len(created)})
+
+    # --- ServiceNow change-tracking connector ---------------------------
+    # Modeled on the ServiceOps connector's shape above, not copied: the
+    # credential store, response envelope, and state model all differ.
+    # Credential storage reuses the existing integration_credentials table
+    # (provider='servicenow') -- the same one-secret-per-provider model
+    # ServiceOps already uses -- rather than a named connection (deferred,
+    # see PRODUCT_BACKLOG.md Epic 3.1). ServiceNow's Table API uses Basic
+    # Auth (username + password, not a bearer token); the password is the
+    # value stored in integration_credentials, the username is a plain
+    # instance_settings value (servicenow_username) since it isn't secret.
+    SERVICENOW_STATE_MAP = {"live": "-1", "complete": "3"}  # default OOB change_request states: Implement, Closed
+
+    def servicenow_request(self, db, instance_id, method, resource, body=None):
+        base_row=db.execute("SELECT value FROM instance_settings WHERE instance_id=? AND key='servicenow_url'",(instance_id,)).fetchone()
+        base=(base_row[0] if base_row else "").rstrip("/")
+        username_row=db.execute("SELECT value FROM instance_settings WHERE instance_id=? AND key='servicenow_username'",(instance_id,)).fetchone()
+        username=username_row[0] if username_row else ""
+        password,_=integration_credential(db,instance_id,"servicenow")
+        if not base or not username or not password:
+            raise RuntimeError("Configure the ServiceNow URL, username, and password in Administration → Connections")
+        encoded=json.dumps(body).encode() if body is not None else None
+        auth=base64.b64encode(f"{username}:{password}".encode()).decode()
+        headers={"Authorization":f"Basic {auth}","Accept":"application/json"}
+        if encoded is not None: headers["Content-Type"]="application/json"
+        try:
+            response=safe_urlopen(f"{base}/api/now/table/{resource.lstrip('/')}",data=encoded,headers=headers,method=method,timeout=10,allow_private_network=True)
+        except RuntimeError as exc:
+            raise RuntimeError(f"ServiceNow is unreachable: {exc}") from exc
+        with response:
+            body_bytes=response.read()
+            if response.status>=400:
+                raise RuntimeError(f"ServiceNow returned HTTP {response.status}")
+            try: document=json.loads(body_bytes)
+            except json.JSONDecodeError as exc: raise RuntimeError("ServiceNow returned invalid JSON") from exc
+            return document.get("result",document)
+
+    def store_servicenow_ticket(self, db, rid, ticket):
+        db.execute("UPDATE runbooks SET servicenow_change_number=?,servicenow_sys_id=?,servicenow_state=?,servicenow_synced_at=?,updated_at=? WHERE id=?",
+            (str(ticket.get("number",""))[:40],str(ticket.get("sys_id",""))[:40],str(ticket.get("state",""))[:20],now(),now(),rid))
+
+    def apply_servicenow_sync(self, db, rid, change_number):
+        rb=db.execute("SELECT r.*,w.instance_id FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE r.id=?",(rid,)).fetchone()
+        result=self.servicenow_request(db,rb["instance_id"],"GET",f"change_request?sysparm_query=number={urllib.parse.quote(change_number)}&sysparm_limit=1")
+        ticket=(result[0] if isinstance(result,list) and result else result if isinstance(result,dict) else None)
+        if not ticket: raise RuntimeError(f"ServiceNow change {change_number} was not found")
+        self.store_servicenow_ticket(db,rid,ticket)
+        append_audit(db,rid,"servicenow.synced",f"Linked {change_number}")
+        return ticket
+
+    def servicenow_lifecycle(self, db, rid, target):
+        rb=db.execute("SELECT r.*,w.instance_id FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE r.id=?",(rid,)).fetchone()
+        change_number=str(rb["servicenow_change_number"] or "").strip()
+        settings={r["key"]:r["value"] for r in db.execute("SELECT key,value FROM instance_settings WHERE instance_id=? AND key LIKE 'servicenow_%'",(rb["instance_id"],))}
+        if not change_number or settings.get("servicenow_enabled","false")!="true" or target not in self.SERVICENOW_STATE_MAP: return None
+        should_update=(target=="live" and settings.get("servicenow_sync_on_live","true")=="true") or (target=="complete" and settings.get("servicenow_sync_on_complete","true")=="true")
+        if not should_update: return None
+        sys_id=rb["servicenow_sys_id"]
+        if not sys_id:
+            ticket=self.apply_servicenow_sync(db,rid,change_number); sys_id=ticket.get("sys_id")
+        desired_state=self.SERVICENOW_STATE_MAP[target]
+        ticket=self.servicenow_request(db,rb["instance_id"],"PATCH",f"change_request/{sys_id}",{"state":desired_state})
+        self.store_servicenow_ticket(db,rid,ticket)
+        append_audit(db,rid,"servicenow.lifecycle",f"{change_number} → state {desired_state}","FlowOps API")
+        return {"ticket":ticket}
+
+    def sync_servicenow(self, db, rid, payload):
+        rb=db.execute("SELECT servicenow_change_number FROM runbooks WHERE id=?",(rid,)).fetchone()
+        change_number=str(payload.get("ticket") or (rb["servicenow_change_number"] if rb else "") or "").strip()
+        if not change_number: return self.send_json({"error":"Link a ServiceNow change number first"},400)
+        try:
+            ticket=self.apply_servicenow_sync(db,rid,change_number)
+        except RuntimeError as exc: return self.send_json({"error":str(exc)},502)
+        doc=runbook_document(db,rid);db.commit()
+        return self.send_json({"data":doc,"servicenow":ticket})
+
+    def test_servicenow_integration(self, db, actor, overrides=None):
+        overrides=overrides or {}
+        values=instance_settings(db,actor["instance_id"])
+        base=str(overrides.get("url") or values.get("servicenow_url","")).strip().rstrip("/")
+        username=str(overrides.get("username") or values.get("servicenow_username","")).strip()
+        password=str(overrides.get("credential") or "").strip()
+        testing_unsaved_credential=bool(password)
+        if not password:
+            try:password,_=integration_credential(db,actor["instance_id"],"servicenow")
+            except RuntimeError as exc:return self.send_json({"error":str(exc)},503)
+        if not base:return self.send_json({"error":"Configure the ServiceNow instance URL first"},400)
+        if not username:return self.send_json({"error":"Configure the ServiceNow username first"},400)
+        if not password:return self.send_json({"error":"Paste a ServiceNow password, save the connection, then test again"},400)
+        auth=base64.b64encode(f"{username}:{password}".encode()).decode()
+        headers={"Accept":"application/json","Authorization":f"Basic {auth}"}
+        started=time.monotonic()
+        try:
+            response=safe_urlopen(f"{base}/api/now/table/change_request?sysparm_limit=1",headers=headers,timeout=8,allow_private_network=True)
+        except RuntimeError as exc:
+            return self.send_json({"error":str(exc)},502)
+        with response:
+            if response.status in (401,403):return self.send_json({"error":"ServiceNow rejected the username/password. Verify the account has read access to change_request."},502)
+            if response.status>=400:return self.send_json({"error":f"ServiceNow returned HTTP {response.status}"},502)
+            try: document=json.loads(response.read())
+            except json.JSONDecodeError:return self.send_json({"error":"ServiceNow returned invalid JSON"},502)
+            if "result" not in document:return self.send_json({"error":"ServiceNow returned an incompatible Table API response"},502)
+        result={"ok":True,"provider":"servicenow","latency_ms":round((time.monotonic()-started)*1000),"message":"ServiceNow Table API verified","credential_configured":True,"tested_unsaved_credential":testing_unsaved_credential}
+        append_audit(db,None,"integration.tested",f"servicenow: {result['message']}",actor["display_name"],actor["instance_id"]);db.commit()
+        return self.send_json({"data":result})
 
     def test_integration(self, db, provider, actor, overrides=None):
         overrides=overrides or {}
