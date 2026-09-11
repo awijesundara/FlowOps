@@ -150,6 +150,30 @@ class FlowOpsBrowserTest(unittest.TestCase):
         overflow = self.page.evaluate('document.documentElement.scrollWidth - window.innerWidth')
         self.assertLessEqual(overflow, 1, f'page overflows horizontally by {overflow}px')
 
+    def _assert_task_execution_view_reflows_and_has_real_touch_targets(self, width, height):
+        self.page.set_viewport_size({'width': width, 'height': height})
+        self.page.click('#menu')  # off-canvas sidebar below 900px -- open it first, like a real mobile user would
+        self.page.click('.shell.menu-open [data-view="runbooks"]')
+        self.page.wait_for_selector('#runbooks.view.active')
+        self.page.locator('.trow[data-id]').first.click()
+        self.page.wait_for_selector('#detail.view.active')
+        self.page.wait_for_selector('.task .task-actions button')
+        overflow = self.page.evaluate('document.documentElement.scrollWidth - window.innerWidth')
+        self.assertLessEqual(overflow, 1, f'execution view overflows horizontally by {overflow}px at {width}x{height}')
+        boxes = self.page.eval_on_selector_all(
+            '.task-actions button',
+            "els => els.map(el => { const r = el.getBoundingClientRect(); return {w: r.width, h: r.height}; })",
+        )
+        self.assertGreater(len(boxes), 0, 'expected at least one visible task action button')
+        undersized = [b for b in boxes if b['w'] < 44 or b['h'] < 44]
+        self.assertEqual(undersized, [], f'task action buttons under the 44x44 touch target minimum at {width}x{height}: {undersized}')
+
+    def test_task_execution_view_reflows_and_meets_touch_targets_at_375(self):
+        self._assert_task_execution_view_reflows_and_has_real_touch_targets(375, 812)
+
+    def test_task_execution_view_reflows_and_meets_touch_targets_at_414(self):
+        self._assert_task_execution_view_reflows_and_has_real_touch_targets(414, 896)
+
 
 if __name__ == '__main__':
     unittest.main()

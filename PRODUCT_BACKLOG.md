@@ -897,9 +897,29 @@ penetration-testing engagement not available in this environment.
 
 ### Epic 4.5 — Mobile and Field Access
 
-Responsive assigned-task execution (P1/L): `PARTIAL`, in progress —
-targeted CSS pass for the 375-414px viewport range (320px reflow already
-proven, see Cross-Cutting table).
+Responsive assigned-task execution (P1/L): `DONE` (2026-09-11) — CSS-only
+pass targeting the 375-414px viewport range (320px reflow already proven,
+see Cross-Cutting table). Two real, concrete issues found and fixed, not
+assumed: (1) task action buttons (`.task-actions button`) were 6px/9px
+padding at 11px font — well under a real touch-target minimum. Fixed with
+a `max-width:480px` rule that stacks the actions row onto its own full-width
+grid row (`.task{grid-template-columns:32px 1fr 30px}`, actions at
+`grid-column:1/-1`) and bumps buttons to `min-height/min-width:44px`.
+(2) A genuine CSS grid blowout: `.detail-grid{grid-template-columns:1fr}`
+(the existing `max-width:900px` rule) still let the single track grow to
+its widest descendant's min-content size — confirmed via live layout
+inspection that the resolved track was rendering at 1058px inside a 335px
+container, overflowing the page by 700+px the moment a runbook was
+actually opened at a narrow width (the pre-existing 320px test only ever
+checked the *runbooks list*, never opened a runbook, so this was
+invisible until this pass). Fixed with `minmax(0,1fr)`, the standard fix
+for this exact class of bug, mirroring the `main{min-width:0}` guard
+already in place one level up in the same file. Covered by
+`test_task_execution_view_reflows_and_meets_touch_targets_at_375` and
+`_at_414` in `test_browser.py`: opens a real runbook at each viewport
+(through the real off-canvas mobile nav, `#menu` → sidebar), asserts zero
+horizontal page overflow, and asserts every visible task action button's
+real bounding box is at least 44×44px.
 
 Push notifications for assignment/overdue work (P2/M): `BACKLOG`, in
 progress — interpreted as standards-based Web Push (VAPID, no encrypted
