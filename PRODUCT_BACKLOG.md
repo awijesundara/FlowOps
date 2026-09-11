@@ -117,7 +117,7 @@ and retrieves an audit trail with no automation dependency.
 
 | Story | Priority | Size | Status |
 |---|---:|---:|---:|
-| Workspace Manager, Stakeholder, and Member scoped roles | P0 | L | PARTIAL |
+| Workspace Manager, Stakeholder, and Member scoped roles | P0 | L | DONE |
 | Folder-scoped Runbook Creator | P0 | M | DONE |
 | Stream Editor rights | P1 | M | DONE |
 | Global Stakeholder read-only visibility | P1 | M | DONE |
@@ -144,15 +144,24 @@ Regression tests create a real user of each new role, log in as them, and
 assert both the pre-grant 403 and the post-grant 200/201 — not just that
 the role string exists.
 
-`PARTIAL`, not `DONE`, because the existing `Member` role remains
-instance-wide by design (a Member still sees every runbook they're on a
-team for across the whole instance, not scoped to a workspace) — genuinely
-re-scoping `Member` itself was judged out of proportion to redo in this
-pass given its blast radius, so it's left unchanged rather than risk an
-authorization regression. Workspace structural setup — creating folders,
-runbook types, and templates themselves (as opposed to runbooks within
-them) — also remains Admin/Editor only; `Workspace Manager` does not
-extend to that layer yet.
+Member runbook visibility: `DONE`. `GET /api/runbooks` now excludes any
+runbook where the requesting Member has no assigned task — personally
+(`owner_user_id`) or via a team they belong to, directly (`team_members`)
+or through a central team (`central_team_members`) — instead of listing
+every runbook in the instance. This is deliberately scoped to the list
+endpoint only, reusing the same assignment relationship
+`runbook_document()` already uses to filter a Member's *task* list within
+a runbook they can open; it does not touch `owns_runbook()` (the
+lower-level check used by comments, teams, and direct-link access across
+many endpoints), so a Member who already has a runbook open via a shared
+link is unaffected — only what appears in their own runbook list/command
+center changed. Aggregate dashboard counts (`/api/dashboard`) remain
+instance-wide, unscoped, since they were never per-user to begin with.
+Covered by `test_member_runbook_list_only_shows_runbooks_with_an_assigned_task`.
+
+Workspace structural setup — creating folders, runbook types, and
+templates themselves (as opposed to runbooks within them) — remains
+Admin/Editor only; `Workspace Manager` does not extend to that layer yet.
 
 ### Epic 2.2 — Folders and Runbook Types
 

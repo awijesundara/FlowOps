@@ -1078,6 +1078,10 @@ class Handler(BaseHTTPRequestHandler):
                 folder_clause=""; params=[actor["instance_id"]]
                 if query.get("folder_id"):
                     folder_clause="AND r.folder_id=?"; params.append(int(query["folder_id"][0]))
+                member_clause=""
+                if actor["role"]=="Member":
+                    member_clause="AND EXISTS (SELECT 1 FROM tasks mt LEFT JOIN runbook_teams mrt ON mrt.id=mt.owner_team_id LEFT JOIN central_team_members mctm ON mctm.team_id=mrt.central_team_id AND mctm.user_id=? LEFT JOIN team_members mtm ON mtm.team_id=mrt.id AND mtm.user_id=? WHERE mt.runbook_id=r.id AND (mt.owner_user_id=? OR mctm.user_id IS NOT NULL OR mtm.user_id IS NOT NULL))"
+                    params+=[actor["id"],actor["id"],actor["id"]]
                 search_clause=""
                 q=(query.get("q",[""])[0]).strip()
                 task_owner_join="LEFT JOIN users su ON su.id=st.owner_user_id LEFT JOIN runbook_teams stt ON stt.id=st.owner_team_id"
@@ -1085,7 +1089,7 @@ class Handler(BaseHTTPRequestHandler):
                     like=f"%{q}%"
                     search_clause=f"AND (r.name LIKE ? OR r.owner LIKE ? OR r.serviceops_ticket LIKE ? OR EXISTS (SELECT 1 FROM tasks st {task_owner_join} WHERE st.runbook_id=r.id AND (st.title LIKE ? OR st.owner LIKE ? OR su.display_name LIKE ? OR stt.name LIKE ?)))"
                     params+= [like,like,like,like,like,like,like]
-                items=rows(db.execute(f"SELECT r.*,w.name workspace_name,f.name folder_name,rt.name runbook_type_name,rt.icon runbook_type_icon,rt.color runbook_type_color,COUNT(t.id) task_count,SUM(CASE WHEN t.status='complete' THEN 1 ELSE 0 END) done_count FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id LEFT JOIN folders f ON f.id=r.folder_id LEFT JOIN runbook_types rt ON rt.id=r.runbook_type_id LEFT JOIN tasks t ON t.runbook_id=r.id WHERE w.instance_id=? {archived_clause} {folder_clause} {search_clause} GROUP BY r.id ORDER BY r.updated_at DESC",params))
+                items=rows(db.execute(f"SELECT r.*,w.name workspace_name,f.name folder_name,rt.name runbook_type_name,rt.icon runbook_type_icon,rt.color runbook_type_color,COUNT(t.id) task_count,SUM(CASE WHEN t.status='complete' THEN 1 ELSE 0 END) done_count FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id LEFT JOIN folders f ON f.id=r.folder_id LEFT JOIN runbook_types rt ON rt.id=r.runbook_type_id LEFT JOIN tasks t ON t.runbook_id=r.id WHERE w.instance_id=? {archived_clause} {folder_clause} {member_clause} {search_clause} GROUP BY r.id ORDER BY r.updated_at DESC",params))
                 if q:
                     like=f"%{q}%"
                     for item in items:
