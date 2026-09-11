@@ -197,6 +197,117 @@ class FlowOpsBrowserTest(unittest.TestCase):
         )
         self.assertEqual(violations, [], '\n'.join(violations))
 
+    def test_sidebar_stays_fixed_in_place_while_the_page_scrolls(self):
+        self.page.click('[data-view="runbooks"]', force=True)
+        self.page.wait_for_selector('#runbooks.view.active')
+        self.page.locator('.trow[data-id]').first.click()
+        self.page.wait_for_selector('#detail.view.active')
+        position = self.page.evaluate("getComputedStyle(document.querySelector('aside')).position")
+        self.assertEqual(position, 'fixed', "the primary nav sidebar must be truly fixed, not sticky, so it never drifts during scroll")
+        before = self.page.eval_on_selector('aside', "el => { const r = el.getBoundingClientRect(); return {x: r.x, y: r.y}; }")
+        self.page.mouse.wheel(0, 1500)
+        self.page.wait_for_timeout(100)
+        after = self.page.eval_on_selector('aside', "el => { const r = el.getBoundingClientRect(); return {x: r.x, y: r.y}; }")
+        self.assertEqual(before, after, "the sidebar must not move at all while the page scrolls")
+
+    def test_modal_close_buttons_are_square_icon_buttons_not_stretched(self):
+        self.page.click('#openProfile')
+        self.page.wait_for_selector('#profileModal[open]')
+        box = self.page.eval_on_selector('.close-profile', "el => { const r = el.getBoundingClientRect(); return {w: r.width, h: r.height}; }")
+        self.assertLess(box['h'], 60, f"profile modal close button is stretched tall: {box}")
+        self.assertAlmostEqual(box['w'], box['h'], delta=4, msg=f"close button should be roughly square: {box}")
+
+    def test_view_switches_and_admin_pane_switches_use_a_real_reveal_animation(self):
+        self.page.click('[data-view="runbooks"]', force=True)
+        self.page.wait_for_selector('#runbooks.view.active')
+        name = self.page.evaluate("getComputedStyle(document.querySelector('#runbooks.view.active')).animationName")
+        self.assertNotEqual(name, 'none', 'switching views should play a reveal animation, not cut instantly')
+        self.page.click('[data-view="admin"]', force=True)
+        self.page.wait_for_selector('#admin.view.active')
+        self.page.click('text=People & access')
+        self.page.wait_for_selector('.admin-tool-card')
+        self.page.click('text=Users & access')
+        self.page.wait_for_selector('.admin-pane.active')
+        pane_name = self.page.evaluate("getComputedStyle(document.querySelector('.admin-pane.active')).animationName")
+        self.assertNotEqual(pane_name, 'none', 'switching admin panes should play the same reveal animation as the rest of the app')
+
+    def test_monitor_view_opens_from_the_runbook_and_shows_live_task_state(self):
+        self.page.click('[data-view="runbooks"]', force=True)
+        self.page.wait_for_selector('#runbooks.view.active')
+        self.page.locator('.trow[data-id]').first.click()
+        self.page.wait_for_selector('#detail.view.active')
+        rid = self.page.evaluate('state.current.id')
+        self.page.goto(f'{self.base}/monitor.html?rid={rid}')
+        self.page.wait_for_selector('.card')
+        self.assertIn('Confirm change approval', self.page.inner_text('.card'))
+        self.assertIn('Live', self.page.inner_text('#liveLabel'))
+
+    def test_monitor_view_prompts_sign_in_when_not_authenticated(self):
+        fresh_context = self.browser.new_context()
+        fresh_page = fresh_context.new_page()
+        rid = self.page.evaluate('state.current ? state.current.id : 1')
+        fresh_page.goto(f'{self.base}/monitor.html?rid={rid}')
+        fresh_page.wait_for_selector('.signin')
+        self.assertIn('Sign in', fresh_page.inner_text('.signin'))
+        fresh_context.close()
+
+    def test_dependency_gate_badges_show_entry_sequential_and_and_or_correctly(self):
+        self.page.click('[data-view="runbooks"]', force=True)
+        self.page.wait_for_selector('#runbooks.view.active')
+        self.page.locator('.trow[data-id]').first.click()
+        self.page.wait_for_selector('#detail.view.active')
+        badges = self.page.eval_on_selector_all(
+            '.task .gate-badge',
+            "els => els.map(e => ({text: e.textContent, cls: e.className}))",
+        )
+        self.assertGreater(len(badges), 0)
+        self.assertIn('gate-entry', badges[0]['cls'], 'first task (no dependencies) should show the entry badge')
+        self.assertEqual(badges[0]['text'], '▶')
+        sequential = [b for b in badges[1:] if 'gate-seq' in b['cls']]
+        self.assertTrue(sequential, 'tasks with exactly one dependency should show the sequential arrow badge')
+        self.page.evaluate("""async () => {
+            const rid = state.current.id;
+            async function addTask(title, dependsOn, logic) {
+                const res = await fetch(`/api/runbooks/${rid}/tasks`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json', 'X-CSRF-Token': state.csrf},
+                    body: JSON.stringify({title, depends_on: dependsOn, dependency_logic: logic}),
+                });
+                const body = await res.json();
+                state.current = body.data;
+                return body.data.tasks[body.data.tasks.length - 1].id;
+            }
+            const a = await addTask('Gate A', [], 'and');
+            const b = await addTask('Gate B', [], 'and');
+            await addTask('AND join', [a, b], 'and');
+            await addTask('OR join', [a, b], 'or');
+            renderDetail();
+        }""")
+        self.page.wait_for_selector('.task h3:has-text("OR join")')
+        badge_map = self.page.eval_on_selector_all(
+            '.task',
+            "els => els.map(el => ({title: el.querySelector('h3').textContent.trim(), badge: el.querySelector('.gate-badge')?.textContent, cls: el.querySelector('.gate-badge')?.className}))",
+        )
+        and_row = next(r for r in badge_map if 'AND join' in r['title'])
+        or_row = next(r for r in badge_map if 'OR join' in r['title'])
+        self.assertEqual(and_row['badge'], 'AND'); self.assertIn('gate-and', and_row['cls'])
+        self.assertEqual(or_row['badge'], 'OR'); self.assertIn('gate-or', or_row['cls'])
+
+    def test_escalating_and_flagging_a_task_applies_real_visual_state_via_the_ui(self):
+        self.page.click('[data-view="runbooks"]', force=True)
+        self.page.wait_for_selector('#runbooks.view.active')
+        self.page.locator('.trow[data-id]').first.click()
+        self.page.wait_for_selector('#detail.view.active')
+        self.page.once('dialog', lambda d: d.accept('Vendor is unresponsive'))
+        self.page.locator('.task .escalate-btn').first.click()
+        self.page.wait_for_selector('.task.escalated')
+        self.assertTrue(self.page.locator('.task.escalated .escalated-chip').is_visible())
+        self.page.once('dialog', lambda d: d.accept('Caused a brief outage'))
+        self.page.locator('.task.escalated .incident-btn').click()
+        self.page.wait_for_selector('.task.incident')
+        self.assertTrue(self.page.locator('.task.incident .incident-chip').is_visible())
+        self.assertTrue(self.page.locator('.task.escalated.incident').count() > 0, 'escalation must survive flagging an incident on the same task')
+
     def test_runbook_rows_are_keyboard_operable(self):
         self.page.click('[data-view="runbooks"]')
         row = self.page.locator('.trow[data-id]').first

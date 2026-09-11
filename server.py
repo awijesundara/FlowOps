@@ -143,14 +143,15 @@ WEBHOOK_EVENT_ACTIONS = (
     "central_team.member_added","central_team.member_removed","comment.added","custom_field.created",
     "custom_field.deleted","folder.created","folder.deleted","instance.created",
     "integration.configured","integration.tested","profile.avatar_updated","profile.password_changed",
-    "profile.updated","runbook.approved","runbook.archived","runbook.created","runbook.duplicated",
+    "profile.updated","runbook.approved","runbook.archived","runbook.created","runbook.deleted","runbook.duplicated",
     "runbook.edited","runbook.reviewed","runbook.transition","runbook_type.created",
     "runbook_type.deleted","servicenow.lifecycle","servicenow.synced","serviceops.ctask_sync_failed",
     "serviceops.ctask_synced","serviceops.ctasks_imported","serviceops.ctasks_synced",
     "serviceops.lifecycle","serviceops.sync_failed","serviceops.synced","snippet.deleted",
     "snippet.inserted","snippet.saved","stream.created","stream.deleted","stream.renamed",
     "task.automation_result","task.automation_running","task.automation_test_fired",
-    "task.bulk_edited","task.created","task.csv_imported","task.edited","task.transition",
+    "task.bulk_edited","task.created","task.csv_imported","task.edited","task.escalated",
+    "task.escalation_cleared","task.incident_flagged","task.incident_cleared","task.transition",
     "team.created","template.deleted","template.saved","webhook.created","webhook.deleted",
 )
 
@@ -826,7 +827,10 @@ def init_db() -> None:
           "validation_result":"TEXT", "validation_comment":"TEXT", "blocked_reason":"TEXT",
           "serviceops_ctask":"TEXT", "serviceops_ctask_team":"TEXT",
           "automation_status":"TEXT NOT NULL DEFAULT 'idle'", "automation_result":"TEXT",
-          "automation_attempts":"INTEGER NOT NULL DEFAULT 0", "skip_reason":"TEXT"
+          "automation_attempts":"INTEGER NOT NULL DEFAULT 0", "skip_reason":"TEXT",
+          "escalated":"INTEGER NOT NULL DEFAULT 0", "escalation_reason":"TEXT",
+          "incident":"INTEGER NOT NULL DEFAULT 0", "incident_reason":"TEXT",
+          "dependency_logic":"TEXT NOT NULL DEFAULT 'and'",
         }
         for column,definition in task_migrations.items():
             if column not in task_columns: db.execute(f"ALTER TABLE tasks ADD COLUMN {column} {definition}")
@@ -1434,7 +1438,15 @@ def runbook_document(db: sqlite3.Connection, rid: int, user: dict[str,Any] | Non
         dep_map.setdefault(dep["task_id"], []).append(dep["depends_on_id"])
     for task in all_tasks:
         task["depends_on"] = dep_map.get(task["id"], [])
-        task["blocked"] = task["status"] == "pending" and any(next((x["status"] for x in all_tasks if x["id"] == d), "pending") not in {"complete","skipped"} for d in task["depends_on"])
+        dep_statuses = [next((x["status"] for x in all_tasks if x["id"] == d), "pending") for d in task["depends_on"]]
+        # AND (default): every predecessor must finish before this task can
+        # start -- a single unfinished dependency blocks it. OR: any one
+        # finished predecessor is enough (a Cutover-style "either branch"
+        # join) -- only relevant with 2+ dependencies; with 0 or 1 it's moot.
+        if task.get("dependency_logic") == "or" and len(dep_statuses) > 1:
+            task["blocked"] = task["status"] == "pending" and dep_statuses and not any(s in {"complete","skipped"} for s in dep_statuses)
+        else:
+            task["blocked"] = task["status"] == "pending" and any(s not in {"complete","skipped"} for s in dep_statuses)
         task["owner_display"] = task["owner_user_name"] or task["owner_team_name"] or task["owner"] or "Unassigned"
     tasks=all_tasks
     if user and user.get("role")=="Member":
@@ -1453,9 +1465,14 @@ def runbook_document(db: sqlite3.Connection, rid: int, user: dict[str,Any] | Non
         task = by_id.get(tid)
         if not task: return 0
         earliest_start_memo[tid] = max(0, int(task.get("scheduled_offset") or 0))
+        finish_times = [earliest_start(dep) + by_id[dep]["duration"] for dep in task["depends_on"] if dep in by_id]
+        # OR-gated tasks with 2+ deps can start as soon as the *earliest*
+        # branch finishes, not the latest -- the mirror image of the
+        # blocked-status check above.
+        combine = min if (task.get("dependency_logic") == "or" and len(finish_times) > 1) else max
         offset = max(
             max(0, int(task.get("scheduled_offset") or 0)),
-            max((earliest_start(dep) + by_id[dep]["duration"] for dep in task["depends_on"] if dep in by_id), default=0),
+            combine(finish_times) if finish_times else 0,
         )
         earliest_start_memo[tid] = offset
         return offset
@@ -1807,6 +1824,8 @@ class Handler(BaseHTTPRequestHandler):
         if path=="/app.js": return self.static("app.js","application/javascript; charset=utf-8")
         if path=="/strings.js": return self.static("strings.js","application/javascript; charset=utf-8")
         if path=="/sw.js": return self.static("sw.js","application/javascript; charset=utf-8")
+        if path=="/monitor.html": return self.static("monitor.html","text/html; charset=utf-8")
+        if path=="/monitor.js": return self.static("monitor.js","application/javascript; charset=utf-8")
         if path=="/styles.css": return self.static("styles.css","text/css; charset=utf-8")
         if path=="/api-explorer": return self.static("api-explorer.html","text/html; charset=utf-8")
         if path=="/api-explorer.js": return self.static("api-explorer.js","application/javascript; charset=utf-8")
@@ -2389,6 +2408,40 @@ class Handler(BaseHTTPRequestHandler):
                 status_ok,snippet=perform_automation_call(url,headers,body,timeout=15)
                 append_audit(db,task["runbook_id"],"task.automation_test_fired",f"{task['title']}: {'success' if status_ok else 'failed'} ({snippet[:200]})",actor["display_name"]); db.commit()
                 return self.send_json({"data":{"ok":status_ok,"result":snippet[:2000]}})
+            if path.startswith("/api/tasks/") and path.endswith("/escalate"):
+                try: tid=int(path.strip("/").split("/")[2])
+                except (ValueError,IndexError): return self.send_json({"error":"Not found"},404)
+                precheck=self.current_user(db)
+                if not precheck: return self.send_json({"error":"Authentication required"},401)
+                task=db.execute("SELECT t.* FROM tasks t JOIN runbooks r ON r.id=t.runbook_id JOIN workspaces w ON w.id=r.workspace_id WHERE t.id=? AND w.instance_id=?",(tid,precheck["instance_id"])).fetchone()
+                if not task: return self.send_json({"error":"Not found"},404)
+                actor=self.require(db,"runbooks:execute")
+                if not actor:return
+                escalated=1 if payload.get("escalated",True) else 0
+                reason=str(payload.get("reason",""))[:500]
+                db.execute("UPDATE tasks SET escalated=?,escalation_reason=? WHERE id=?",(escalated,reason if escalated else None,tid))
+                detail=f"{task['title']}"+(f": {reason}" if reason else "")
+                if escalated: append_audit(db,task["runbook_id"],"task.escalated",detail,actor["display_name"])
+                else: append_audit(db,task["runbook_id"],"task.escalation_cleared",detail,actor["display_name"])
+                doc=runbook_document(db,task["runbook_id"],actor); db.commit()
+                return self.send_json({"data":doc})
+            if path.startswith("/api/tasks/") and path.endswith("/incident"):
+                try: tid=int(path.strip("/").split("/")[2])
+                except (ValueError,IndexError): return self.send_json({"error":"Not found"},404)
+                precheck=self.current_user(db)
+                if not precheck: return self.send_json({"error":"Authentication required"},401)
+                task=db.execute("SELECT t.* FROM tasks t JOIN runbooks r ON r.id=t.runbook_id JOIN workspaces w ON w.id=r.workspace_id WHERE t.id=? AND w.instance_id=?",(tid,precheck["instance_id"])).fetchone()
+                if not task: return self.send_json({"error":"Not found"},404)
+                actor=self.require(db,"runbooks:execute")
+                if not actor:return
+                incident=1 if payload.get("incident",True) else 0
+                reason=str(payload.get("reason",""))[:500]
+                db.execute("UPDATE tasks SET incident=?,incident_reason=? WHERE id=?",(incident,reason if incident else None,tid))
+                detail=f"{task['title']}"+(f": {reason}" if reason else "")
+                if incident: append_audit(db,task["runbook_id"],"task.incident_flagged",detail,actor["display_name"])
+                else: append_audit(db,task["runbook_id"],"task.incident_cleared",detail,actor["display_name"])
+                doc=runbook_document(db,task["runbook_id"],actor); db.commit()
+                return self.send_json({"data":doc})
             if path=="/api/admin/invitations":
                 actor=self.require(db,"admin:users")
                 if not actor:return
@@ -2624,7 +2677,9 @@ class Handler(BaseHTTPRequestHandler):
                     if not db.execute("SELECT 1 FROM streams WHERE runbook_id=? AND name=?",(rid,stream)).fetchone():
                         stream_order=db.execute("SELECT COALESCE(MAX(sort_order),-1)+1 FROM streams WHERE runbook_id=?",(rid,)).fetchone()[0]
                         db.execute("INSERT INTO streams(runbook_id,name,sort_order,created_at) VALUES(?,?,?,?)",(rid,stream,stream_order,now()))
-                    cur=db.execute("INSERT INTO tasks(runbook_id,title,description,stream,owner,duration,sort_order,automation_url,task_type,scheduled_offset,owner_user_id,owner_team_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(rid,title,str(payload.get("description",""))[:2000],stream,"",duration,order,str(payload.get("automation_url",""))[:500] or None,task_type,max(0,int(payload.get("scheduled_offset",0))),owner_user_id,owner_team_id))
+                    dependency_logic=str(payload.get("dependency_logic","and")).strip().lower()
+                    if dependency_logic not in ("and","or"): dependency_logic="and"
+                    cur=db.execute("INSERT INTO tasks(runbook_id,title,description,stream,owner,duration,sort_order,automation_url,task_type,scheduled_offset,owner_user_id,owner_team_id,dependency_logic) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(rid,title,str(payload.get("description",""))[:2000],stream,"",duration,order,str(payload.get("automation_url",""))[:500] or None,task_type,max(0,int(payload.get("scheduled_offset",0))),owner_user_id,owner_team_id,dependency_logic))
                     for dep in payload.get("depends_on",[]):
                         if db.execute("SELECT 1 FROM tasks WHERE id=? AND runbook_id=?",(dep,rid)).fetchone(): db.execute("INSERT OR IGNORE INTO dependencies VALUES(?,?)",(cur.lastrowid,dep))
                     append_audit(db,rid,"task.created",title,actor["display_name"]); db.execute("UPDATE runbooks SET updated_at=? WHERE id=?",(now(),rid)); doc=runbook_document(db,rid,actor); db.commit()
@@ -3033,6 +3088,10 @@ class Handler(BaseHTTPRequestHandler):
                     owner_team_id=int(payload["owner_team_id"]) if payload.get("owner_team_id") else None
                     if owner_team_id and not db.execute("SELECT 1 FROM runbook_teams WHERE id=? AND runbook_id=?",(owner_team_id,task["runbook_id"])).fetchone():return self.send_json({"error":"Assigned team is invalid"},400)
                     if owner_team_id!=task["owner_team_id"]: changes.append("owner_team_id changed"); sets.append("owner_team_id=?"); values.append(owner_team_id)
+                if "dependency_logic" in payload:
+                    dependency_logic=str(payload["dependency_logic"]).strip().lower()
+                    if dependency_logic not in ("and","or"): return self.send_json({"error":"Dependency logic must be 'and' or 'or'"},400)
+                    if dependency_logic!=task["dependency_logic"]: changes.append(f"dependency_logic: {task['dependency_logic']} → {dependency_logic}"); sets.append("dependency_logic=?"); values.append(dependency_logic)
                 if "stream" in payload and payload["stream"]:
                     stream_name=str(payload["stream"]).strip()[:80]
                     if not db.execute("SELECT 1 FROM streams WHERE runbook_id=? AND name=?",(task["runbook_id"],stream_name)).fetchone():
@@ -3100,6 +3159,22 @@ class Handler(BaseHTTPRequestHandler):
                 if actor.get("auth_method")=="session" and self.headers.get("X-CSRF-Token","") != actor["csrf_token"]: return self.send_json({"error":"Invalid or missing CSRF token"},403)
                 endpoint=(urllib.parse.parse_qs(parsed.query).get("endpoint") or [""])[0]
                 db.execute("DELETE FROM push_subscriptions WHERE endpoint=? AND user_id=?",(endpoint,actor["id"])); db.commit()
+                return self.send_json({"data":{"ok":True}})
+        if len(parts)==3 and parts[:2]==["api","runbooks"]:
+            try: rid=int(parts[2])
+            except ValueError: return self.send_json({"error":"Not found"},404)
+            with connect() as db:
+                actor=self.require(db,"admin:access")
+                if not actor:return
+                runbook=db.execute("SELECT r.*,w.instance_id FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE r.id=? AND w.instance_id=?",(rid,actor["instance_id"])).fetchone()
+                if not runbook: return self.send_json({"error":"Not found"},404)
+                if runbook["status"]=="live": return self.send_json({"error":"A live runbook cannot be deleted. Pause or complete it first."},409)
+                # Task/comment/stream rows cascade-delete via their own FK
+                # constraints; audit rows deliberately do NOT (audit.runbook_id
+                # has no FK) -- the immutable history of a deleted runbook is
+                # preserved, matching this app's compliance-evidence design.
+                db.execute("DELETE FROM runbooks WHERE id=?",(rid,))
+                append_audit(db,None,"runbook.deleted",f"{runbook['name']} (was {runbook['status']})",actor["display_name"],actor["instance_id"]); db.commit()
                 return self.send_json({"data":{"ok":True}})
         if len(parts)==3 and parts[:2]==["api","saved-views"]:
             with connect() as db:
