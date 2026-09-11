@@ -587,6 +587,26 @@ class FlowOpsTest(unittest.TestCase):
         _,folders=self.req('/api/folders')
         self.assertTrue(any(f['id']==folder_id and f['runbook_count']==1 for f in folders['data']))
         self.assertEqual(self.req(f'/api/folders/{folder_id}','DELETE')[0],409)
+    def test_runbook_home_content_is_editable_and_returned_in_document(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Home page runbook'}); rid=created['data']['id']
+        _,doc=self.req(f'/api/runbooks/{rid}')
+        self.assertEqual(doc['data']['home_content'],'')
+        code,updated=self.req(f'/api/runbooks/{rid}','PATCH',{'home_content':'Runbook owner: Platform SRE\nRunbook wiki: https://wiki.example.com/release'})
+        self.assertEqual(code,200)
+        self.assertIn('Platform SRE',updated['data']['home_content'])
+    def test_post_implementation_review_only_allowed_after_completion(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Review target'}); rid=created['data']['id']
+        code,rejected=self.req(f'/api/runbooks/{rid}/review','PATCH',{'what_went_well':'Too early'})
+        self.assertEqual(code,409)
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'complete'})
+        code,review=self.req(f'/api/runbooks/{rid}/review','PATCH',{'what_went_well':'Smooth rollout','what_went_wrong':'Late start','follow_up_actions':'Automate the manual step'})
+        self.assertEqual(code,200)
+        self.assertEqual(review['data']['review']['what_went_well'],'Smooth rollout')
+        self.assertEqual(review['data']['review']['reviewed_by'],'Anushka')
+        _,doc=self.req(f'/api/runbooks/{rid}')
+        self.assertEqual(doc['data']['review']['what_went_wrong'],'Late start')
     def test_nested_folders_track_parent_and_reject_invalid_parent(self):
         code,parent=self.req('/api/folders','POST',{'name':'2026 Releases'})
         self.assertEqual(code,201); parent_id=parent['data']['id']
