@@ -780,6 +780,43 @@ class FlowOpsTest(unittest.TestCase):
         self.assertIn(assigned_rid,visible_ids)
         self.assertNotIn(hidden_rid,visible_ids)
         self.__class__.opener,self.__class__.csrf=admin_opener,admin_csrf
+    def test_unhandled_exception_returns_structured_500_instead_of_crashing(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Error path probe'}); rid=created['data']['id']
+        with patch('server.runbook_document', side_effect=RuntimeError('boom')):
+            code,body=self.req(f'/api/runbooks/{rid}')
+        self.assertEqual(code,500)
+        self.assertIn('error_id',body)
+        self.assertEqual(len(body['error_id']),12)
+        # the server must still be alive and serving other requests afterward
+        self.assertEqual(self.req('/api/runbooks')[0],200)
+    def test_admin_can_trigger_and_list_database_backups(self):
+        with tempfile.TemporaryDirectory() as backup_dir:
+            with patch('server.BACKUP_DIR', __import__('pathlib').Path(backup_dir)):
+                code,created=self.req('/api/admin/backups','POST',{})
+                self.assertEqual(code,201)
+                self.assertTrue(created['data']['filename'].startswith('flowops-'))
+                self.assertGreater(created['data']['size_bytes'],0)
+                code,listed=self.req('/api/admin/backups')
+                self.assertEqual(code,200)
+                filenames=[b['filename'] for b in listed['data']['backups']]
+                self.assertIn(created['data']['filename'],filenames)
+    def test_backup_retention_deletes_oldest_beyond_retain_limit(self):
+        with tempfile.TemporaryDirectory() as backup_dir:
+            with patch('server.BACKUP_DIR', __import__('pathlib').Path(backup_dir)), patch('server.BACKUP_RETAIN', 2):
+                for _ in range(4): server.backup_database()
+                self.assertEqual(len(server.list_backups()), 2)
+    def test_api_token_requests_are_rate_limited(self):
+        code,token=self.req('/api/admin/api-tokens','POST',{'name':'Rate limit probe','scopes':['runbooks:read']})
+        self.assertEqual(code,201)
+        def bearer_get(token):
+            request=urllib.request.Request(self.base+'/api/runbooks',headers={'Authorization':f'Bearer {token}'})
+            try:
+                with urllib.request.urlopen(request) as res:return res.status
+            except urllib.error.HTTPError as err:return err.code
+        with patch('server.API_RATE_LIMIT', 3):
+            statuses=[bearer_get(token['data']['token']) for _ in range(5)]
+        self.assertEqual(statuses[:3], [200,200,200])
+        self.assertIn(429, statuses[3:])
     def test_realtime_feed_emits_after_change(self):
         stream=self.opener.open(self.base+'/api/events',timeout=4)
         self.assertEqual(stream.readline().decode().strip(),'event: connected')
