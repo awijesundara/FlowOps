@@ -17,6 +17,17 @@ os.environ['FLOWOPS_PREVIEW_TOKENS']='true'
 os.environ['FLOWOPS_SETTINGS_ENCRYPTION_KEY']='a1J1M20wV3JlbklvNWt1a2NTYk9pQ3VHTW5PRzFjTFI='
 import server
 
+def unrestricted_urlopen(url,data=None,headers=None,method='GET',timeout=8,allow_private_network=False,max_redirects=3):
+    """A drop-in replacement for server.safe_urlopen used ONLY to bypass the
+    SSRF loopback rejection in tests that need to point at a real receiver
+    running on 127.0.0.1 (there's no other practical way to run a real HTTP
+    server in this test environment) -- the SSRF *validation* itself stays
+    untouched and is separately covered by its own dedicated tests; this
+    only swaps out the destination check for these specific real-receiver
+    tests, mirroring how ServiceOps's own test suite handles the identical
+    tension for its own (unconditional) loopback rejection."""
+    return urllib.request.urlopen(urllib.request.Request(url,data=data,headers=headers or {},method=method),timeout=timeout)
+
 class FlowOpsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -426,16 +437,17 @@ class FlowOpsTest(unittest.TestCase):
             _,created=self.req('/api/runbooks','POST',{'name':'Automation success'}); rid=created['data']['id']
             _,task=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Call webhook','task_type':'automation','automation_url':f'http://127.0.0.1:{receiver.server_port}/hook'}); tid=task['data']['tasks'][0]['id']
             self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'}); self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
-            code,started=self.req(f'/api/tasks/{tid}','PATCH',{'status':'running'})
-            self.assertEqual(code,200)
-            started_task=next(t for t in started['data']['tasks'] if t['id']==tid)
-            self.assertEqual(started_task['status'],'running')
-            self.assertEqual(started_task['automation_status'],'queued')
-            for _ in range(50):
-                _,doc=self.req(f'/api/runbooks/{rid}')
-                task_now=next(t for t in doc['data']['tasks'] if t['id']==tid)
-                if task_now['status']=='complete': break
-                time.sleep(0.1)
+            with patch('server.safe_urlopen',unrestricted_urlopen):
+                code,started=self.req(f'/api/tasks/{tid}','PATCH',{'status':'running'})
+                self.assertEqual(code,200)
+                started_task=next(t for t in started['data']['tasks'] if t['id']==tid)
+                self.assertEqual(started_task['status'],'running')
+                self.assertEqual(started_task['automation_status'],'queued')
+                for _ in range(50):
+                    _,doc=self.req(f'/api/runbooks/{rid}')
+                    task_now=next(t for t in doc['data']['tasks'] if t['id']==tid)
+                    if task_now['status']=='complete': break
+                    time.sleep(0.1)
             self.assertEqual(task_now['status'],'complete')
             self.assertEqual(task_now['automation_status'],'success')
             self.assertEqual(task_now['automation_attempts'],1)
@@ -443,6 +455,72 @@ class FlowOpsTest(unittest.TestCase):
             self.assertEqual(received[0]['task_id'],tid)
         finally:
             receiver.shutdown()
+    def test_automation_task_carries_runbooks_configured_context_header_and_variable(self):
+        import http.server as http_server_module
+        received=[]
+        class Receiver(http_server_module.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length=int(self.headers.get('Content-Length','0'))
+                received.append({'path':self.path,'header':self.headers.get('X-Tenant',''),'body':self.rfile.read(length)})
+                self.send_response(200); self.end_headers(); self.wfile.write(b'{"ok":true}')
+            def log_message(self,*a): pass
+        receiver=http_server_module.HTTPServer(('127.0.0.1',0),Receiver)
+        threading.Thread(target=receiver.serve_forever,daemon=True).start()
+        try:
+            _,created=self.req('/api/runbooks','POST',{'name':'Context-aware release'}); rid=created['data']['id']
+            code,updated=self.req(f'/api/runbooks/{rid}','PATCH',{'automation_context':{'headers':{'X-Tenant':'acme-corp'},'variables':{'env':'prod'}}})
+            self.assertEqual(code,200)
+            self.assertEqual(updated['data']['automation_context'],{'headers':{'X-Tenant':'acme-corp'},'variables':{'env':'prod'}})
+            _,task=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Deploy','task_type':'automation','automation_url':f'http://127.0.0.1:{receiver.server_port}/hook?target={{{{env}}}}'}); tid=task['data']['tasks'][0]['id']
+            self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'}); self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+            with patch('server.safe_urlopen',unrestricted_urlopen):
+                self.req(f'/api/tasks/{tid}','PATCH',{'status':'running'})
+                for _ in range(50):
+                    _,doc=self.req(f'/api/runbooks/{rid}')
+                    task_now=next(t for t in doc['data']['tasks'] if t['id']==tid)
+                    if task_now['status']=='complete': break
+                    time.sleep(0.1)
+            self.assertEqual(task_now['status'],'complete')
+            self.assertEqual(len(received),1)
+            self.assertEqual(received[0]['header'],'acme-corp')
+            self.assertEqual(received[0]['path'],'/hook?target=prod')
+        finally:
+            receiver.shutdown()
+    def test_task_test_fire_reaches_receiver_without_touching_task_state(self):
+        import http.server as http_server_module
+        received=[]
+        class Receiver(http_server_module.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length=int(self.headers.get('Content-Length','0'))
+                received.append(json.loads(self.rfile.read(length)))
+                self.send_response(200); self.end_headers(); self.wfile.write(b'{"ok":true}')
+            def log_message(self,*a): pass
+        receiver=http_server_module.HTTPServer(('127.0.0.1',0),Receiver)
+        threading.Thread(target=receiver.serve_forever,daemon=True).start()
+        try:
+            _,created=self.req('/api/runbooks','POST',{'name':'Test-fire check'}); rid=created['data']['id']
+            _,task=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Deploy','task_type':'automation','automation_url':f'http://127.0.0.1:{receiver.server_port}/hook'}); tid=task['data']['tasks'][0]['id']
+            before=next(t for t in task['data']['tasks'] if t['id']==tid)
+            with patch('server.safe_urlopen',unrestricted_urlopen):
+                code,fired=self.req(f'/api/tasks/{tid}/test-fire','POST',{})
+            self.assertEqual(code,200)
+            self.assertTrue(fired['data']['ok'])
+            self.assertEqual(len(received),1)
+            self.assertTrue(received[0].get('test'))
+            _,doc=self.req(f'/api/runbooks/{rid}')
+            after=next(t for t in doc['data']['tasks'] if t['id']==tid)
+            self.assertEqual(after['status'],before['status'])
+            self.assertEqual(after['automation_status'],before['automation_status'])
+            self.assertEqual(after['automation_attempts'],before['automation_attempts'])
+            audit_actions=[a['action'] for a in doc['data']['audit']]
+            self.assertEqual(audit_actions.count('task.automation_test_fired'),1)
+        finally:
+            receiver.shutdown()
+    def test_task_test_fire_requires_automation_url(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'No URL check'}); rid=created['data']['id']
+        _,task=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Normal task'}); tid=task['data']['tasks'][0]['id']
+        code,body=self.req(f'/api/tasks/{tid}/test-fire','POST',{})
+        self.assertEqual(code,400)
     def test_automation_task_failure_allows_retry_and_audited_skip(self):
         _,created=self.req('/api/runbooks','POST',{'name':'Automation failure'}); rid=created['data']['id']
         _,task=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Call dead endpoint','task_type':'automation','automation_url':'http://127.0.0.1:1/nowhere'}); tid=task['data']['tasks'][0]['id']
@@ -530,8 +608,9 @@ class FlowOpsTest(unittest.TestCase):
             code,teamsHook=self.req('/api/admin/webhooks','POST',{'name':'Teams channel','url':f'http://127.0.0.1:{receiver_port}/teams','provider':'teams','events':['*']})
             self.assertEqual(code,201)
             self.assertEqual(self.req('/api/admin/webhooks','POST',{'name':'Bad provider','url':f'http://127.0.0.1:{receiver_port}/x','provider':'discord'})[0],400)
-            self.req(f"/api/admin/webhooks/{slackHook['data']['id']}/test",'POST',{})
-            self.req(f"/api/admin/webhooks/{teamsHook['data']['id']}/test",'POST',{})
+            with patch('server.safe_urlopen',unrestricted_urlopen):
+                self.req(f"/api/admin/webhooks/{slackHook['data']['id']}/test",'POST',{})
+                self.req(f"/api/admin/webhooks/{teamsHook['data']['id']}/test",'POST',{})
             self.assertEqual(len(received),2)
             slack_payload=json.loads(received[0]['body'])
             self.assertIn('text',slack_payload)
@@ -583,7 +662,8 @@ class FlowOpsTest(unittest.TestCase):
             self.assertEqual(code,201)
             self.assertTrue(created['data']['secret'])
             webhook_id=created['data']['id']
-            code,tested=self.req(f'/api/admin/webhooks/{webhook_id}/test','POST',{})
+            with patch('server.safe_urlopen',unrestricted_urlopen):
+                code,tested=self.req(f'/api/admin/webhooks/{webhook_id}/test','POST',{})
             self.assertEqual(code,200)
             self.assertEqual(len(received),1)
             payload=json.loads(received[0]['body'])
@@ -599,6 +679,37 @@ class FlowOpsTest(unittest.TestCase):
             self.assertFalse(any(w['id']==webhook_id for w in listedAfter['data']))
         finally:
             receiver.shutdown()
+    def test_webhook_test_fire_against_loopback_is_rejected_before_any_connection(self):
+        code,created=self.req('/api/admin/webhooks','POST',{'name':'Loopback attempt','url':'http://127.0.0.1:9/hook','events':['*']})
+        self.assertEqual(code,201)
+        code,tested=self.req(f"/api/admin/webhooks/{created['data']['id']}/test",'POST',{})
+        self.assertEqual(code,502)
+        self.assertIn('non-routable or private address',tested['error'])
+    def test_ssrf_address_validation_rejects_private_ranges_and_allows_public(self):
+        # Unit-level: exercise resolve_endpoint_addresses_safely() directly
+        # against literal IPs (no DNS dependency, so this can't be flaky in
+        # a CI environment without real internet access) to prove both
+        # halves: over-blocking a legitimate public destination would be as
+        # real a bug as under-blocking a private one.
+        for literal in ('http://127.0.0.1/x','http://169.254.169.254/latest/meta-data/','http://10.0.0.5/x','http://[::1]/x'):
+            ok,_,_=server.resolve_endpoint_addresses_safely(literal)
+            self.assertFalse(ok,f'{literal} must be rejected')
+        ok,hostname,infos=server.resolve_endpoint_addresses_safely('http://8.8.8.8/x')
+        self.assertTrue(ok); self.assertIsNone(hostname); self.assertIsNone(infos)
+        # allow_private_network=True (trusted, admin-configured integrations
+        # like ServiceNow) permits ordinary private ranges but never loopback.
+        self.assertTrue(server.resolve_endpoint_addresses_safely('http://10.0.0.5/x',allow_private_network=True)[0])
+        self.assertFalse(server.resolve_endpoint_addresses_safely('http://127.0.0.1/x',allow_private_network=True)[0])
+    def test_pin_resolved_addresses_forces_the_pinned_answer_for_the_same_host(self):
+        import socket as socket_module
+        fake_infos=[(socket_module.AF_INET,socket_module.SOCK_STREAM,6,'',('203.0.113.5',0))]
+        with server.pin_resolved_addresses('pinned.example',fake_infos):
+            result=socket_module.getaddrinfo('pinned.example',443)
+            self.assertEqual(result[0][4][0],'203.0.113.5')
+        # pin is cleared on exit -- a real lookup for an unrelated host must
+        # not be affected before, during, or after the pin is active.
+        with self.assertRaises(socket_module.gaierror):
+            socket_module.getaddrinfo('pinned.example',443)
     def test_cloudflare_access_sso_verifies_signature_audience_and_expiry(self):
         import base64 as b64
         import random
