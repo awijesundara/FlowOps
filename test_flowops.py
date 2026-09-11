@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import tempfile
@@ -518,6 +519,82 @@ class FlowOpsTest(unittest.TestCase):
             self.assertFalse(any(w['id']==webhook_id for w in listedAfter['data']))
         finally:
             receiver.shutdown()
+    def test_cloudflare_access_sso_verifies_signature_audience_and_expiry(self):
+        import base64 as b64
+        import random
+        def is_probable_prime(num, rounds=20):
+            if num < 2: return False
+            for small in (2,3,5,7,11,13,17,19,23,29,31,37):
+                if num % small == 0: return num == small
+            d, r = num - 1, 0
+            while d % 2 == 0: d //= 2; r += 1
+            for _ in range(rounds):
+                a = random.randrange(2, num - 1)
+                x = pow(a, d, num)
+                if x in (1, num - 1): continue
+                for _ in range(r - 1):
+                    x = pow(x, 2, num)
+                    if x == num - 1: break
+                else: return False
+            return True
+        def gen_prime(bits):
+            while True:
+                candidate = random.getrandbits(bits) | (1 << (bits - 1)) | 1
+                if is_probable_prime(candidate): return candidate
+        random.seed(1234567)  # deterministic test run
+        p, q = gen_prime(512), gen_prime(512)
+        n = p * q
+        phi = (p - 1) * (q - 1)
+        e = 65537
+        d = pow(e, -1, phi)
+        def sign(message: bytes) -> bytes:
+            digest_info_prefix = bytes.fromhex("3031300d060960864801650304020105000420")
+            digest = hashlib.sha256(message).digest()
+            key_bytes = (n.bit_length() + 7) // 8
+            padded_len = key_bytes - 3 - len(digest_info_prefix) - len(digest)
+            em = b"\x00\x01" + b"\xff" * padded_len + b"\x00" + digest_info_prefix + digest
+            sig_int = pow(int.from_bytes(em, "big"), d, n)
+            return sig_int.to_bytes(key_bytes, "big")
+        def b64url(data: bytes) -> str:
+            return b64.urlsafe_b64encode(data).decode().rstrip("=")
+        kid = "test-key"
+        server._cf_access_jwks_cache["keys"] = {kid: (n, e)}
+        server._cf_access_jwks_cache["fetched_at"] = time.monotonic()
+        with patch.object(server, "CF_ACCESS_TEAM_DOMAIN", "test.cloudflareaccess.com"), patch.object(server, "CF_ACCESS_AUD", "test-aud"):
+            def make_jwt(email, aud="test-aud", exp=None, kid_used=kid, tamper=False):
+                header = b64url(json.dumps({"alg": "RS256", "kid": kid_used}).encode())
+                payload = b64url(json.dumps({"email": email, "aud": [aud], "exp": exp if exp is not None else int(time.time()) + 300}).encode())
+                signing_input = f"{header}.{payload}".encode()
+                sig = sign(signing_input)
+                if tamper:
+                    payload = b64url(json.dumps({"email": "attacker@example.com", "aud": [aud], "exp": int(time.time()) + 300}).encode())
+                return f"{header}.{payload}.{b64url(sig)}"
+            def sso_request(token):
+                request = urllib.request.Request(self.base + '/api/auth/sso', data=b'{}', method='POST', headers={'Content-Type': 'application/json', 'Cf-Access-Jwt-Assertion': token})
+                try:
+                    with urllib.request.urlopen(request) as res: return res.status, json.load(res)
+                except urllib.error.HTTPError as err: return err.code, json.load(err)
+            # No matching FlowOps account for this verified email
+            code, body = sso_request(make_jwt("nobody@example.com"))
+            self.assertEqual(code, 404)
+            # Valid signature, correct email, matches the seeded admin -> logs in with no password
+            code, body = sso_request(make_jwt("admin@flowops.local"))
+            self.assertEqual(code, 200)
+            self.assertEqual(body['data']['username'], 'admin')
+            # Tampering with the payload after signing must invalidate the signature
+            code, body = sso_request(make_jwt("admin@flowops.local", tamper=True))
+            self.assertEqual(code, 401)
+            # Wrong audience must be rejected even with a valid signature
+            code, body = sso_request(make_jwt("admin@flowops.local", aud="some-other-app"))
+            self.assertEqual(code, 401)
+            # Expired token must be rejected even with a valid signature
+            code, body = sso_request(make_jwt("admin@flowops.local", exp=int(time.time()) - 10))
+            self.assertEqual(code, 401)
+            # Unknown kid (not in the JWKS) must be rejected
+            code, body = sso_request(make_jwt("admin@flowops.local", kid_used="not-a-real-kid"))
+            self.assertEqual(code, 401)
+        code, body = sso_request(make_jwt("admin@flowops.local"))
+        self.assertEqual(code, 401)  # feature disabled again once CF_ACCESS_TEAM_DOMAIN/AUD are unpatched
     def test_api_token_scopes_grant_bearer_access_without_csrf(self):
         code,readToken=self.req('/api/admin/api-tokens','POST',{'name':'CI reader','scopes':['runbooks:read']})
         self.assertEqual(code,201)
