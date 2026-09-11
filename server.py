@@ -1078,7 +1078,19 @@ class Handler(BaseHTTPRequestHandler):
                 folder_clause=""; params=[actor["instance_id"]]
                 if query.get("folder_id"):
                     folder_clause="AND r.folder_id=?"; params.append(int(query["folder_id"][0]))
-                items=rows(db.execute(f"SELECT r.*,w.name workspace_name,f.name folder_name,rt.name runbook_type_name,rt.icon runbook_type_icon,rt.color runbook_type_color,COUNT(t.id) task_count,SUM(CASE WHEN t.status='complete' THEN 1 ELSE 0 END) done_count FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id LEFT JOIN folders f ON f.id=r.folder_id LEFT JOIN runbook_types rt ON rt.id=r.runbook_type_id LEFT JOIN tasks t ON t.runbook_id=r.id WHERE w.instance_id=? {archived_clause} {folder_clause} GROUP BY r.id ORDER BY r.updated_at DESC",params))
+                search_clause=""
+                q=(query.get("q",[""])[0]).strip()
+                task_owner_join="LEFT JOIN users su ON su.id=st.owner_user_id LEFT JOIN runbook_teams stt ON stt.id=st.owner_team_id"
+                if q:
+                    like=f"%{q}%"
+                    search_clause=f"AND (r.name LIKE ? OR r.owner LIKE ? OR r.serviceops_ticket LIKE ? OR EXISTS (SELECT 1 FROM tasks st {task_owner_join} WHERE st.runbook_id=r.id AND (st.title LIKE ? OR st.owner LIKE ? OR su.display_name LIKE ? OR stt.name LIKE ?)))"
+                    params+= [like,like,like,like,like,like,like]
+                items=rows(db.execute(f"SELECT r.*,w.name workspace_name,f.name folder_name,rt.name runbook_type_name,rt.icon runbook_type_icon,rt.color runbook_type_color,COUNT(t.id) task_count,SUM(CASE WHEN t.status='complete' THEN 1 ELSE 0 END) done_count FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id LEFT JOIN folders f ON f.id=r.folder_id LEFT JOIN runbook_types rt ON rt.id=r.runbook_type_id LEFT JOIN tasks t ON t.runbook_id=r.id WHERE w.instance_id=? {archived_clause} {folder_clause} {search_clause} GROUP BY r.id ORDER BY r.updated_at DESC",params))
+                if q:
+                    like=f"%{q}%"
+                    for item in items:
+                        matched_task=db.execute(f"SELECT st.title FROM tasks st {task_owner_join} WHERE st.runbook_id=? AND (st.title LIKE ? OR st.owner LIKE ? OR su.display_name LIKE ? OR stt.name LIKE ?) LIMIT 1",(item["id"],like,like,like,like)).fetchone()
+                        item["matched_task"]=matched_task["title"] if matched_task and q.lower() not in item["name"].lower() else None
                 return self.send_json({"data":items})
             if path.startswith("/api/runbooks/"):
                 user=self.require(db,"runbooks:view")

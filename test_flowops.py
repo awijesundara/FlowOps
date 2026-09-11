@@ -601,6 +601,20 @@ class FlowOpsTest(unittest.TestCase):
     def test_dashboard_widgets_rejects_non_list_payload(self):
         code,body=self.req('/api/me/dashboard','PATCH',{'widgets':'runbook_activity'})
         self.assertEqual(code,400)
+    def test_runbook_search_matches_task_titles_and_owners_not_just_runbook_name(self):
+        self.req('/api/admin/users','POST',{'username':'priya','display_name':'Priya Shah','email':'priya@example.com','role':'Member','password':'Temporary!123'})
+        _,users=self.req('/api/admin/users'); user_id=next(u['id'] for u in users['data'] if u['username']=='priya')
+        _,created=self.req('/api/runbooks','POST',{'name':'Totally unrelated name'}); rid=created['data']['id']
+        self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Rotate database credentials','owner_user_id':user_id,'duration':10})
+        code,results=self.req('/api/runbooks?q=rotate+database')
+        self.assertEqual(code,200)
+        matched=[r for r in results['data'] if r['id']==rid]
+        self.assertEqual(len(matched),1)
+        self.assertEqual(matched[0]['matched_task'],'Rotate database credentials')
+        code,by_owner=self.req('/api/runbooks?q=priya')
+        self.assertIn(rid,[r['id'] for r in by_owner['data']])
+        code,no_match=self.req('/api/runbooks?q=zzz_nonexistent_zzz')
+        self.assertEqual(no_match['data'],[])
     def test_seed_runbook_has_backfilled_streams_on_fresh_install(self):
         _,doc=self.req('/api/runbooks/1')
         self.assertGreater(len(doc['data']['streams']),0)
