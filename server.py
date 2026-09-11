@@ -6,9 +6,11 @@ import csv
 import hashlib
 import hmac
 import io
+import ipaddress
 import json
 import os
 import secrets
+import socket
 import sqlite3
 import smtplib
 import ssl
@@ -179,6 +181,223 @@ def check_rate_limit(key: str) -> int | None:
     return None
 
 
+# --- SSRF-resistant outbound requests -------------------------------------
+# Every outbound call this app makes to an admin/user-supplied URL (webhook
+# delivery, automation task URLs, the ServiceNow connector) goes through
+# safe_urlopen() below rather than urllib.request.urlopen() directly, so a
+# maliciously or carelessly configured destination can't be used to probe
+# the pod's own loopback interface or other in-cluster services. Behavior
+# (not code) is modeled on ServiceOps's own webhook SSRF hardening
+# (serviceops_core/dns_pin.py, app.py's _integration_address_allowed()) --
+# ServiceOps uses the third-party `requests` library; this reimplements the
+# same protections with stdlib urllib/socket/ipaddress only, consistent
+# with this app's zero-dependency architecture.
+
+_dns_pin_local = threading.local()
+_real_getaddrinfo = socket.getaddrinfo
+
+
+def _dns_pin_matching_addresses(infos, port, family, type_, proto):
+    """The pin is captured via a bare socket.getaddrinfo(host, None), which
+    returns one entry per (address, socket-type) combination, all with
+    port 0. The real caller (urllib's HTTPConnection) asks for a specific
+    family/type/proto and a real port -- this filters the pinned entries to
+    what the caller actually asked for and substitutes the real port."""
+    port = 0 if port is None else port
+    matches = []
+    for fam, socktype, sockproto, canonname, sockaddr in infos:
+        if family and fam != family: continue
+        if type_ and socktype != type_: continue
+        if proto and sockproto != proto: continue
+        matches.append((fam, socktype, sockproto, canonname, (sockaddr[0], port) + tuple(sockaddr[2:])))
+    if not matches:
+        # Every pinned address was already validated safe regardless of
+        # socket type -- if the filter matches nothing, fall back to the
+        # full pinned set with the port substituted rather than silently
+        # resolving fresh (which would reopen the TOCTOU window this exists
+        # to close).
+        matches = [(fam, socktype, sockproto, canonname, (sockaddr[0], port) + tuple(sockaddr[2:])) for fam, socktype, sockproto, canonname, sockaddr in infos]
+    return matches
+
+
+def _dns_pin_patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    pins = getattr(_dns_pin_local, "pins", None)
+    if pins and host in pins:
+        return _dns_pin_matching_addresses(pins[host], port, family, type, proto)
+    return _real_getaddrinfo(host, port, family, type, proto, flags)
+
+
+if socket.getaddrinfo is not _dns_pin_patched_getaddrinfo:
+    socket.getaddrinfo = _dns_pin_patched_getaddrinfo
+
+
+class pin_resolved_addresses:
+    """Context manager: for the calling thread only, socket.getaddrinfo(host,
+    ...) returns exactly `infos` instead of performing a fresh DNS lookup --
+    closing the gap between validating a hostname's addresses and the HTTP
+    client's own, independent resolution of the same hostname a moment
+    later (classic DNS-rebinding TOCTOU). Always clears the pin on exit,
+    including on exception, so a failed delivery never leaves a stale pin
+    behind for a later, unrelated call on the same thread."""
+
+    def __init__(self, host: str, infos):
+        self.host = host; self.infos = infos
+
+    def __enter__(self):
+        pins = getattr(_dns_pin_local, "pins", None)
+        if pins is None:
+            pins = {}; _dns_pin_local.pins = pins
+        self._previous = pins.get(self.host)
+        pins[self.host] = self.infos
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback_obj):
+        pins = getattr(_dns_pin_local, "pins", None)
+        if pins is None: return False
+        if self._previous is None: pins.pop(self.host, None)
+        else: pins[self.host] = self._previous
+        return False
+
+
+def _integration_address_allowed(address: ipaddress.IPv4Address | ipaddress.IPv6Address, allow_private_network: bool) -> bool:
+    """True if `address` is safe to connect to. Loopback/link-local/
+    multicast/reserved/unspecified addresses are always rejected (they'd
+    point the request at the app's own host or network infrastructure
+    regardless of who configured the endpoint). Ordinary private-network
+    addresses (RFC1918 etc.) are rejected too UNLESS allow_private_network
+    is set -- opt-in, for trusted admin-configured integrations expected to
+    live on the internal network (e.g. ServiceNow reachable only via a
+    cluster-internal hostname), as opposed to arbitrary user-supplied
+    targets like webhook URLs."""
+    if address.is_loopback or address.is_link_local or address.is_multicast or address.is_reserved or address.is_unspecified:
+        return False
+    if address.is_global: return True
+    return allow_private_network and address.is_private
+
+
+def resolve_endpoint_addresses_safely(endpoint: str, allow_private_network: bool = False):
+    """Re-resolves endpoint's hostname and rejects it if any A/AAAA record
+    is disallowed -- closes the gap a literal-string check alone can't (a
+    public-looking hostname that resolves to a private address). Returns
+    (ok, hostname, infos): hostname is None when endpoint was already a
+    literal IP (nothing to pin, no resolver step to race); infos is the raw
+    socket.getaddrinfo() result, in the shape pin_resolved_addresses()
+    expects, for the caller to pin for the connection that follows."""
+    hostname = urllib.parse.urlparse(endpoint).hostname
+    if not hostname: return False, None, None
+    try:
+        address = ipaddress.ip_address(hostname)
+        return _integration_address_allowed(address, allow_private_network), None, None
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except OSError:
+        return False, hostname, None
+    if not infos: return False, hostname, None
+    for info in infos:
+        raw_address = info[4][0]
+        try:
+            if not _integration_address_allowed(ipaddress.ip_address(raw_address), allow_private_network):
+                return False, hostname, None
+        except ValueError:
+            return False, hostname, None
+    return True, hostname, infos
+
+
+class _NoAutoRedirectOrErrorOpener:
+    """A minimal urllib opener that returns every response as-is -- no
+    automatic redirect-following (urllib.request's default HTTPRedirectHandler
+    would silently reopen the SSRF hole on a 3xx to an unvalidated
+    destination) and no automatic HTTPError-on-non-2xx (so callers can
+    inspect response.status themselves, same as they'd check
+    response.status_code with requests' allow_redirects=False)."""
+    _opener = urllib.request.OpenerDirector()
+    for _handler in (urllib.request.ProxyHandler(), urllib.request.HTTPHandler(), urllib.request.HTTPSHandler(), urllib.request.UnknownHandler()):
+        _opener.add_handler(_handler)
+
+    @classmethod
+    def open(cls, request, timeout):
+        return cls._opener.open(request, timeout=timeout)
+
+
+def safe_urlopen(url: str, data: bytes | None = None, headers: dict[str, str] | None = None, method: str = "GET", timeout: float = 8, allow_private_network: bool = False, max_redirects: int = 3):
+    """SSRF-resistant, DNS-rebinding-resistant replacement for
+    urllib.request.urlopen(), used for every outbound call this app makes
+    to an admin/user-supplied destination. Validates and pins the resolved
+    addresses immediately before each connection attempt (including on
+    every redirect hop, re-validated and re-pinned, capped at
+    max_redirects, rather than trusting urllib to follow a redirect to an
+    unvalidated destination). Returns an opened response object (same
+    context-manager/.read()/.status interface as urlopen's) on success;
+    raises RuntimeError with a caller-safe message on any SSRF rejection or
+    network failure."""
+    target = url
+    for _ in range(max_redirects + 1):
+        ok, hostname, infos = resolve_endpoint_addresses_safely(target, allow_private_network)
+        if not ok:
+            raise RuntimeError("Destination resolves to a non-routable or private address")
+        request = urllib.request.Request(target, data=data, method=method, headers=headers or {})
+        try:
+            if hostname and infos:
+                with pin_resolved_addresses(hostname, infos):
+                    response = _NoAutoRedirectOrErrorOpener.open(request, timeout)
+            else:
+                response = _NoAutoRedirectOrErrorOpener.open(request, timeout)
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError(str(exc)[:300]) from exc
+        if response.status in (301, 302, 303, 307, 308):
+            location = response.headers.get("Location", "")
+            response.close()
+            if not location:
+                raise RuntimeError("Redirect response missing Location header")
+            target = urllib.parse.urljoin(target, location)
+            continue
+        return response
+    raise RuntimeError("Too many redirects")
+
+
+def automation_context(db: sqlite3.Connection, runbook_id: int) -> dict[str, Any]:
+    """A runbook's admin-configured extra headers/variables for its
+    automation task calls (Epic 3.1 'automatic context') -- flat key/value
+    only, no conditionals/loops, applied to every automation task fired
+    from that runbook. Returns {} if none configured."""
+    row = db.execute("SELECT automation_context_json FROM runbooks WHERE id=?", (runbook_id,)).fetchone()
+    if not row or not row["automation_context_json"]: return {"headers": {}, "variables": {}}
+    try:
+        parsed = json.loads(row["automation_context_json"])
+    except json.JSONDecodeError:
+        return {"headers": {}, "variables": {}}
+    return {"headers": parsed.get("headers") or {}, "variables": parsed.get("variables") or {}}
+
+
+def apply_automation_context(url: str, body: bytes, context: dict[str, Any]) -> tuple[str, bytes]:
+    """Flat {{var}} substitution into the automation URL and JSON body
+    using the runbook's configured variables -- deliberately simple string
+    substitution, not a templating engine, to avoid scope creep."""
+    variables = context.get("variables") or {}
+    if not variables: return url, body
+    def substitute(text: str) -> str:
+        for key, value in variables.items():
+            text = text.replace("{{" + key + "}}", str(value))
+        return text
+    return substitute(url), substitute(body.decode()).encode()
+
+
+def perform_automation_call(url: str, headers: dict[str, str], body: bytes, timeout: float = 30, allow_private_network: bool = False) -> tuple[bool, str]:
+    """Fires one automation HTTP call through safe_urlopen (SSRF-resistant).
+    Never raises -- callers get a uniform (status_ok, snippet) pass/fail
+    result and a truncated response/error snippet for storage."""
+    try:
+        response = safe_urlopen(url, data=body, headers=headers, method="POST", timeout=timeout, allow_private_network=allow_private_network)
+        with response:
+            status_ok = 200 <= response.status < 300
+            snippet = response.read(2000).decode(errors="replace")
+    except Exception as exc:
+        status_ok, snippet = False, f"{type(exc).__name__}: {exc}"
+    return status_ok, snippet
+
+
 def run_automation_task(task_id: int, request_id: str) -> None:
     """Executes an 'automation' task's outbound HTTP call in the background so
     the triggering request returns immediately with 'queued'/'running' state;
@@ -190,14 +409,12 @@ def run_automation_task(task_id: int, request_id: str) -> None:
         db.execute("UPDATE tasks SET automation_status='running', automation_attempts=automation_attempts+1 WHERE id=?", (task_id,))
         append_audit(db, task["runbook_id"], "task.automation_running", f"{task['title']}: calling {task['automation_url']}", "FlowOps automation")
         db.commit()
-    try:
-        body = json.dumps({"request_id": request_id, "task_id": task_id, "task_title": task["title"]}).encode()
-        request = urllib.request.Request(task["automation_url"], data=body, method="POST", headers={"Content-Type": "application/json", "X-Request-ID": request_id})
-        with urllib.request.urlopen(request, timeout=30) as response:
-            status_ok = 200 <= response.status < 300
-            snippet = response.read(2000).decode(errors="replace")
-    except Exception as exc:
-        status_ok, snippet = False, f"{type(exc).__name__}: {exc}"
+        context = automation_context(db, task["runbook_id"])
+    body = json.dumps({"request_id": request_id, "task_id": task_id, "task_title": task["title"]}).encode()
+    url = task["automation_url"]
+    headers = {"Content-Type": "application/json", "X-Request-ID": request_id, **context["headers"]}
+    url, body = apply_automation_context(url, body, context)
+    status_ok, snippet = perform_automation_call(url, headers, body)
     with connect() as db:
         task = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not task: return
@@ -452,7 +669,9 @@ def init_db() -> None:
         if "provider" not in webhook_columns: db.execute("ALTER TABLE webhooks ADD COLUMN provider TEXT NOT NULL DEFAULT 'generic'")
         for column,definition in {
           "serviceops_type":"TEXT","serviceops_title":"TEXT","serviceops_state":"TEXT",
-          "serviceops_priority":"TEXT","serviceops_synced_at":"TEXT","serviceops_request_id":"TEXT"
+          "serviceops_priority":"TEXT","serviceops_synced_at":"TEXT","serviceops_request_id":"TEXT",
+          "automation_context_json":"TEXT",
+          "servicenow_change_number":"TEXT","servicenow_sys_id":"TEXT","servicenow_state":"TEXT","servicenow_synced_at":"TEXT"
         }.items():
             if column not in columns: db.execute(f"ALTER TABLE runbooks ADD COLUMN {column} {definition}")
         task_columns={row[1] for row in db.execute("PRAGMA table_info(tasks)")}
@@ -810,13 +1029,12 @@ def deliver_webhook_once(webhook: dict[str, Any], event: dict[str, Any]) -> tupl
         headers["X-FlowOps-Event"] = event["action"]
     last_error = None; status = None
     for attempt in range(1, 4):
-        request = urllib.request.Request(webhook["url"], data=body, method="POST", headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=8) as response:
-                return response.status, None, attempt
-        except urllib.error.HTTPError as exc:
-            status = exc.code; last_error = f"HTTP {exc.code}"
-        except (urllib.error.URLError, TimeoutError) as exc:
+            with safe_urlopen(webhook["url"], data=body, headers=headers, method="POST", timeout=8) as response:
+                if 200 <= response.status < 300:
+                    return response.status, None, attempt
+                status = response.status; last_error = f"HTTP {response.status}"
+        except RuntimeError as exc:
             status = None; last_error = str(exc)[:300]
         if attempt < 3: time.sleep(attempt * 2)
     return status, last_error, 3
@@ -888,6 +1106,8 @@ def runbook_document(db: sqlite3.Connection, rid: int, user: dict[str,Any] | Non
     doc = dict(rb)
     raw_review = doc.pop("review_json", None)
     doc["review"] = json.loads(raw_review) if raw_review else None
+    raw_automation_context = doc.pop("automation_context_json", None)
+    doc["automation_context"] = json.loads(raw_automation_context) if raw_automation_context else {"headers":{},"variables":{}}
     doc["runbook_type_requires_approval"] = bool(db.execute("SELECT requires_approval FROM runbook_types WHERE id=?",(doc["runbook_type_id"],)).fetchone()[0]) if doc.get("runbook_type_id") else False
     all_tasks = rows(db.execute("SELECT t.*,u.display_name owner_user_name,rt.name owner_team_name FROM tasks t LEFT JOIN users u ON u.id=t.owner_user_id LEFT JOIN runbook_teams rt ON rt.id=t.owner_team_id WHERE t.runbook_id=? ORDER BY t.sort_order,t.id", (rid,)))
     deps = rows(db.execute("SELECT d.task_id,d.depends_on_id FROM dependencies d JOIN tasks t ON t.id=d.task_id WHERE t.runbook_id=?", (rid,)))
@@ -1740,6 +1960,24 @@ class Handler(BaseHTTPRequestHandler):
                 db.execute("INSERT INTO webhook_deliveries(webhook_id,audit_id,event_type,success,status_code,error,attempts,attempted_at) VALUES(?,?,?,?,?,?,?,?)",(webhook_id,None,"webhook.test",1 if status and 200<=status<300 else 0,status,error,attempts,now())); db.commit()
                 if status and 200<=status<300: return self.send_json({"data":{"ok":True,"status_code":status}})
                 return self.send_json({"error":error or f"HTTP {status}"},502)
+            if path.startswith("/api/tasks/") and path.endswith("/test-fire"):
+                try: tid=int(path.strip("/").split("/")[2])
+                except (ValueError,IndexError): return self.send_json({"error":"Not found"},404)
+                precheck=self.current_user(db)
+                if not precheck: return self.send_json({"error":"Authentication required"},401)
+                task=db.execute("SELECT t.* FROM tasks t JOIN runbooks r ON r.id=t.runbook_id JOIN workspaces w ON w.id=r.workspace_id WHERE t.id=? AND w.instance_id=?",(tid,precheck["instance_id"])).fetchone()
+                if not task: return self.send_json({"error":"Not found"},404)
+                actor=self.require_scoped_edit(db,runbook_id=task["runbook_id"])
+                if not actor:return
+                if task["task_type"]!="automation" or not task["automation_url"]:
+                    return self.send_json({"error":"This task has no automation URL configured"},400)
+                context=automation_context(db,task["runbook_id"])
+                body=json.dumps({"request_id":f"test-fire-{tid}","task_id":tid,"task_title":task["title"],"test":True}).encode()
+                url,body=apply_automation_context(task["automation_url"],body,context)
+                headers={"Content-Type":"application/json","X-Request-ID":f"test-fire-{tid}",**context["headers"]}
+                status_ok,snippet=perform_automation_call(url,headers,body,timeout=15)
+                append_audit(db,task["runbook_id"],"task.automation_test_fired",f"{task['title']}: {'success' if status_ok else 'failed'} ({snippet[:200]})",actor["display_name"]); db.commit()
+                return self.send_json({"data":{"ok":status_ok,"result":snippet[:2000]}})
             if path=="/api/admin/invitations":
                 actor=self.require(db,"admin:users")
                 if not actor:return
@@ -2296,6 +2534,13 @@ class Handler(BaseHTTPRequestHandler):
                         if parent["parent_runbook_id"]: return self.send_json({"error":"That runbook is already a child of another runbook; linking supports only one level of nesting"},400)
                         if db.execute("SELECT 1 FROM runbooks WHERE parent_runbook_id=?",(rid,)).fetchone(): return self.send_json({"error":"This runbook already has its own linked children; linking supports only one level of nesting"},400)
                     if parent_id!=runbook["parent_runbook_id"]: changes.append("parent_runbook_id changed"); sets.append("parent_runbook_id=?"); values.append(parent_id)
+                if isinstance(payload.get("automation_context"),dict):
+                    context=payload["automation_context"]
+                    headers={str(k)[:100]:str(v)[:500] for k,v in (context.get("headers") or {}).items() if isinstance(k,str)}
+                    variables={str(k)[:100]:str(v)[:500] for k,v in (context.get("variables") or {}).items() if isinstance(k,str)}
+                    encoded=json.dumps({"headers":headers,"variables":variables})
+                    if encoded!=(runbook["automation_context_json"] or ""):
+                        changes.append("automation_context changed"); sets.append("automation_context_json=?"); values.append(encoded)
                 field_changes=apply_custom_field_values(db,runbook["workspace_id"],"runbook",rid,payload.get("custom_fields",{})) if isinstance(payload.get("custom_fields"),dict) else []
                 if not changes and not field_changes: return self.send_json({"data":runbook_document(db,rid,actor)})
                 ticket_linked="serviceops_ticket" in payload and str(payload["serviceops_ticket"]).strip()[:40]!=runbook["serviceops_ticket"] and str(payload["serviceops_ticket"]).strip()

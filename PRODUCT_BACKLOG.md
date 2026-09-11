@@ -334,11 +334,80 @@ and central team rosters.
 
 ### Epic 3.1 — Integration Framework
 
-Named connections (P0/M), API key/basic/bearer/OAuth authentication (P0/L),
-automatic context (P1/M), and sandbox action tests (P0/M) remain `BACKLOG`
--- there is still no reusable, named "connection" abstraction with its own
-stored credentials; an automation task's URL is per-task, not backed by a
-shared, admin-managed connection profile.
+Named connections (P0/M) and API key/basic/bearer/OAuth authentication
+(P0/L) remain `BACKLOG` -- explicitly deferred (2026-09-11, product-owner
+direction): there is still no reusable, named "connection" abstraction
+with its own stored credentials; an automation task's URL is per-task,
+not backed by a shared, admin-managed connection profile.
+
+Automatic context (P1/M): `DONE` (2026-09-11), scoped to the existing
+per-task `automation_url` mechanism rather than a connection record (since
+connections themselves are deferred, above). `runbooks.automation_context_json`
+stores admin/Editor-configured extra headers and `{{var}}` substitution
+values (`PATCH /api/runbooks/{id}` accepts an `automation_context` object);
+`run_automation_task()` merges the configured headers and does flat
+string substitution into the automation URL and request body -- no
+templating engine, just literal `{{name}}` replacement, to avoid scope
+creep. Surfaced as an "Automation context" sidebar card on the runbook
+detail view (Editor/Admin only). Covered by
+`test_automation_task_carries_runbooks_configured_context_header_and_variable`
+(a real receiver confirms both the injected header and the substituted
+URL query parameter).
+
+Sandbox action tests (P0/M): `DONE` (2026-09-11), likewise scoped to
+`automation_url` rather than a connection. `POST /api/tasks/{id}/test-fire`
+fires the task's existing automation URL (through the same
+SSRF-hardened `perform_automation_call()` every other automation call
+uses) without touching the task's own `status`/`automation_status`/
+`automation_attempts` -- audited as `task.automation_test_fired`, a
+distinctly-named event from a real production run. Gated by the same
+`runbooks:edit`/workspace-scoped permission as every other task mutation
+(not a separate admin capability, since there's no connection-level owner
+to scope it to). A "🧪 Test" button appears next to every automation
+task with a configured URL. Covered by
+`test_task_test_fire_reaches_receiver_without_touching_task_state` (a
+real receiver, exactly one `task.automation_test_fired` audit row, task
+status/automation fields provably unchanged before/after) and
+`test_task_test_fire_requires_automation_url`.
+
+SSRF hardening (Epic 3.5, P0 -- security): `DONE` (2026-09-11). Every
+outbound call this app makes to an admin/user-supplied destination --
+webhook delivery, automation task URLs -- now goes through a new
+`safe_urlopen()` instead of `urllib.request.urlopen()` directly.
+Behavior (not code) modeled on ServiceOps's own webhook SSRF hardening
+(`serviceops_core/dns_pin.py`, `app.py`'s `_integration_address_allowed()`)
+-- ServiceOps uses the third-party `requests` library; this reimplements
+the same protections with stdlib `urllib`/`socket`/`ipaddress` only, to
+stay within this app's zero-dependency architecture.
+`_integration_address_allowed()` rejects loopback/link-local/multicast/
+reserved/unspecified addresses unconditionally and ordinary private
+ranges unless an explicit `allow_private_network` flag is set (opt-in,
+for trusted admin-configured integrations expected to reach in-cluster
+hosts -- not used by webhooks/automation URLs today, but available for
+the ServiceNow connector below). `resolve_endpoint_addresses_safely()`
+re-resolves at delivery time and validates every A/AAAA record, closing
+the gap a literal-string hostname check alone can't catch (a
+public-looking hostname resolving to a private address). A
+`pin_resolved_addresses` context manager (a `threading.local`-scoped
+monkeypatch of `socket.getaddrinfo`) forces the connection that follows
+to use exactly the addresses just validated, closing the classic
+DNS-rebinding TOCTOU gap between validation and connection. Redirects are
+followed manually (a minimal custom `urllib` opener with no automatic
+redirect-following or HTTPError-raising), re-validating and re-pinning on
+every hop, capped at 3. The existing MicroK8s NetworkPolicy egress
+restriction remains defense-in-depth, not a substitute. Covered by
+`test_webhook_test_fire_against_loopback_is_rejected_before_any_connection`
+(end-to-end: a real API call, real 502, real error message),
+`test_ssrf_address_validation_rejects_private_ranges_and_allows_public`
+(unit-level, no DNS dependency -- proves both under- and over-blocking are
+real bugs), and `test_pin_resolved_addresses_forces_the_pinned_answer_for_the_same_host`
+(proves the pinning mechanism itself, since simulating true DNS rebinding
+isn't practical without controlling DNS). Existing webhook/automation
+tests that legitimately need a real receiver on `127.0.0.1` now bypass
+only the SSRF *destination check* for that one call (never the validation
+logic itself, which has its own dedicated tests above) -- the identical
+technique ServiceOps's own test suite uses for the same unconditional-
+loopback-rejection tension.
 
 Triggered actions with URL and payload template (P0/L) and auto-complete
 on success (P1/M): `DONE` (2026-09-11) via a new `automation` task type.
