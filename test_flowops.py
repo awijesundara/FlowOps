@@ -766,6 +766,20 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(self.req(f'/api/tasks/{assigned_id}','PATCH',{'status':'complete'})[0],200)
         self.assertEqual(self.req(f'/api/tasks/{unassigned_id}','PATCH',{'status':'running'})[0],403)
         self.__class__.opener,self.__class__.csrf=admin_opener,admin_csrf
+    def test_member_runbook_list_only_shows_runbooks_with_an_assigned_task(self):
+        _,users=self.req('/api/admin/users');operator_id=next(u['id'] for u in users['data'] if u['username']=='operator')
+        _,assigned_rb=self.req('/api/runbooks','POST',{'name':'Member visible runbook'});assigned_rid=assigned_rb['data']['id']
+        _,team=self.req(f'/api/runbooks/{assigned_rid}/teams','POST',{'name':'Visible Team','user_ids':[operator_id]});team_id=team['data']['id']
+        self.req(f'/api/runbooks/{assigned_rid}/tasks','POST',{'title':'Member task','owner_team_id':team_id})
+        _,hidden_rb=self.req('/api/runbooks','POST',{'name':'Member hidden runbook'});hidden_rid=hidden_rb['data']['id']
+        admin_opener,admin_csrf=self.opener,self.csrf
+        self.__class__.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()));self.__class__.csrf=''
+        _,login=self.req('/api/auth/login','POST',{'username':'operator','password':'Operator!Preview2026'});self.__class__.csrf=login['data']['csrf_token']
+        _,listing=self.req('/api/runbooks')
+        visible_ids={r['id'] for r in listing['data']}
+        self.assertIn(assigned_rid,visible_ids)
+        self.assertNotIn(hidden_rid,visible_ids)
+        self.__class__.opener,self.__class__.csrf=admin_opener,admin_csrf
     def test_realtime_feed_emits_after_change(self):
         stream=self.opener.open(self.base+'/api/events',timeout=4)
         self.assertEqual(stream.readline().decode().strip(),'event: connected')
