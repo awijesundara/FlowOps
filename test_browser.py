@@ -75,6 +75,45 @@ class FlowOpsBrowserTest(unittest.TestCase):
         titles = [r.inner_text() for r in rows]
         self.assertEqual(len(titles), len(set(titles)), "no category should be listed twice")
 
+    def test_enabling_push_notifications_registers_a_real_service_worker_and_subscribes(self):
+        self.page.context.grant_permissions(['notifications'], origin=self.base)
+        registration_scope = self.page.evaluate("""async () => {
+            const reg = await navigator.serviceWorker.register('/sw.js');
+            await navigator.serviceWorker.ready;
+            return reg.scope;
+        }""")
+        self.assertTrue(registration_scope.endswith('/'))
+        vapid_key = self.page.evaluate("""async () => {
+            const res = await fetch('/api/push/vapid-public-key');
+            const body = await res.json();
+            return body.data.public_key;
+        }""")
+        raw_point_length = self.page.evaluate("""(key) => {
+            const padding = '='.repeat((4 - key.length % 4) % 4);
+            const raw = atob((key + padding).replace(/-/g, '+').replace(/_/g, '/'));
+            return raw.length;
+        }""", vapid_key)
+        self.assertEqual(raw_point_length, 65, 'VAPID public key must be a real 65-byte uncompressed P-256 point')
+        try:
+            subscribed = self.page.evaluate("""async (key) => {
+                const padding = '='.repeat((4 - key.length % 4) % 4);
+                const raw = atob((key + padding).replace(/-/g, '+').replace(/_/g, '/'));
+                const applicationServerKey = Uint8Array.from([...raw].map(c => c.charCodeAt(0)));
+                const reg = await navigator.serviceWorker.ready;
+                const sub = await reg.pushManager.subscribe({userVisibleOnly: true, applicationServerKey});
+                const csrf = state.csrf;
+                const res = await fetch('/api/push/subscribe', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf},
+                    body: JSON.stringify(sub.toJSON()),
+                });
+                return {status: res.status, endpoint: sub.endpoint};
+            }""", vapid_key)
+        except Exception as exc:
+            self.skipTest(f'This browser/environment cannot reach a real push service to complete subscription: {exc}')
+        self.assertEqual(subscribed['status'], 201)
+        self.assertTrue(subscribed['endpoint'].startswith('http'))
+
     def test_switching_locale_to_japanese_translates_nav_and_falls_back_for_unknown_locale(self):
         self.page.click('[data-view="runbooks"]', force=True)
         self.page.wait_for_selector('#runbooks.view.active')

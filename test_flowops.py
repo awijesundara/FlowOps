@@ -993,6 +993,98 @@ class FlowOpsTest(unittest.TestCase):
         # not be affected before, during, or after the pin is active.
         with self.assertRaises(socket_module.gaierror):
             socket_module.getaddrinfo('pinned.example',443)
+    def test_vapid_jwt_is_a_real_ec_signature_verifiable_by_openssl_itself(self):
+        import subprocess,tempfile as tf,os as os_module
+        private_key_pem,public_key_b64url=server.generate_vapid_keypair()
+        self.assertTrue(public_key_b64url)
+        raw_point=base64.urlsafe_b64decode(public_key_b64url+'=='*((4-len(public_key_b64url)%4)%4))
+        self.assertEqual(len(raw_point),65); self.assertEqual(raw_point[0],0x04)
+        token=server.vapid_jwt(private_key_pem,'https://push.example.test','mailto:ops@example.test')
+        header_b64,payload_b64,sig_b64=token.split('.')
+        claims=json.loads(server._b64url_decode(payload_b64))
+        self.assertEqual(claims['aud'],'https://push.example.test')
+        self.assertEqual(claims['sub'],'mailto:ops@example.test')
+        self.assertGreater(claims['exp'],time.time())
+        # Verify the signature is real by asking openssl itself to check it --
+        # independent confirmation, not just re-running our own signer.
+        raw_sig=server._b64url_decode(sig_b64)
+        r,s=raw_sig[:32],raw_sig[32:]
+        def der_int(component):
+            component=component.lstrip(b'\x00') or b'\x00'
+            if component[0]&0x80: component=b'\x00'+component
+            return b'\x02'+bytes([len(component)])+component
+        der_body=der_int(r)+der_int(s)
+        der_sig=b'\x30'+bytes([len(der_body)])+der_body
+        with tf.TemporaryDirectory() as d:
+            priv_path=os_module.path.join(d,'priv.pem'); pub_path=os_module.path.join(d,'pub.pem'); sig_path=os_module.path.join(d,'sig.der')
+            open(priv_path,'w').write(private_key_pem)
+            subprocess.run(['openssl','ec','-in',priv_path,'-pubout','-out',pub_path],check=True,capture_output=True)
+            open(sig_path,'wb').write(der_sig)
+            result=subprocess.run(['openssl','dgst','-sha256','-verify',pub_path,'-signature',sig_path],
+                input=f'{header_b64}.{payload_b64}'.encode(),capture_output=True)
+            self.assertIn(b'Verified OK',result.stdout,result.stderr)
+    def test_push_subscribe_stores_and_unsubscribe_removes_a_real_subscription(self):
+        code,vapid=self.req('/api/push/vapid-public-key')
+        self.assertEqual(code,200); self.assertTrue(vapid['data']['public_key'])
+        code,body=self.req('/api/push/subscribe','POST',{'endpoint':'','keys':{'p256dh':'x','auth':'y'}})
+        self.assertEqual(code,400)
+        endpoint='https://push.example.test/subscription/abc123'
+        code,body=self.req('/api/push/subscribe','POST',{'endpoint':endpoint,'keys':{'p256dh':'fake-p256dh','auth':'fake-auth'}})
+        self.assertEqual(code,201)
+        with server.connect() as db:
+            row=db.execute('SELECT * FROM push_subscriptions WHERE endpoint=?',(endpoint,)).fetchone()
+            self.assertIsNotNone(row); self.assertEqual(row['p256dh'],'fake-p256dh')
+        request=urllib.request.Request(self.base+f'/api/push/subscribe?endpoint={urllib.parse.quote(endpoint)}',method='DELETE',headers={'X-CSRF-Token':self.csrf})
+        with self.opener.open(request) as res: code=res.status
+        self.assertEqual(code,200)
+        with server.connect() as db:
+            self.assertIsNone(db.execute('SELECT 1 FROM push_subscriptions WHERE endpoint=?',(endpoint,)).fetchone())
+    def test_task_assignment_sends_a_real_web_push_and_expired_subscription_is_pruned(self):
+        import http.server as http_server_module
+        received=[]
+        class PushDouble(http_server_module.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length=int(self.headers.get('Content-Length','0'))
+                body=self.rfile.read(length)
+                received.append({'auth':self.headers.get('Authorization',''),'ttl':self.headers.get('TTL',''),'body':body})
+                self.send_response(201); self.end_headers()
+            def log_message(self,*a): pass
+        double=http_server_module.HTTPServer(('127.0.0.1',0),PushDouble)
+        threading.Thread(target=double.serve_forever,daemon=True).start()
+        try:
+            endpoint=f'http://127.0.0.1:{double.server_port}/push/xyz'
+            self.req('/api/push/subscribe','POST',{'endpoint':endpoint,'keys':{'p256dh':'p','auth':'a'}})
+            _,created=self.req('/api/runbooks','POST',{'name':'Push notify test'}); rid=created['data']['id']
+            _,task=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Notify me'})
+            task_id=task['data']['tasks'][0]['id']
+            with patch('server.safe_urlopen',unrestricted_urlopen):
+                code,updated=self.req(f'/api/tasks/{task_id}','PATCH',{'owner_user_id':1})
+            self.assertEqual(code,200)
+            deadline=time.monotonic()+3
+            while not received and time.monotonic()<deadline: time.sleep(0.05)
+            self.assertEqual(len(received),1,'expected exactly one push delivery on assignment')
+            self.assertTrue(received[0]['auth'].startswith('vapid t='))
+            self.assertIn('k=',received[0]['auth'])
+            self.assertEqual(received[0]['body'],b'')
+        finally:
+            double.shutdown()
+        # a 410 Gone from the push service must prune the stale subscription
+        class GoneDouble(http_server_module.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(410); self.end_headers()
+            def log_message(self,*a): pass
+        gone=http_server_module.HTTPServer(('127.0.0.1',0),GoneDouble)
+        threading.Thread(target=gone.serve_forever,daemon=True).start()
+        try:
+            endpoint2=f'http://127.0.0.1:{gone.server_port}/push/gone'
+            self.req('/api/push/subscribe','POST',{'endpoint':endpoint2,'keys':{'p256dh':'p','auth':'a'}})
+            with server.connect() as db:
+                sub=db.execute('SELECT * FROM push_subscriptions WHERE endpoint=?',(endpoint2,)).fetchone()
+                with patch('server.safe_urlopen',unrestricted_urlopen):
+                    server.send_web_push(db,dict(sub),sub['instance_id']); db.commit()
+                self.assertIsNone(db.execute('SELECT 1 FROM push_subscriptions WHERE endpoint=?',(endpoint2,)).fetchone())
+        finally:
+            gone.shutdown()
     def test_cloudflare_access_sso_verifies_signature_audience_and_expiry(self):
         import base64 as b64
         import random

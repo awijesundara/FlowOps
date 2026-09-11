@@ -232,6 +232,18 @@ $('#profileForm').onsubmit=async e=>{e.preventDefault();const data=Object.fromEn
 $('#avatarFile').onchange=async e=>{const file=e.target.files[0];if(!file)return;if(file.size>5*1024*1024){toast('Profile picture must be smaller than 5 MB',true);e.target.value='';return}const reader=new FileReader();reader.onload=async()=>{try{const updated=await api('/api/profile/avatar',{method:'POST',body:JSON.stringify({avatar_base64:reader.result})});state.user.avatar_path=updated.avatar_path;applyIdentity();$('#profileAvatarPreview').src=`/avatar/${state.user.id}?v=${encodeURIComponent(updated.avatar_path)}`;$('#profileAvatarPreview').style.display='';toast('Profile picture updated')}catch(err){toast(err.message,true)}finally{e.target.value=''}};reader.readAsDataURL(file)};
 $('#passwordForm').onsubmit=async e=>{e.preventDefault();const form=e.currentTarget,data=Object.fromEntries(new FormData(form));try{await api('/api/profile/change-password',{method:'POST',body:JSON.stringify(data)});form.reset();toast('Password changed. Your other sessions have been signed out.')}catch(err){toast(err.message,true)}};
 $('#exportMyData').onclick=()=>window.open('/api/profile/export','_blank');
+function urlBase64ToUint8Array(base64){const padding='='.repeat((4-base64.length%4)%4);const raw=atob((base64+padding).replace(/-/g,'+').replace(/_/g,'/'));return Uint8Array.from([...raw].map(c=>c.charCodeAt(0)))}
+$('#enablePush').onclick=async()=>{
+  if(!('serviceWorker' in navigator)||!('PushManager' in window)){toast('Push notifications are not supported in this browser',true);return}
+  try{
+    const registration=await navigator.serviceWorker.register('/sw.js');
+    await navigator.serviceWorker.ready;
+    const {public_key}=(await api('/api/push/vapid-public-key')).data;
+    const subscription=await registration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:urlBase64ToUint8Array(public_key)});
+    await api('/api/push/subscribe',{method:'POST',body:JSON.stringify(subscription.toJSON())});
+    toast('Push notifications enabled')
+  }catch(e){toast(e.message||'Could not enable push notifications',true)}
+};
 const mainContent=$('main');mainContent.id='mainContent';mainContent.tabIndex=-1;
 const skipLink=document.createElement('a');skipLink.className='skip-link';skipLink.href='#mainContent';skipLink.textContent='Skip to main content';document.body.prepend(skipLink);
 $('#statusFilter').setAttribute('aria-label','Filter runbooks by status');$('#savedViewSelect').setAttribute('aria-label','Apply a saved runbook view');$('#search').setAttribute('aria-label','Search runbooks');
