@@ -1,0 +1,63 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FlowOps · Monitor</title>
+<style>
+:root{--ink:#e7eaf5;--muted:#8b93ac;--line:#232a45;--bg:#0b0e1f;--panel:#131834;--purple:#6d7dff;--green:#2fd499;--orange:#ffb454;--red:#ff5f6d}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh}
+header{display:flex;align-items:center;justify-content:space-between;padding:22px 34px;border-bottom:1px solid var(--line);background:#0e1330}
+.brand{display:flex;align-items:center;gap:12px;font-size:15px;color:var(--muted);text-transform:uppercase;letter-spacing:.1em}
+.brand b{color:#fff}
+h1{font-size:30px;margin:6px 0}
+.status-row{display:flex;align-items:center;gap:14px}
+.chip{padding:6px 14px;border-radius:20px;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+.chip.live{background:#2f1620;color:var(--red)}
+.chip.ready{background:#1a2340;color:var(--purple)}
+.chip.complete{background:#0f2b22;color:var(--green)}
+.chip.draft,.chip.paused{background:#232a45;color:var(--muted)}
+.live-dot{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
+.live-dot i{width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 0 5px #2fd49922;animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.4}}
+main{padding:34px}
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:18px;margin-bottom:30px}
+.metric{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px}
+.metric span{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}
+.metric strong{display:block;font-size:36px;margin-top:8px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}
+.card{background:var(--panel);border:1px solid var(--line);border-left:5px solid #3a4270;border-radius:12px;padding:18px;position:relative;overflow:hidden}
+.card.status-running{border-left-color:var(--purple);animation:runglow 2s ease-in-out infinite}
+@keyframes runglow{0%,100%{box-shadow:0 0 0 0 #6d7dff22}50%{box-shadow:0 0 0 8px #6d7dff00}}
+.card.status-complete{border-left-color:var(--green)}
+.card.status-failed{border-left-color:var(--red)}
+.card.escalated{border-left-color:var(--orange);background:#1c1a17}
+.card.incident{border-left-color:var(--red);background:#1e1315}
+.card.running-long{border-left-color:var(--orange)}
+.card.blocked{opacity:.6}
+.card-top{display:flex;justify-content:space-between;align-items:start;gap:10px;margin-bottom:8px}
+.card h3{margin:0;font-size:15px}
+.card small{color:var(--muted);display:block;margin-top:6px}
+.badge{font-size:10px;font-weight:800;padding:3px 8px;border-radius:20px;white-space:nowrap}
+.badge.running{background:#1a1a3d;color:var(--purple)}
+.badge.complete{background:#0f2b22;color:var(--green)}
+.badge.failed{background:#2f1620;color:var(--red)}
+.badge.pending{background:#20263f;color:var(--muted)}
+.badge.skipped{background:#20263f;color:var(--muted)}
+.flags{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
+.flag{font-size:10px;font-weight:800;padding:3px 8px;border-radius:20px}
+.flag.escalated{background:#2e2410;color:var(--orange)}
+.flag.incident{background:#2f1620;color:var(--red)}
+.flag.running-long{background:#2e2410;color:var(--orange)}
+.empty,.signin{text-align:center;padding:80px 20px;color:var(--muted)}
+.signin a{color:var(--purple)}
+@media(prefers-reduced-motion:reduce){.card.status-running,.live-dot i{animation:none}}
+</style></head>
+<body>
+<header>
+  <div class="brand">FlowOps <b id="rbName">Monitor</b></div>
+  <div class="status-row">
+    <div class="live-dot"><i></i><span id="liveLabel">Live</span></div>
+    <span class="chip" id="rbStatus">—</span>
+  </div>
+</header>
+<main id="content"><div class="empty">Loading…</div></main>
+<script src="/monitor.js"></script>
+</body></html>

@@ -509,6 +509,53 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(code,204)
         with server.connect() as db:
             self.assertIsNone(db.execute('SELECT 1 FROM central_teams WHERE id=?',(int(gid),)).fetchone())
+    def test_task_escalation_and_incident_flags_toggle_and_are_audited(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Escalation test runbook'}); rid=created['data']['id']
+        _,task=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Needs escalation'})
+        tid=task['data']['tasks'][0]['id']
+        code,body=self.req(f'/api/tasks/{tid}/escalate','POST',{'escalated':True,'reason':'Waiting on vendor'})
+        self.assertEqual(code,200)
+        escalated_task=next(t for t in body['data']['tasks'] if t['id']==tid)
+        self.assertTrue(escalated_task['escalated']); self.assertEqual(escalated_task['escalation_reason'],'Waiting on vendor')
+        code,body=self.req(f'/api/tasks/{tid}/incident','POST',{'incident':True,'reason':'Caused a brief outage'})
+        self.assertEqual(code,200)
+        flagged_task=next(t for t in body['data']['tasks'] if t['id']==tid)
+        self.assertTrue(flagged_task['incident']); self.assertEqual(flagged_task['incident_reason'],'Caused a brief outage')
+        self.assertTrue(flagged_task['escalated'],'flagging an incident must not silently clear an existing escalation')
+        code,body=self.req(f'/api/tasks/{tid}/escalate','POST',{'escalated':False})
+        cleared_task=next(t for t in body['data']['tasks'] if t['id']==tid)
+        self.assertFalse(cleared_task['escalated']); self.assertIsNone(cleared_task['escalation_reason'])
+        _,doc=self.req(f'/api/runbooks/{rid}')
+        actions=[a['action'] for a in doc['data']['audit']]
+        self.assertIn('task.escalated',actions); self.assertIn('task.incident_flagged',actions); self.assertIn('task.escalation_cleared',actions)
+    def test_admin_can_delete_a_runbook_but_not_while_live_and_keeps_its_audit_trail(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Deletable release'}); rid=created['data']['id']
+        self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Some task'})
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})
+        code,body=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        self.assertEqual(code,200)
+        code,body=self.req(f'/api/runbooks/{rid}','DELETE')
+        self.assertEqual(code,409,'a live runbook must not be deletable')
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'paused'})
+        code,body=self.req(f'/api/runbooks/{rid}','DELETE')
+        self.assertEqual(code,200,body)
+        code,body=self.req(f'/api/runbooks/{rid}')
+        self.assertEqual(code,404,'the runbook itself should be gone')
+        with server.connect() as db:
+            self.assertIsNone(db.execute('SELECT 1 FROM tasks WHERE runbook_id=?',(rid,)).fetchone(),'tasks should cascade-delete')
+            audit_row=db.execute("SELECT * FROM audit WHERE action='runbook.deleted' AND runbook_id IS NULL ORDER BY id DESC LIMIT 1").fetchone()
+            self.assertIsNotNone(audit_row,'a runbook.deleted audit row must survive the runbook itself being gone')
+            self.assertIn('Deletable release',audit_row['detail'])
+            older_row=db.execute('SELECT 1 FROM audit WHERE runbook_id=?',(rid,)).fetchone()
+            self.assertIsNotNone(older_row,'earlier audit rows referencing the now-deleted runbook id must be preserved, not cascade-deleted')
+    def test_non_admin_cannot_delete_a_runbook(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Protected from non-admins'}); rid=created['data']['id']
+        _,editor_token=self.req('/api/admin/api-tokens','POST',{'name':'Editor-scope token for delete test','scopes':['runbooks:write']})
+        request=urllib.request.Request(self.base+f'/api/runbooks/{rid}',method='DELETE',headers={'Authorization':f"Bearer {editor_token['data']['token']}"})
+        try:
+            with urllib.request.urlopen(request) as res: code=res.status
+        except urllib.error.HTTPError as err: code=err.code
+        self.assertEqual(code,403)
     def test_completing_a_task_pushes_its_ctask_state_back_to_serviceops(self):
         self.req('/api/admin/integrations','POST',{'provider':'serviceops','url':'https://serviceops.example','credential':'sop_ctask_push','enabled':True})
         _,created=self.req('/api/runbooks','POST',{'name':'Push-back change','serviceops_ticket':'CHG0000044'});rid=created['data']['id']
@@ -1543,6 +1590,30 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(by_id[d_id]['planned_start_offset'],30)
         # The critical path is the longer branch (A -> C -> D), not A -> B -> D.
         self.assertEqual(doc['critical_path'],[a_id,c_id,d_id])
+    def test_or_gated_join_unblocks_on_the_first_finished_branch_not_all(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'OR-gated release'}); rid=created['data']['id']
+        _,a=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'A','duration':10}); a_id=a['data']['tasks'][-1]['id']
+        _,b=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'B','duration':5,'depends_on':[a_id]}); b_id=b['data']['tasks'][-1]['id']
+        _,c=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'C','duration':20,'depends_on':[a_id]}); c_id=c['data']['tasks'][-1]['id']
+        _,d=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'D','duration':5,'depends_on':[b_id,c_id]}); d_id=d['data']['tasks'][-1]['id']
+        code,body=self.req(f'/api/tasks/{d_id}','PATCH',{'dependency_logic':'or'})
+        self.assertEqual(code,200)
+        by_id={t['id']:t for t in body['data']['tasks']}
+        self.assertEqual(by_id[d_id]['dependency_logic'],'or')
+        # A finishes at 10; B (the earlier branch) finishes at 15; C (the
+        # later branch) finishes at 30. An OR join only needs the EARLIER
+        # branch, unlike the AND-gated diamond test's later-branch wait.
+        self.assertEqual(by_id[d_id]['planned_start_offset'],15)
+        self.assertTrue(by_id[d_id]['blocked'],'D must still be blocked -- neither B nor C has actually finished yet')
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        self.req(f'/api/tasks/{a_id}','PATCH',{'status':'running'})
+        self.req(f'/api/tasks/{a_id}','PATCH',{'status':'complete'})
+        self.req(f'/api/tasks/{b_id}','PATCH',{'status':'running'})
+        code,body=self.req(f'/api/tasks/{b_id}','PATCH',{'status':'complete'})
+        by_id={t['id']:t for t in body['data']['tasks']}
+        self.assertFalse(by_id[d_id]['blocked'],'D must unblock once just ONE of its two OR-gated dependencies (B) completes, even though C is still pending')
+        self.assertEqual(by_id[c_id]['status'],'pending','C itself is untouched by this test and should remain pending')
     def test_combined_fan_out_fan_in_computes_correct_join_offset(self):
         _,created=self.req('/api/runbooks','POST',{'name':'Fan-out fan-in release'}); rid=created['data']['id']
         _,a=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'A','duration':5}); a_id=a['data']['tasks'][-1]['id']
@@ -1840,6 +1911,25 @@ class FlowOpsTest(unittest.TestCase):
             self.assertEqual(res.status,200); self.assertIn(b'API Explorer',res.read())
         with urllib.request.urlopen(self.base+'/api-explorer.js') as res:
             self.assertEqual(res.status,200); self.assertIn(b'openapi.json',res.read())
+    def test_monitor_page_serves_and_real_runbook_data_flows_through_the_real_api(self):
+        with urllib.request.urlopen(self.base+'/monitor.html') as res:
+            self.assertEqual(res.status,200); self.assertIn(b'monitor.js',res.read())
+        with urllib.request.urlopen(self.base+'/monitor.js') as res:
+            body=res.read()
+            self.assertEqual(res.status,200); self.assertIn(b'/api/runbooks/',body); self.assertIn(b'/api/events',body)
+        # the monitor page itself is a thin client over the same real,
+        # already-authenticated /api/runbooks/{id} endpoint -- no separate
+        # backend surface to duplicate-test; confirm that endpoint carries
+        # everything the monitor needs to render (status, progress, escalation/incident flags).
+        _,created=self.req('/api/runbooks','POST',{'name':'Monitor smoke test'}); rid=created['data']['id']
+        _,task=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Watch me'})
+        tid=task['data']['tasks'][0]['id']
+        self.req(f'/api/tasks/{tid}/escalate','POST',{'escalated':True})
+        code,body=self.req(f'/api/runbooks/{rid}')
+        self.assertEqual(code,200)
+        watched=next(t for t in body['data']['tasks'] if t['id']==tid)
+        self.assertTrue(watched['escalated'])
+        self.assertIn('progress',body['data'])
     def test_api_token_requests_are_rate_limited(self):
         code,token=self.req('/api/admin/api-tokens','POST',{'name':'Rate limit probe','scopes':['runbooks:read']})
         self.assertEqual(code,201)
