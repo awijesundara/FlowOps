@@ -294,16 +294,25 @@ class FlowOpsBrowserTest(unittest.TestCase):
         self.assertEqual(or_row['badge'], 'OR'); self.assertIn('gate-or', or_row['cls'])
 
     def test_escalating_and_flagging_a_task_applies_real_visual_state_via_the_ui(self):
+        # toggleEscalate()/toggleIncident() used to collect their optional
+        # reason via a native prompt() -- this test used to answer it via
+        # Playwright's page.once('dialog', ...). Both now go through the
+        # app's own formDialog() (a real <dialog>), matching the rest of the
+        # app's dialog conversion, so this test fills that form instead.
         self.page.click('[data-view="runbooks"]', force=True)
         self.page.wait_for_selector('#runbooks.view.active')
         self.page.locator('.trow[data-id]').first.click()
         self.page.wait_for_selector('#detail.view.active')
-        self.page.once('dialog', lambda d: d.accept('Vendor is unresponsive'))
         self.page.locator('.task .escalate-btn').first.click()
+        self.page.wait_for_selector('dialog.generic-dialog[open]')
+        self.page.fill('dialog.generic-dialog textarea[name=reason]', 'Vendor is unresponsive')
+        self.page.click('dialog.generic-dialog .modalactions .primary')
         self.page.wait_for_selector('.task.escalated')
         self.assertTrue(self.page.locator('.task.escalated .escalated-chip').is_visible())
-        self.page.once('dialog', lambda d: d.accept('Caused a brief outage'))
         self.page.locator('.task.escalated .incident-btn').click()
+        self.page.wait_for_selector('dialog.generic-dialog[open]')
+        self.page.fill('dialog.generic-dialog textarea[name=reason]', 'Caused a brief outage')
+        self.page.click('dialog.generic-dialog .modalactions .primary')
         self.page.wait_for_selector('.task.incident')
         self.assertTrue(self.page.locator('.task.incident .incident-chip').is_visible())
         self.assertTrue(self.page.locator('.task.escalated.incident').count() > 0, 'escalation must survive flagging an incident on the same task')

@@ -91,7 +91,6 @@ CF_ACCESS_TEAM_DOMAIN = os.getenv("FLOWOPS_CF_ACCESS_TEAM_DOMAIN", "")
 CF_ACCESS_AUD = os.getenv("FLOWOPS_CF_ACCESS_AUD", "")
 STATIC = Path(__file__).with_name("static")
 MAX_BODY = 1_000_000
-SESSION_SECONDS = 8 * 60 * 60
 DEFAULT_INSTANCE_SLUG = "flowops"
 ROLE_PERMISSIONS = {
     "Admin": {"runbooks:view","runbooks:edit","runbooks:execute","integrations:sync","admin:access","admin:users","admin:settings"},
@@ -211,23 +210,74 @@ def backup_database() -> dict[str, Any]:
 
 API_RATE_LIMIT = int(os.getenv("FLOWOPS_API_RATE_LIMIT", "120"))  # requests per window, per API token
 API_RATE_WINDOW_SECONDS = 60
+LOGIN_RATE_LIMIT_PER_IP = 60
+LOGIN_RATE_WINDOW_PER_IP_SECONDS = 60
+LOGIN_RATE_LIMIT_PER_ACCOUNT = 8
+LOGIN_RATE_WINDOW_PER_ACCOUNT_SECONDS = 300
 _rate_limit_state: dict[str, tuple[float, int]] = {}
 _rate_limit_lock = threading.Lock()
 
 
-def check_rate_limit(key: str) -> int | None:
+def check_rate_limit(key: str, limit: int | None = None, window_seconds: int | None = None) -> int | None:
     """Fixed-window limiter. Returns None if the request is allowed, or the
-    number of seconds the caller should wait (Retry-After) if it isn't."""
+    number of seconds the caller should wait (Retry-After) if it isn't.
+    `limit`/`window_seconds` default to the API-token values but callers with
+    a different threshold (e.g. login brute-force protection, which needs a
+    much stricter window than routine API traffic) can override them --
+    each distinct `key` still gets its own independent window/counter.
+    Defaults are resolved here rather than in the signature -- a `def
+    f(x=SOME_GLOBAL)` default is bound once at module-import time, so
+    existing tests that patch server.API_RATE_LIMIT to exercise this at a
+    low threshold would silently keep hitting the original value."""
+    limit = API_RATE_LIMIT if limit is None else limit
+    window_seconds = API_RATE_WINDOW_SECONDS if window_seconds is None else window_seconds
     now_ts = time.monotonic()
     with _rate_limit_lock:
         window_start, count = _rate_limit_state.get(key, (now_ts, 0))
-        if now_ts - window_start >= API_RATE_WINDOW_SECONDS:
+        if now_ts - window_start >= window_seconds:
             window_start, count = now_ts, 0
         count += 1
         _rate_limit_state[key] = (window_start, count)
-        if count > API_RATE_LIMIT:
-            return max(1, int(API_RATE_WINDOW_SECONDS - (now_ts - window_start)))
+        if count > limit:
+            return max(1, int(window_seconds - (now_ts - window_start)))
     return None
+
+
+def rate_limit_lockout(key: str, limit: int, window_seconds: int) -> int | None:
+    """Read-only counterpart to check_rate_limit(): reports whether `key` is
+    already over threshold without consuming a slot. Used for the login
+    account-lockout gate, which must be checked *before* an attempt (to
+    reject it outright while locked out) but must only accumulate on actual
+    failures -- recorded separately via record_rate_limit_failure() -- so a
+    legitimate user's successful logins never count toward their own
+    lockout. (An earlier version called check_rate_limit() unconditionally
+    on every attempt, success included, which meant as few as 8 logins by
+    the same real, correctly-authenticated user within 5 minutes locked
+    the account out -- caught by test_browser.py's real UI login in every
+    one of its 20 test cases.)"""
+    now_ts = time.monotonic()
+    with _rate_limit_lock:
+        window_start, count = _rate_limit_state.get(key, (now_ts, 0))
+        if now_ts - window_start >= window_seconds or count <= limit:
+            return None
+        return max(1, int(window_seconds - (now_ts - window_start)))
+
+
+def record_rate_limit_failure(key: str, window_seconds: int) -> None:
+    """Increments the failure counter used by rate_limit_lockout(), or
+    clears it entirely (a fresh window) once a caller succeeds -- see
+    reset_rate_limit_failures()."""
+    now_ts = time.monotonic()
+    with _rate_limit_lock:
+        window_start, count = _rate_limit_state.get(key, (now_ts, 0))
+        if now_ts - window_start >= window_seconds:
+            window_start, count = now_ts, 0
+        _rate_limit_state[key] = (window_start, count + 1)
+
+
+def reset_rate_limit_failures(key: str) -> None:
+    with _rate_limit_lock:
+        _rate_limit_state.pop(key, None)
 
 
 # --- SSRF-resistant outbound requests -------------------------------------
@@ -563,8 +613,17 @@ def dashboard_email_loop() -> None:
         time.sleep(900)
         try:
             with connect() as db:
-                for instance in rows(db.execute("SELECT id FROM instances")):
-                    maybe_send_dashboard_email(db,instance["id"])
+                instance_ids=[row["id"] for row in rows(db.execute("SELECT id FROM instances"))]
+            # One short connection per instance rather than one held open
+            # across every instance's checks and (for whichever instance is
+            # actually due) its blocking SMTP sends -- maybe_send_dashboard_
+            # email() itself is unaffected/still takes an already-open
+            # connection (its tested contract), this only bounds how long
+            # any single connection stays open in the common case where
+            # most instances aren't due and return immediately.
+            for instance_id in instance_ids:
+                with connect() as db:
+                    maybe_send_dashboard_email(db,instance_id)
         except Exception as exc:
             print(json.dumps({"ts":now(),"level":"error","message":f"dashboard email loop failed: {exc}"},separators=(",",":")))
 
@@ -882,6 +941,13 @@ def init_db() -> None:
             )
         if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             password=os.getenv("FLOWOPS_BOOTSTRAP_PASSWORD","FlowOps!Preview2026")
+            if password=="FlowOps!Preview2026":
+                # This only fires once, at the exact moment the admin account
+                # is actually created (subsequent restarts skip this whole
+                # block since users already exist) -- exactly when an
+                # operator deploying for real needs to see it, and never
+                # again afterward regardless of log retention.
+                print(json.dumps({"ts":now(),"level":"warning","message":"FLOWOPS_BOOTSTRAP_PASSWORD was not set; the admin account was created with the documented default preview password. Change it immediately if this is not a local/preview deployment."},separators=(",",":")))
             db.execute("INSERT INTO users(username,display_name,email,role,team,password_hash,created_at,instance_id) VALUES(?,?,?,?,?,?,?,?)",
                        ("admin","Anushka","admin@flowops.local","Admin","Platform Operations",password_hash(password),now(),default_instance))
             db.execute("INSERT INTO users(username,display_name,email,role,team,password_hash,created_at,instance_id) VALUES(?,?,?,?,?,?,?,?)",
@@ -1679,6 +1745,24 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
+    def request_is_over_tls(self) -> bool:
+        """This process only ever speaks plain HTTP itself; in every real
+        deployment (the MicroK8s Cloudflare Tunnel, or any other reverse
+        proxy) TLS is terminated upstream and the proxy sets
+        X-Forwarded-Proto so the origin can tell. Falls back to an explicit
+        env var for a reverse proxy that doesn't set that header. Session
+        cookies were previously never marked Secure at all -- this is only
+        used to decide whether to add that flag, so the one thing it must
+        never do is force it on in the local Docker preview (plain HTTP),
+        which would make the browser silently refuse to store the cookie
+        and break login."""
+        return (self.headers.get("X-Forwarded-Proto","").strip().lower()=="https"
+                or os.getenv("FLOWOPS_FORCE_SECURE_COOKIES","").strip().lower()=="true")
+
+    def session_cookie(self, raw: str, max_age: int) -> str:
+        secure=" Secure;" if self.request_is_over_tls() else ""
+        return f"flowops_session={raw}; Path=/;{secure} HttpOnly; SameSite=Strict; Max-Age={max_age}"
+
     def send_json(self, payload: Any, status=200, headers: dict[str,str] | None=None):
         body=json.dumps(payload, separators=(",", ":")).encode()
         self.send_response(status); self.send_header("Content-Type","application/json; charset=utf-8")
@@ -1852,6 +1936,15 @@ class Handler(BaseHTTPRequestHandler):
     def _do_GET(self):
         path=urllib.parse.urlparse(self.path).path
         if path=="/": return self.static("index.html","text/html; charset=utf-8")
+        # The SPA does its own client-side routing (see navigate()/boot() in
+        # app.js) and updates the URL via history.pushState so views and
+        # individual runbooks are bookmarkable/shareable/refresh-safe --
+        # previously there was no server route for any of these, so a
+        # refresh or direct link landed on a raw {"error":"Not found"} JSON
+        # body instead of the app. These just serve the same shell; app.js
+        # reads location.pathname on load to restore the right view.
+        if path in ("/runbooks","/templates","/analytics","/admin") or re.match(r"^/runbooks/\d+$",path):
+            return self.static("index.html","text/html; charset=utf-8")
         if path=="/app.js": return self.static("app.js","application/javascript; charset=utf-8")
         if path=="/strings.js": return self.static("strings.js","application/javascript; charset=utf-8")
         if path=="/sw.js": return self.static("sw.js","application/javascript; charset=utf-8")
@@ -2147,6 +2240,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"error":"Authentication required"},401)
             instance_id=user["instance_id"]
             version=db.execute("SELECT COALESCE(MAX(id),0) FROM audit WHERE instance_id=?",(instance_id,)).fetchone()[0]
+        # No socket timeout was ever set on this (or any) connection: a
+        # cleanly closed/reset client is already handled below, but a
+        # half-open one -- dropped mid-stream with no FIN/RST, e.g. a
+        # laptop sleeping or a NAT/firewall silently expiring the session --
+        # would leave wfile.write() blocked indefinitely, holding one of
+        # ThreadingHTTPServer's one-thread-per-connection threads forever.
+        # 30s is comfortably above both the 1s poll tick and the 15s
+        # heartbeat, so it never fires during normal operation.
+        self.connection.settimeout(30)
         self.send_response(200); self.send_header("Content-Type","text/event-stream; charset=utf-8")
         self.send_header("Cache-Control","no-cache, no-store"); self.send_header("Connection","keep-alive")
         self.send_header("X-Accel-Buffering","no"); self.end_headers()
@@ -2164,7 +2266,7 @@ class Handler(BaseHTTPRequestHandler):
                     version=current; self.wfile.flush()
                 elif tick % 15 == 0:
                     self.wfile.write(b": heartbeat\n\n"); self.wfile.flush()
-        except (BrokenPipeError,ConnectionResetError):
+        except (BrokenPipeError,ConnectionResetError,TimeoutError):
             return
 
     def do_POST(self):
@@ -2224,7 +2326,7 @@ class Handler(BaseHTTPRequestHandler):
                 raw=secrets.token_urlsafe(36); csrf=secrets.token_urlsafe(24); expires=int(time.time())+session_seconds
                 db.execute("DELETE FROM sessions WHERE expires_at<=?",(int(time.time()),)); db.execute("INSERT INTO sessions(token_hash,csrf_token,user_id,expires_at,created_at,ip_address,user_agent) VALUES(?,?,?,?,?,?,?)",(hashlib.sha256(raw.encode()).hexdigest(),csrf,user["id"],expires,now(),self.client_address[0][:64],self.headers.get("User-Agent","")[:300])); db.execute("UPDATE users SET last_login_at=? WHERE id=?",(now(),user["id"])); append_audit(db,None,"auth.sso_login",f"{user['username']} signed in via Cloudflare Access ({email})",user["display_name"],user["instance_id"]); db.commit()
                 safe={k:user[k] for k in ("id","username","display_name","email","role","team")}; safe["permissions"]=sorted(ROLE_PERMISSIONS[user["role"]]); safe["csrf_token"]=csrf
-                return self.send_json({"data":safe},headers={"Set-Cookie":f"flowops_session={raw}; Path=/; HttpOnly; SameSite=Strict; Max-Age={session_seconds}"})
+                return self.send_json({"data":safe},headers={"Set-Cookie":self.session_cookie(raw,session_seconds)})
             if path=="/api/push/subscribe":
                 actor=self.current_user(db)
                 if not actor: return self.send_json({"error":"Authentication required"},401)
@@ -2271,28 +2373,46 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"data":{"ok":True}})
             if path=="/api/auth/login":
                 username=str(payload.get("username","")).strip(); password=str(payload.get("password",""));source=str(payload.get("source","local")).lower()
+                # Every other password/token entry point in this file is rate
+                # limited (API tokens via check_rate_limit, password reset
+                # implicitly single-use); this one previously had only a
+                # fixed 200ms sleep on failure -- serial, not per-caller, so
+                # ThreadingHTTPServer's one-thread-per-connection model let an
+                # attacker trivially parallelize past it. Two independent
+                # gates: per-IP is a simple attempt-based flood limit (catches
+                # one attacker trying many usernames); per-account is a
+                # failure-based lockout (catches distributed attempts against
+                # one account from many IPs) -- it must only accumulate on
+                # actual failures, never on successes, or a legitimately busy
+                # user gets locked out of their own account.
+                account_key=f"login-fail:{username.lower()}"
+                retry_after=(check_rate_limit(f"login-ip:{self.client_address[0][:64]}",limit=LOGIN_RATE_LIMIT_PER_IP,window_seconds=LOGIN_RATE_WINDOW_PER_IP_SECONDS)
+                             or rate_limit_lockout(account_key,LOGIN_RATE_LIMIT_PER_ACCOUNT,LOGIN_RATE_WINDOW_PER_ACCOUNT_SECONDS))
+                if retry_after:
+                    return self.send_json({"error":"Too many sign-in attempts. Try again later."},429,headers={"Retry-After":str(retry_after)})
                 instance=db.execute("SELECT id FROM instances WHERE slug=?",(DEFAULT_INSTANCE_SLUG,)).fetchone()
                 if source=="ldap":
                     if not instance:return self.send_json({"error":"FlowOps instance is unavailable"},503)
                     try:remote=self.serviceops_directory_authenticate(db,instance["id"],username,password)
-                    except RuntimeError as exc:time.sleep(.2);return self.send_json({"error":str(exc)},401)
+                    except RuntimeError as exc:record_rate_limit_failure(account_key,LOGIN_RATE_WINDOW_PER_ACCOUNT_SECONDS);time.sleep(.2);return self.send_json({"error":str(exc)},401)
                     username=str(remote["username"]);user=db.execute("SELECT * FROM users WHERE username=? AND instance_id=? AND active=1",(username,instance["id"])).fetchone()
                     if not user:
                         display=str(remote.get("name") or username)[:160];db.execute("INSERT INTO users(username,display_name,email,role,team,password_hash,created_at,instance_id) VALUES(?,?,?,?,?,?,?,?)",(username,display,"","Member","",password_hash(secrets.token_urlsafe(48)),now(),instance["id"]));user=db.execute("SELECT * FROM users WHERE username=? AND instance_id=?",(username,instance["id"])).fetchone()
                 else:
                     user=db.execute("SELECT * FROM users WHERE (username=? OR email=?) AND active=1",(username,username)).fetchone()
-                    if not user or not password_valid(password,user["password_hash"]):time.sleep(.2);return self.send_json({"error":"Invalid username or password"},401)
+                    if not user or not password_valid(password,user["password_hash"]):record_rate_limit_failure(account_key,LOGIN_RATE_WINDOW_PER_ACCOUNT_SECONDS);time.sleep(.2);return self.send_json({"error":"Invalid username or password"},401)
+                reset_rate_limit_failures(account_key)
                 hours=max(1,min(24,int(instance_settings(db,user["instance_id"]).get("session_hours","8")))); session_seconds=hours*3600
                 raw=secrets.token_urlsafe(36); csrf=secrets.token_urlsafe(24); expires=int(time.time())+session_seconds
                 db.execute("DELETE FROM sessions WHERE expires_at<=?",(int(time.time()),)); db.execute("INSERT INTO sessions(token_hash,csrf_token,user_id,expires_at,created_at,ip_address,user_agent) VALUES(?,?,?,?,?,?,?)",(hashlib.sha256(raw.encode()).hexdigest(),csrf,user["id"],expires,now(),self.client_address[0][:64],self.headers.get("User-Agent","")[:300])); db.execute("UPDATE users SET last_login_at=? WHERE id=?",(now(),user["id"])); append_audit(db,None,"auth.login",f"{user['username']} signed in",user["display_name"],user["instance_id"]); db.commit()
                 safe={k:user[k] for k in ("id","username","display_name","email","role","team")}; safe["permissions"]=sorted(ROLE_PERMISSIONS[user["role"]]); safe["csrf_token"]=csrf
-                return self.send_json({"data":safe},headers={"Set-Cookie":f"flowops_session={raw}; Path=/; HttpOnly; SameSite=Strict; Max-Age={session_seconds}"})
+                return self.send_json({"data":safe},headers={"Set-Cookie":self.session_cookie(raw,session_seconds)})
             if path=="/api/auth/logout":
                 user=self.current_user(db)
                 if user:
                     cookies={i.strip().split("=",1)[0]:i.strip().split("=",1)[1] for i in self.headers.get("Cookie","").split(";") if "=" in i}; raw=cookies.get("flowops_session","")
                     db.execute("DELETE FROM sessions WHERE token_hash=?",(hashlib.sha256(raw.encode()).hexdigest(),)); append_audit(db,None,"auth.logout",f"{user['username']} signed out",user["display_name"],user["instance_id"]); db.commit()
-                return self.send_json({"data":{"ok":True}},headers={"Set-Cookie":"flowops_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"})
+                return self.send_json({"data":{"ok":True}},headers={"Set-Cookie":self.session_cookie("",0)})
             if path=="/api/auth/invitations/accept":
                 raw=str(payload.get("token","")).strip();username=str(payload.get("username","")).strip();display=str(payload.get("display_name","")).strip();password=str(payload.get("password",""))
                 invite=db.execute("SELECT * FROM invitations WHERE token_hash=? AND accepted_at IS NULL AND expires_at>?",(hashlib.sha256(raw.encode()).hexdigest(),int(time.time()))).fetchone() if raw else None
@@ -3649,7 +3769,7 @@ class Handler(BaseHTTPRequestHandler):
             redirect_to=row["redirect_to"] or "/"
         self.send_response(302)
         self.send_header("Location",redirect_to)
-        self.send_header("Set-Cookie",f"flowops_session={raw}; Path=/; HttpOnly; SameSite=Strict; Max-Age={session_seconds}")
+        self.send_header("Set-Cookie",self.session_cookie(raw,session_seconds))
         self.end_headers()
 
     def test_oidc_integration(self, db, actor, overrides=None):

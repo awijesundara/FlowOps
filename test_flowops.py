@@ -2010,6 +2010,51 @@ class FlowOpsTest(unittest.TestCase):
             statuses=[bearer_get(token['data']['token']) for _ in range(5)]
         self.assertEqual(statuses[:3], [200,200,200])
         self.assertIn(429, statuses[3:])
+    def test_login_is_rate_limited_per_account(self):
+        """Regression test for a real gap: /api/auth/login previously had no
+        rate limiting at all (only a fixed 200ms sleep on a failed attempt),
+        and ThreadingHTTPServer's one-thread-per-connection model lets an
+        attacker trivialize that by parallelizing. Uses a dedicated,
+        never-elsewhere-used username so this test's own attempts don't
+        interact with the per-IP counter that every other test's real login
+        (via self.opener, same 127.0.0.1 source) already increments --
+        LOGIN_RATE_LIMIT_PER_IP is patched to a very high value so only the
+        per-account gate under test can possibly fire."""
+        def attempt():
+            request=urllib.request.Request(
+                self.base+'/api/auth/login',
+                data=json.dumps({'username':'nonexistent-ratelimit-probe','password':'wrong-password'}).encode(),
+                method='POST', headers={'Content-Type':'application/json'},
+            )
+            try:
+                with urllib.request.urlopen(request) as res: return res.status
+            except urllib.error.HTTPError as err: return err.code
+        with patch('server.LOGIN_RATE_LIMIT_PER_IP',10_000), patch('server.LOGIN_RATE_LIMIT_PER_ACCOUNT',3):
+            statuses=[attempt() for _ in range(5)]
+        self.assertEqual(statuses[:3],[401,401,401])
+        self.assertIn(429,statuses[3:])
+    def test_session_cookie_is_marked_secure_only_behind_a_tls_terminating_proxy(self):
+        """Regression test: Set-Cookie previously never included Secure at
+        all, even in production. It must stay absent for the local/plain-
+        HTTP case (this test suite's own server) so login keeps working
+        without TLS, and appear once the request looks like it arrived
+        through a TLS-terminating reverse proxy (X-Forwarded-Proto: https,
+        the header a real deployment's Cloudflare Tunnel sets)."""
+        with patch('server.LOGIN_RATE_LIMIT_PER_IP',10_000), patch('server.LOGIN_RATE_LIMIT_PER_ACCOUNT',10_000):
+            plain=urllib.request.Request(
+                self.base+'/api/auth/login',
+                data=json.dumps({'username':'admin','password':'FlowOps!Preview2026'}).encode(),
+                method='POST', headers={'Content-Type':'application/json'},
+            )
+            with urllib.request.urlopen(plain) as res:
+                self.assertNotIn('Secure',res.headers.get('Set-Cookie',''))
+            proxied=urllib.request.Request(
+                self.base+'/api/auth/login',
+                data=json.dumps({'username':'admin','password':'FlowOps!Preview2026'}).encode(),
+                method='POST', headers={'Content-Type':'application/json','X-Forwarded-Proto':'https'},
+            )
+            with urllib.request.urlopen(proxied) as res:
+                self.assertIn('Secure',res.headers.get('Set-Cookie',''))
     def test_realtime_feed_emits_after_change(self):
         stream=self.opener.open(self.base+'/api/events',timeout=4)
         self.assertEqual(stream.readline().decode().strip(),'event: connected')
