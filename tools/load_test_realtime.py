@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 BASE = os.environ.get("FLOWOPS_BASE", "http://localhost:8088")
 CONCURRENCY = int(sys.argv[1]) if len(sys.argv) > 1 else 25
@@ -32,11 +33,11 @@ def login():
     return opener, body["data"]["csrf_token"]
 
 
-def listener(opener, index, ready_barrier, results, deadline_marker):
+def listener(opener, index, ready_barrier, results, deadline_marker, barrier_timeout):
     req = urllib.request.Request(f"{BASE}/api/events")
     try:
         with opener.open(req, timeout=20) as resp:
-            ready_barrier.wait(timeout=10)
+            ready_barrier.wait(timeout=barrier_timeout)
             for raw_line in resp:
                 line = raw_line.decode().strip()
                 if line == "event: workspace":
@@ -50,17 +51,36 @@ def listener(opener, index, ready_barrier, results, deadline_marker):
 def main():
     print(f"Load-testing real-time propagation: {BASE}, concurrency={CONCURRENCY}")
     opener, csrf = login()
-    listeners = [login()[0] for _ in range(CONCURRENCY)]
+    # Logging in is deliberately expensive (240,000-round PBKDF2 per
+    # attempt, server-side) -- at higher concurrency, CONCURRENCY sequential
+    # logins alone can take longer than the readiness barrier's timeout
+    # before a single listener thread even starts. Parallelize it, the same
+    # way the listeners themselves already are.
+    login_start = time.monotonic()
+    with ThreadPoolExecutor(max_workers=min(CONCURRENCY, 50)) as pool:
+        listeners = list(pool.map(lambda _: login()[0], range(CONCURRENCY)))
+    print(f"Logged in {CONCURRENCY} viewers in {time.monotonic() - login_start:.1f}s")
     ready_barrier = threading.Barrier(CONCURRENCY + 1)
     deadline_marker = [0.0]
     results = [None] * CONCURRENCY
+    # SSE connection establishment itself (not just login) measurably slows
+    # down at higher concurrency in this environment (observed: Docker
+    # Desktop's port-forwarding NAT arrives in bursts of ~10-20 connections
+    # every few seconds well past 300 concurrent connects) -- a real,
+    # environment-specific characteristic, not something to paper over with
+    # an arbitrarily large fixed timeout. Scale it visibly instead. Every
+    # party (each listener thread AND the main thread) must use the SAME
+    # scaled timeout -- a barrier breaks the instant any single waiting
+    # party's timeout elapses, so an unscaled per-listener timeout defeats
+    # this entirely even if the main thread's own wait is scaled correctly.
+    barrier_timeout = max(10, CONCURRENCY * 0.2)
     threads = [
-        threading.Thread(target=listener, args=(listeners[i], i, ready_barrier, results, deadline_marker))
+        threading.Thread(target=listener, args=(listeners[i], i, ready_barrier, results, deadline_marker, barrier_timeout))
         for i in range(CONCURRENCY)
     ]
     for t in threads:
         t.start()
-    ready_barrier.wait(timeout=10)
+    ready_barrier.wait(timeout=barrier_timeout)
     time.sleep(0.3)  # let SSE connections actually establish server-side
     deadline_marker[0] = time.monotonic()
     req = urllib.request.Request(

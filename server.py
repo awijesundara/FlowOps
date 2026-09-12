@@ -1395,25 +1395,56 @@ def claim_new_audit_events() -> list[dict[str, Any]]:
         db.close()
 
 
+def dispatch_pending_webhooks() -> int:
+    """Runs one pass: claim newly committed audit rows, deliver them to
+    every active, subscribed webhook, and persist the delivery records.
+    Returns the number of deliveries attempted (for tests/introspection).
+
+    Deliberately never holds a database connection open across the actual
+    delivery (network I/O): a real load test surfaced that an earlier
+    version did exactly that -- one open connection wrapped every
+    deliver_webhook_once() call for a whole batch, and the first
+    successful/failed delivery in that batch already escalates the
+    connection to SQLite's write lock. A single slow or unreachable
+    webhook (deliver_webhook_once() retries 3x with backoff, up to ~30s
+    worst case) then held that write lock for the entire remainder of the
+    batch, starving every other writer in the process -- including
+    ordinary user logins -- with a real, reproducible 'database is
+    locked' error. Fetching the work with one short-lived read connection,
+    doing all delivery with no connection open, then persisting results
+    with a second short-lived write connection closes that gap."""
+    events = claim_new_audit_events()
+    if not events:
+        return 0
+    with connect() as db:
+        work = [
+            (event, webhook)
+            for event in events
+            for webhook in rows(db.execute("SELECT * FROM webhooks WHERE instance_id=? AND active=1", (event["instance_id"],)))
+            if webhook_matches(webhook["events_json"], event["action"])
+        ]
+    deliveries = [
+        (webhook["id"], event["id"], event["action"], *deliver_webhook_once(webhook, event))
+        for event, webhook in work
+    ]
+    if deliveries:
+        with connect() as db:
+            for webhook_id, audit_id, action, status, error, attempts in deliveries:
+                db.execute(
+                    "INSERT INTO webhook_deliveries(webhook_id,audit_id,event_type,success,status_code,error,attempts,attempted_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (webhook_id, audit_id, action, 1 if status and 200<=status<300 else 0, status, error, attempts, now()),
+                )
+            db.commit()
+    return len(deliveries)
+
+
 def webhook_dispatcher_loop() -> None:
     """Background poller (mirrors the SSE feed's own polling design): picks
     up newly committed audit rows and delivers them to every active webhook
     subscribed to that action, so delivery never blocks a request thread."""
     while True:
         try:
-            events = claim_new_audit_events()
-            if events:
-                with connect() as db:
-                    for event in events:
-                        webhooks = rows(db.execute("SELECT * FROM webhooks WHERE instance_id=? AND active=1", (event["instance_id"],)))
-                        for webhook in webhooks:
-                            if not webhook_matches(webhook["events_json"], event["action"]): continue
-                            status, error, attempts = deliver_webhook_once(webhook, event)
-                            db.execute(
-                                "INSERT INTO webhook_deliveries(webhook_id,audit_id,event_type,success,status_code,error,attempts,attempted_at) VALUES(?,?,?,?,?,?,?,?)",
-                                (webhook["id"], event["id"], event["action"], 1 if status and 200<=status<300 else 0, status, error, attempts, now()),
-                            )
-                    db.commit()
+            dispatch_pending_webhooks()
         except Exception as exc:
             print(f"webhook dispatcher error: {exc}")
         time.sleep(2)

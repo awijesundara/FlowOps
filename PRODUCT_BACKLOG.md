@@ -979,10 +979,46 @@ implementation pass**; requires real infrastructure in a second geographic
 region, not available on this single-LAN, 2-node MicroK8s deployment.
 
 Validated hundreds-of-users/thousands-of-tasks real-time performance
-(P0/L): `BACKLOG`, in progress — extending the existing
-`tools/load_test_realtime.py` (already proven at 150 concurrent viewers,
-see Epic 1.5) to 300 and 500 concurrent viewers against the Docker
-preview.
+(P0/L): `DONE` (2026-09-12). Extended `tools/load_test_realtime.py`
+(already proven at 150 concurrent viewers, see Epic 1.5) to 300 and 500
+concurrent viewers against the Docker preview, with real concurrent HTTP
+clients (parallelized logins via a thread pool — sequential 240,000-round
+PBKDF2 logins alone would have exceeded the listener-readiness window at
+this concurrency). Results: 300 viewers → 300/300 delivered, 0 errors, 0
+timeouts, p50 0.802s / p95 0.978s / max 1.012s; 500 viewers → 500/500
+delivered, 0 errors, 0 timeouts, p50 0.768s / p95 0.957s / max 1.003s.
+Both runs stayed well under the 2-second target and server logs were
+clean (no errors/tracebacks, no "database is locked").
+
+This pass also caught and fixed a real bug rather than just measuring
+against a healthy server: `webhook_dispatcher_loop()` was holding one
+open SQLite connection across every webhook delivery in a batch, and the
+first delivery already escalates that connection to SQLite's write lock
+— a single slow or unreachable webhook (accumulated dead test
+registrations from earlier sessions, each retried 3x with backoff, up to
+~30s) starved every other writer in the process, including ordinary user
+logins, with a real, reproducible "database is locked" error surfaced
+under this load-test session's sustained traffic. Fixed by extracting
+`dispatch_pending_webhooks()` to use short-lived connections around the
+actual delivery (network I/O), mirroring the pattern
+`claim_new_audit_events()` already established. Regression test:
+`test_slow_webhook_delivery_does_not_hold_the_database_write_lock`
+(validated to fail against the old code and pass against the fix, using
+two webhooks — a fast one to cause the lock-escalating write, a slow one
+to hold it — since a single webhook doesn't reproduce the bug).
+
+Resource-limit finding: the local Docker preview (no CPU/memory cap) used
+~1.19GiB RSS and ~196% CPU during the 500-viewer propagation burst — 500
+concurrent SSE connections under `ThreadingHTTPServer`'s
+thread-per-connection model means 500 live OS threads. The MicroK8s
+deployment's current limits (`~/Github/k8s/flowops.yaml`: `cpu: "1",
+memory: 512Mi`) are too tight for this scale and would likely OOM-kill or
+CPU-throttle the pod at 500 concurrent viewers in production. Bumped to
+`cpu: "2", memory: 1536Mi` (documented as based on this measurement, with
+headroom) and deployed — see `~/Github/k8s` commit history for the exact
+change. Direct load-testing against the live k8s deployment at this scale
+remains a recommended follow-up rather than assumed equivalent to the
+Docker-preview result.
 
 Exit: regulated enterprises can run large multi-region operations with
 compliance-grade evidence.
@@ -998,7 +1034,33 @@ compliance-grade evidence.
 | Public API rate limiting | P1 | DONE |
 | Core execution UI accessibility review | P1 | DONE for Phase 1 |
 | Internationalization scaffolding | P2 | DONE |
-| FlowOps platform disaster-recovery plan | P1 | BACKLOG |
+| FlowOps platform disaster-recovery plan | P1 | DONE |
+
+FlowOps platform disaster-recovery plan (2026-09-12): `DONE`. Documented in
+`docs/DR_PLAN.md` plus an actually-run scripted drill (`tools/dr_drill.sh`),
+per this backlog's own closing standard that a plan alone doesn't count —
+the drill's own exit code and printed assertions are the evidence. The
+drill builds the current image, boots a throwaway primary instance, seeds
+a unique marker runbook, triggers a real encrypted backup through the
+actual `POST /api/admin/backups` path, confirms the backup file does not
+open as plain SQLite (proving it's genuinely encrypted, not just
+renamed), decrypts it with the real `SettingsCipher`, confirms the
+decrypted file **does** open as valid SQLite, restores it onto a
+**separate** throwaway instance on a **separate** fresh Docker volume,
+and confirms the marker runbook survived via a real `GET /api/runbooks`
+call — then tears everything down regardless of outcome (verified: no
+leftover containers/volumes/images after a run). The drill's first run
+found a real bug in the restore procedure, not a hypothetical one: a
+freshly-copied-in database file lands owned by root (the helper
+container's user), but FlowOps's image runs as a non-root user (uid
+10001/gid 999 — see `Dockerfile`), so the restored instance failed to
+start until the restore step explicitly `chown`s the file to match. This
+is now documented as a required restore step in `docs/DR_PLAN.md` and
+fixed in the drill script itself — exactly the kind of detail a
+written-only plan would have missed. Full verified transcript recorded in
+`docs/DR_PLAN.md`. Excluded from scope, as previously noted: regional
+failover (Epic 4.6, requires infrastructure in a second geographic region
+not available on this single-LAN, 2-node MicroK8s deployment).
 
 Internationalization scaffolding (2026-09-11): `DONE`. A `static/strings.js`
 keyed dictionary (`en`/`ja` — Japanese chosen to match this codebase's
