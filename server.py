@@ -1943,7 +1943,7 @@ class Handler(BaseHTTPRequestHandler):
         # refresh or direct link landed on a raw {"error":"Not found"} JSON
         # body instead of the app. These just serve the same shell; app.js
         # reads location.pathname on load to restore the right view.
-        if path in ("/runbooks","/templates","/analytics","/admin") or re.match(r"^/runbooks/\d+$",path):
+        if path in ("/runbooks","/templates","/analytics","/admin") or re.match(r"^/runbooks/\d+$",path) or re.match(r"^/admin/[A-Za-z]+$",path):
             return self.static("index.html","text/html; charset=utf-8")
         if path=="/app.js": return self.static("app.js","application/javascript; charset=utf-8")
         if path=="/strings.js": return self.static("strings.js","application/javascript; charset=utf-8")
