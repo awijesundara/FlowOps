@@ -971,6 +971,74 @@ class FlowOpsTest(unittest.TestCase):
             self.assertFalse(any(w['id']==webhook_id for w in listedAfter['data']))
         finally:
             receiver.shutdown()
+    def test_slow_webhook_delivery_does_not_hold_the_database_write_lock(self):
+        """Regression test for a real bug found via load testing (see
+        docs/DR_PLAN.md-adjacent load-test evidence in PRODUCT_BACKLOG.md):
+        dispatch_pending_webhooks() used to hold one open SQLite connection
+        across every webhook delivery in a batch, and the first delivery
+        already escalates that connection to SQLite's write lock. A single
+        slow webhook then starved every other writer -- including ordinary
+        logins -- for the full delivery duration. This proves a concurrent
+        write completes quickly while a real, deliberately slow delivery is
+        still in flight on a background thread."""
+        # Two webhooks matter here, not one: a lone webhook's delivery is
+        # made from a read-only connection (no write lock yet -- SQLite
+        # only escalates on the first actual write). The real bug only
+        # shows once an EARLIER webhook's delivery has already caused an
+        # INSERT on that same open connection, escalating it to the write
+        # lock, and a LATER webhook's slow delivery then holds that lock.
+        # A fast receiver first, then the slow one, reproduces exactly that.
+        import http.server as http_server_module
+        release_response = threading.Event()
+        class FastReceiver(http_server_module.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length=int(self.headers.get('Content-Length','0')); self.rfile.read(length)
+                self.send_response(200); self.end_headers()
+            def log_message(self,*a): pass
+        class SlowReceiver(http_server_module.BaseHTTPRequestHandler):
+            def do_POST(self):
+                release_response.wait(timeout=10)
+                length=int(self.headers.get('Content-Length','0')); self.rfile.read(length)
+                self.send_response(200); self.end_headers()
+            def log_message(self,*a): pass
+        fast_receiver=http_server_module.HTTPServer(('127.0.0.1',0),FastReceiver)
+        slow_receiver=http_server_module.HTTPServer(('127.0.0.1',0),SlowReceiver)
+        threading.Thread(target=fast_receiver.serve_forever,daemon=True).start()
+        threading.Thread(target=slow_receiver.serve_forever,daemon=True).start()
+        webhook_ids=[]
+        try:
+            code,fast_webhook=self.req('/api/admin/webhooks','POST',{'name':'Fast receiver','url':f'http://127.0.0.1:{fast_receiver.server_port}/hook','events':['folder.created']})
+            self.assertEqual(code,201); webhook_ids.append(fast_webhook['data']['id'])
+            code,created=self.req('/api/admin/webhooks','POST',{'name':'Slow receiver','url':f'http://127.0.0.1:{slow_receiver.server_port}/hook','events':['folder.created']})
+            self.assertEqual(code,201); webhook_ids.append(created['data']['id'])
+            with patch('server.safe_urlopen',unrestricted_urlopen):
+                code,_=self.req('/api/folders','POST',{'name':f'DispatchLockTest{time.time()}'})
+                self.assertIn(code,(200,201))
+                dispatch_thread=threading.Thread(target=server.dispatch_pending_webhooks)
+                dispatch_thread.start()
+                time.sleep(0.3)  # let the dispatcher start the (blocked) delivery
+                # An isolated request/opener -- self.req() shares this
+                # class's session cookie jar and cls.csrf across every test
+                # in the file; logging in through it here would silently
+                # rotate the shared session's CSRF token and break every
+                # later test's POST/PATCH/DELETE calls.
+                login_request=urllib.request.Request(self.base+'/api/auth/login',
+                    data=json.dumps({'username':'admin','password':'FlowOps!Preview2026'}).encode(),
+                    method='POST',headers={'Content-Type':'application/json'})
+                started=time.monotonic()
+                try:
+                    with urllib.request.urlopen(login_request,timeout=5) as res: login_code=res.status
+                except urllib.error.HTTPError as err: login_code=err.code
+                elapsed=time.monotonic()-started
+                release_response.set()
+                dispatch_thread.join(timeout=10)
+            self.assertEqual(login_code,200)
+            self.assertLess(elapsed,2.0,f"a concurrent login took {elapsed:.2f}s while a slow webhook delivery was in flight -- the write lock is being held across delivery again")
+        finally:
+            release_response.set()
+            fast_receiver.shutdown()
+            slow_receiver.shutdown()
+            for webhook_id in webhook_ids: self.req(f'/api/admin/webhooks/{webhook_id}','DELETE')
     def test_webhook_event_actions_list_matches_real_append_audit_call_sites(self):
         import re
         source=(server.STATIC.parent/'server.py').read_text()
