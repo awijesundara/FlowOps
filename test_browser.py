@@ -58,6 +58,43 @@ class FlowOpsBrowserTest(unittest.TestCase):
         self.assertIsNotNone(badge, "unread-count badge element should exist in the DOM")
         self.assertFalse(badge.is_visible(), "badge must be hidden when there is nothing unread")
 
+    def test_notification_bell_rings_and_colors_by_severity(self):
+        """The bell rings on every new live-activity arrival and its badge
+        (plus each drawer row) is colored by a severity derived from the
+        audit action string: failures/incidents/escalations are critical
+        (red, the pre-existing default badge color), things worth a look
+        soon are warning (amber), everything else is informational (blue)."""
+        self.page.evaluate(
+            "announceActivity({data: JSON.stringify({"
+            "action: 'task.escalated', actor: 'System', "
+            "detail: 'Deploy application release is overdue', "
+            "created_at: new Date().toISOString()})})"
+        )
+        animation = self.page.evaluate(
+            "getComputedStyle(document.querySelector('#notifBell')).animationName"
+        )
+        self.assertEqual(animation, "notifBellRing", "the bell must ring on a new arrival")
+        badge = self.page.query_selector('.unread-count')
+        self.assertTrue(badge.is_visible())
+        self.assertNotIn("sev-warning", badge.get_attribute("class"))
+        self.assertNotIn("sev-info", badge.get_attribute("class"))
+
+        self.page.evaluate(
+            "announceActivity({data: JSON.stringify({"
+            "action: 'comment.added', actor: 'Priya', "
+            "detail: 'left a comment on Payments release', "
+            "created_at: new Date().toISOString()})})"
+        )
+        self.page.click('#notifBell')
+        self.page.wait_for_selector('.notification-drawer.open')
+        items = self.page.query_selector_all('.notification-item')
+        classes = [item.get_attribute("class") for item in items]
+        self.assertTrue(any("sev-critical" in c for c in classes), classes)
+        self.assertTrue(any("sev-info" in c for c in classes), classes)
+        # Opening the drawer resets the unread state, including the
+        # severity that had colored the badge, back to the base style.
+        self.assertEqual(badge.get_attribute("class"), "unread-count")
+
     def test_runbooks_page_shows_new_runbook_button_exactly_once(self):
         self.page.click('[data-view="runbooks"]', force=True)
         self.page.wait_for_selector('#runbooks.view.active')
