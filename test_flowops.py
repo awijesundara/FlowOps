@@ -1902,10 +1902,21 @@ class FlowOpsTest(unittest.TestCase):
                 self.assertTrue(result['filename'].endswith('.db.enc'))
                 enc_path=__import__('pathlib').Path(backup_dir)/result['filename']
                 ciphertext=enc_path.read_bytes()
-                # must NOT be a readable SQLite file on disk
+                # must NOT be a readable SQLite file on disk. A bare
+                # "SELECT 1" (no table reference) doesn't reliably force a
+                # page read on every SQLite build -- some defer file
+                # validation until real content is actually needed, which
+                # made this assertion pass locally (a newer bundled SQLite)
+                # but consistently fail on GitHub Actions' runner (an older
+                # one) despite the encryption itself being correct either
+                # way. Querying sqlite_master always requires reading page
+                # 1's schema, so it reliably raises on a genuinely
+                # non-SQLite file regardless of SQLite version.
                 self.assertFalse(ciphertext.startswith(b'SQLite format 3'))
                 with self.assertRaises(server.sqlite3.DatabaseError):
-                    server.sqlite3.connect(str(enc_path)).execute('SELECT 1').fetchone()
+                    server.sqlite3.connect(str(enc_path)).execute(
+                        "SELECT name FROM sqlite_master LIMIT 1"
+                    ).fetchone()
                 # round-trips back to a valid SQLite database via the same cipher
                 plaintext=server.settings_cipher().decrypt(ciphertext)
                 self.assertTrue(plaintext.startswith(b'SQLite format 3'))
