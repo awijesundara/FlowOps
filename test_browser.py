@@ -107,6 +107,7 @@ class FlowOpsBrowserTest(unittest.TestCase):
     def test_admin_landing_shows_category_areas_exactly_once(self):
         self.page.click('[data-view="admin"]')
         self.page.wait_for_selector('#admin.view.active')
+        self.page.wait_for_timeout(250)
         rows = self.page.query_selector_all('#adminCatList .admin-cat-row')
         self.assertGreater(len(rows), 0)
         titles = [r.inner_text() for r in rows]
@@ -165,6 +166,7 @@ class FlowOpsBrowserTest(unittest.TestCase):
         self.page.evaluate("setLocale('en')")  # restore for other tests
 
     def test_login_screen_renders_in_the_locale_persisted_from_a_previous_session(self):
+        self.page.click('#accountMenuToggle')
         self.page.click('#logout')
         self.page.wait_for_selector('.login-button')
         self.page.evaluate("localStorage.setItem('flowops_locale','ja')")
@@ -248,11 +250,151 @@ class FlowOpsBrowserTest(unittest.TestCase):
         self.assertEqual(before, after, "the sidebar must not move at all while the page scrolls")
 
     def test_modal_close_buttons_are_square_icon_buttons_not_stretched(self):
+        self.page.click('#accountMenuToggle')
         self.page.click('#openProfile')
         self.page.wait_for_selector('#profileModal[open]')
         box = self.page.eval_on_selector('.close-profile', "el => { const r = el.getBoundingClientRect(); return {w: r.width, h: r.height}; }")
         self.assertLess(box['h'], 60, f"profile modal close button is stretched tall: {box}")
         self.assertAlmostEqual(box['w'], box['h'], delta=4, msg=f"close button should be roughly square: {box}")
+
+    def test_compact_layout_and_viewport_aware_menus_at_desktop_widths(self):
+        for width in (1440, 1280, 1024):
+            self.page.set_viewport_size({'width': width, 'height': 800})
+            self.page.evaluate("show('home')")
+            card_heights = self.page.eval_on_selector_all('#home .metrics article', 'els => els.map(e => e.getBoundingClientRect().height)')
+            self.assertTrue(card_heights)
+            self.assertLessEqual(max(card_heights), 130, f'KPI cards are too tall at {width}px: {card_heights}')
+            self.assertLessEqual(max(card_heights)-min(card_heights), 1, f'KPI cards are not equal-height at {width}px')
+            self.page.evaluate("show('runbooks')")
+            self.page.locator('.trow[data-id]').first.click()
+            self.page.wait_for_selector('#detail.view.active')
+            if width > 1024:
+                columns = self.page.eval_on_selector('.detail-grid', "el => {const a=el.children[0].getBoundingClientRect().width,b=el.children[1].getBoundingClientRect().width;return {a,b,ratio:a/(a+b)}}")
+                self.assertGreaterEqual(columns['ratio'], .74, f'execution plan should receive at least 74% at {width}px: {columns}')
+            self.page.click('.more-menu-toggle')
+            bounds = self.page.eval_on_selector('.more-menu:not([hidden])', "el => {const r=el.getBoundingClientRect();return {left:r.left,top:r.top,right:r.right,bottom:r.bottom,height:r.height,viewportW:innerWidth,viewportH:innerHeight,overflow:getComputedStyle(el).overflowY}}")
+            self.assertGreaterEqual(bounds['left'], 0); self.assertGreaterEqual(bounds['top'], 0)
+            self.assertLessEqual(bounds['right'], bounds['viewportW']); self.assertLessEqual(bounds['bottom'], bounds['viewportH'])
+            self.assertLessEqual(bounds['height'], bounds['viewportH']*.7+1)
+            self.assertIn(bounds['overflow'], ('auto','scroll'))
+            self.page.keyboard.press('Escape')
+
+    def test_sidebar_collapses_and_account_menu_is_keyboard_accessible(self):
+        before = self.page.eval_on_selector('#appSidebar', 'el => el.getBoundingClientRect().width')
+        self.page.click('#collapseSidebar')
+        self.page.wait_for_timeout(250)
+        after = self.page.eval_on_selector('#appSidebar', 'el => el.getBoundingClientRect().width')
+        self.assertLess(after, before)
+        self.assertTrue(self.page.locator('#profile .avatar').is_visible())
+        self.assertFalse(self.page.locator('#profile .profile-copy').is_visible())
+        self.page.click('#accountMenuToggle')
+        self.page.wait_for_selector('#accountMenu:not([hidden])')
+        self.assertEqual(self.page.evaluate('document.activeElement.id'), 'openProfile')
+        self.page.keyboard.press('ArrowDown')
+        self.assertEqual(self.page.evaluate('document.activeElement.id'), 'accountSettings')
+        self.page.keyboard.press('Escape')
+        self.assertTrue(self.page.locator('#accountMenu').is_hidden())
+
+    def test_dashboard_greeting_boundaries_and_visible_runbook_source_are_consistent(self):
+        periods = self.page.evaluate("[4,5,11,12,16,17,23].map(greetingPeriod)")
+        self.assertEqual(periods, ['evening','morning','morning','afternoon','afternoon','evening','evening'])
+        expected = self.page.evaluate("state.runbooks.filter(r => !['complete','cancelled'].includes(r.status)).length")
+        self.assertEqual(int(self.page.inner_text('#mRunbooks')), expected)
+        card_count = self.page.locator('#runbookCards .runbook-card').count()
+        if self.page.evaluate('state.runbooks.length'):
+            self.assertGreater(card_count, 0, 'a non-empty runbook collection must not render the empty state')
+            self.assertEqual(self.page.locator('#runbookCards .dashboard-empty').count(), 0)
+
+    def test_administration_uses_global_icon_rail_and_compact_secondary_navigation(self):
+        self.page.set_viewport_size({'width': 1440, 'height': 900})
+        self.page.click('[data-view="admin"]')
+        self.page.wait_for_selector('#admin.view.active')
+        widths = self.page.evaluate("""() => ({
+            global: document.querySelector('#appSidebar').getBoundingClientRect().width,
+            admin: document.querySelector('.admin-sidenav').getBoundingClientRect().width,
+            overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+        })""")
+        self.assertLessEqual(widths['global'], 72)
+        self.assertGreaterEqual(widths['admin'], 230)
+        self.assertLessEqual(widths['admin'], 250)
+        self.assertLessEqual(widths['overflow'], 0)
+        self.assertFalse(self.page.locator('#adminScopeBanner').is_visible())
+
+    def test_administration_global_navigation_can_expand_and_collapse(self):
+        self.page.set_viewport_size({'width': 1440, 'height': 900})
+        self.page.evaluate("localStorage.removeItem('flowops_admin_global_expanded')")
+        baseline = self.page.evaluate("getComputedStyle(document.querySelector('[data-view=\"runbooks\"]')).fontSize")
+        self.page.click('[data-view="admin"]')
+        self.page.wait_for_selector('#admin.view.active')
+        self.assertLessEqual(self.page.locator('#appSidebar').bounding_box()['width'], 72)
+        self.page.click('#collapseSidebar')
+        self.page.wait_for_timeout(250)
+        self.assertGreaterEqual(self.page.locator('#appSidebar').bounding_box()['width'], 230)
+        self.assertIn('Collapse', self.page.get_attribute('#collapseSidebar', 'aria-label'))
+        self.assertEqual(
+            self.page.evaluate("getComputedStyle(document.querySelector('[data-view=\"runbooks\"]')).fontSize"),
+            baseline,
+            'expanding global navigation in Administration must not change label typography',
+        )
+        self.page.click('#collapseSidebar')
+        self.page.wait_for_timeout(250)
+        self.assertLessEqual(self.page.locator('#appSidebar').bounding_box()['width'], 72)
+        self.assertIn('Expand', self.page.get_attribute('#collapseSidebar', 'aria-label'))
+
+    def test_runbook_and_generated_dialog_actions_never_overlap(self):
+        self.page.click('#newRunbook')
+        self.page.wait_for_selector('#runbookModal[open]')
+        buttons = self.page.locator('#runbookModal .modalactions button')
+        self.assertEqual(buttons.count(), 2)
+        left, right = buttons.nth(0).bounding_box(), buttons.nth(1).bounding_box()
+        self.assertLessEqual(left['x'] + left['width'], right['x'])
+        self.assertEqual(round(left['height']), round(right['height']))
+        self.assertGreaterEqual(left['height'], 44)
+        self.assertEqual(
+            self.page.evaluate("getComputedStyle(document.querySelector('#runbookModal .modalactions button:first-child')).fontSize"),
+            self.page.evaluate("getComputedStyle(document.querySelector('#runbookModal .modalactions button:last-child')).fontSize"),
+        )
+        self.page.click('#runbookModal .close')
+        self.page.set_viewport_size({'width': 390, 'height': 844})
+        self.page.click('#newRunbook')
+        self.page.wait_for_selector('#runbookModal[open]')
+        left, right = buttons.nth(0).bounding_box(), buttons.nth(1).bounding_box()
+        self.assertLessEqual(left['x'] + left['width'], right['x'])
+        self.assertLessEqual(right['x'] + right['width'], 390)
+
+    def test_analytics_is_populated_from_real_runbook_and_delay_sources(self):
+        self.page.click('[data-view="analytics"]')
+        self.page.wait_for_selector('#analytics.view.active')
+        self.page.wait_for_function("document.querySelector('#analyticsTotal').textContent !== '—'")
+        self.assertEqual(int(self.page.inner_text('#analyticsTotal')), self.page.evaluate('state.runbooks.length'))
+        self.assertEqual(self.page.locator('[data-analytics-runbook]').count(), self.page.evaluate('state.runbooks.length'))
+        self.assertTrue(self.page.locator('#analyticsDistribution').is_visible())
+        self.assertTrue(self.page.locator('#delayReportTable').is_visible())
+        self.assertLessEqual(self.page.evaluate('document.documentElement.scrollWidth - document.documentElement.clientWidth'), 0)
+
+    def test_account_control_only_shows_acting_context_for_real_elevation(self):
+        self.assertTrue(self.page.locator('#actingContext').is_hidden())
+        self.page.click('#accountMenuToggle')
+        self.assertIn('Administrator', self.page.inner_text('#accountCurrentRole'))
+        if self.page.locator('#actingAs').is_visible():
+            self.assertTrue(self.page.evaluate("Boolean(state.user.available_roles?.length > 1 || state.user.workspaces?.length > 1)"))
+        self.assertTrue(self.page.locator('#accountEmail').count())
+
+    def test_dashboard_and_administration_reflow_at_supported_widths(self):
+        for width in (1536, 1440, 1280, 1024, 768, 390):
+            self.page.set_viewport_size({'width': width, 'height': 900})
+            self.page.evaluate("show('home', {skipHistory:true})")
+            self.page.wait_for_timeout(220)
+            home = self.page.evaluate("""() => ({
+                overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+                columns: getComputedStyle(document.querySelector('.metrics')).gridTemplateColumns.split(' ').length,
+            })""")
+            self.assertLessEqual(home['overflow'], 0, f'dashboard overflow at {width}px')
+            self.assertEqual(home['columns'], 4 if width > 1100 else 2 if width > 480 else 1)
+            self.page.evaluate("show('admin', {skipHistory:true})")
+            self.page.wait_for_timeout(220)
+            admin_overflow = self.page.evaluate("document.documentElement.scrollWidth - document.documentElement.clientWidth")
+            self.assertLessEqual(admin_overflow, 0, f'administration overflow at {width}px')
 
     def test_view_switches_and_admin_pane_switches_use_a_real_reveal_animation(self):
         self.page.click('[data-view="runbooks"]', force=True)
@@ -366,7 +508,9 @@ class FlowOpsBrowserTest(unittest.TestCase):
         self.page.set_viewport_size({'width': 320, 'height': 800})
         self.page.evaluate("show('runbooks')")
         overflow = self.page.evaluate('document.documentElement.scrollWidth - window.innerWidth')
-        self.assertLessEqual(overflow, 1, f'page overflows horizontally by {overflow}px')
+        layout = self.page.evaluate("({innerWidth,media:matchMedia('(max-width: 900px)').matches,main:getComputedStyle(document.querySelector('main')).marginLeft,mainBox:document.querySelector('main').getBoundingClientRect().toJSON(),shell:document.querySelector('.shell').className})")
+        offenders = self.page.evaluate("[...document.querySelectorAll('body *')].map(e=>({tag:e.tagName,id:e.id,cls:e.className&&String(e.className).slice(0,80),right:e.getBoundingClientRect().right,width:e.getBoundingClientRect().width})).filter(x=>x.right>innerWidth+1||x.width>innerWidth+1).slice(0,12)")
+        self.assertLessEqual(overflow, 1, f'page overflows horizontally by {overflow}px; layout={layout}; offenders={offenders}')
 
     def _assert_task_execution_view_reflows_and_has_real_touch_targets(self, width, height):
         self.page.set_viewport_size({'width': width, 'height': height})
