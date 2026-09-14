@@ -1890,6 +1890,41 @@ class FlowOpsTest(unittest.TestCase):
                 self.assertEqual(code,200)
                 filenames=[b['filename'] for b in listed['data']['backups']]
                 self.assertIn(created['data']['filename'],filenames)
+    def test_admin_can_download_a_backup_file_and_bytes_match_disk(self):
+        with tempfile.TemporaryDirectory() as backup_dir:
+            with patch('server.BACKUP_DIR', __import__('pathlib').Path(backup_dir)):
+                _,created=self.req('/api/admin/backups','POST',{})
+                filename=created['data']['filename']
+                on_disk=(__import__('pathlib').Path(backup_dir)/filename).read_bytes()
+                request=urllib.request.Request(self.base+f'/api/admin/backups/{filename}')
+                with self.opener.open(request) as res:
+                    self.assertEqual(res.status,200)
+                    self.assertEqual(res.read(),on_disk)
+                    self.assertIn(filename,res.headers.get('Content-Disposition',''))
+    def test_backup_download_requires_its_own_scope_not_broader_admin_access(self):
+        with tempfile.TemporaryDirectory() as backup_dir:
+            with patch('server.BACKUP_DIR', __import__('pathlib').Path(backup_dir)):
+                _,created=self.req('/api/admin/backups','POST',{})
+                filename=created['data']['filename']
+                _,runbooks_token=self.req('/api/admin/api-tokens','POST',{'name':'Wrong scope for backups','scopes':['runbooks:read']})
+                _,backups_token=self.req('/api/admin/api-tokens','POST',{'name':'Backup sync','scopes':['backups:read']})
+                def bearer_get(token):
+                    request=urllib.request.Request(self.base+f'/api/admin/backups/{filename}',headers={'Authorization':f'Bearer {token}'})
+                    try:
+                        with urllib.request.urlopen(request) as res:return res.status
+                    except urllib.error.HTTPError as err:return err.code
+                self.assertEqual(bearer_get(runbooks_token['data']['token']),403)
+                self.assertEqual(bearer_get(backups_token['data']['token']),200)
+    def test_backup_download_rejects_unknown_or_path_traversal_filenames(self):
+        with tempfile.TemporaryDirectory() as backup_dir:
+            with patch('server.BACKUP_DIR', __import__('pathlib').Path(backup_dir)):
+                self.req('/api/admin/backups','POST',{})
+                for bad_name in ('does-not-exist.db.enc','..%2F..%2F..%2Fetc%2Fpasswd','..','flowops-x/../../../etc/passwd'):
+                    request=urllib.request.Request(self.base+f'/api/admin/backups/{bad_name}')
+                    try:
+                        with self.opener.open(request) as res:code=res.status
+                    except urllib.error.HTTPError as err:code=err.code
+                    self.assertEqual(code,404,bad_name)
     def test_backup_retention_deletes_oldest_beyond_retain_limit(self):
         with tempfile.TemporaryDirectory() as backup_dir:
             with patch('server.BACKUP_DIR', __import__('pathlib').Path(backup_dir)), patch('server.BACKUP_RETAIN', 2):
