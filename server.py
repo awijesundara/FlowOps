@@ -93,7 +93,7 @@ STATIC = Path(__file__).with_name("static")
 MAX_BODY = 1_000_000
 DEFAULT_INSTANCE_SLUG = "flowops"
 ROLE_PERMISSIONS = {
-    "Admin": {"runbooks:view","runbooks:edit","runbooks:execute","integrations:sync","admin:access","admin:users","admin:settings"},
+    "Admin": {"runbooks:view","runbooks:edit","runbooks:execute","integrations:sync","admin:access","admin:users","admin:settings","backups:read"},
     "Editor": {"runbooks:view","runbooks:edit","runbooks:execute","integrations:sync"},
     "Member": {"runbooks:view","runbooks:execute"},
     "Stakeholder": {"runbooks:view"},
@@ -111,6 +111,11 @@ TOKEN_SCOPE_PERMISSIONS = {
     "runbooks:read": {"runbooks:view"},
     "runbooks:write": {"runbooks:view","runbooks:edit","runbooks:execute"},
     "scim:provision": {"scim:provision"},
+    # Deliberately its own narrow scope rather than admin:access -- a token
+    # meant only to pull encrypted backup files off-host (see the
+    # off-node backup CronJob) has no business also being able to manage
+    # users or settings if it were ever leaked.
+    "backups:read": {"backups:read"},
 }
 
 # SCIM 2.0 schema URNs (RFC 7643/7644) -- reused verbatim by every SCIM
@@ -2097,6 +2102,25 @@ class Handler(BaseHTTPRequestHandler):
                 actor=self.require(db,"admin:access")
                 if not actor:return
                 return self.send_json({"data":{"backups":list_backups(),"retain":BACKUP_RETAIN,"interval_hours":BACKUP_INTERVAL_HOURS}})
+            if path.startswith("/api/admin/backups/"):
+                # Scoped to its own backups:read permission (see
+                # TOKEN_SCOPE_PERMISSIONS) rather than admin:access, so an
+                # off-host backup-sync token can't also manage users or
+                # settings if it were ever leaked. The filename is matched
+                # against list_backups()'s own real directory listing rather
+                # than trusted from the URL directly, so a crafted filename
+                # (e.g. containing "..") can never resolve outside BACKUP_DIR
+                # -- it just won't be found.
+                actor=self.require(db,"backups:read")
+                if not actor:return
+                requested_name=path[len("/api/admin/backups/"):]
+                match=next((item for item in list_backups() if item["filename"]==requested_name),None)
+                if not match:return self.send_json({"error":"Not found"},404)
+                file_path=BACKUP_DIR/match["filename"]
+                body=file_path.read_bytes()
+                self.send_response(200); self.send_header("Content-Type","application/octet-stream")
+                self.send_header("Content-Disposition",f'attachment; filename="{match["filename"]}"')
+                self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body); return
             if path=="/api/saved-views":
                 actor=self.require(db,"runbooks:view")
                 if not actor: return
