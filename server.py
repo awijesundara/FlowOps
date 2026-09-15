@@ -1802,6 +1802,15 @@ class Handler(BaseHTTPRequestHandler):
         return user
 
     def require(self, db: sqlite3.Connection, permission: str) -> dict[str,Any] | None:
+        return self.require_any(db, {permission})
+
+    def require_any(self, db: sqlite3.Connection, permissions: set[str]) -> dict[str,Any] | None:
+        """Like require(), but passes if the actor holds any one of several
+        permissions -- e.g. the backup listing endpoint is useful to both a
+        full admin:access session and a narrowly-scoped backups:read
+        automation token, and neither should have to be granted the other's
+        (broader, for the token; differently-shaped, for the admin) grant
+        just to read a list of filenames and sizes."""
         user=self.current_user(db)
         if not user:
             self.send_json({"error":"Authentication required"},401); return None
@@ -1809,7 +1818,7 @@ class Handler(BaseHTTPRequestHandler):
             retry_after=check_rate_limit(f"token:{user['username']}")
             if retry_after:
                 self.send_json({"error":"Rate limit exceeded. Slow down and try again shortly."},429,{"Retry-After":str(retry_after)}); return None
-        if permission not in user["permissions"]:
+        if not permissions & set(user["permissions"]):
             self.send_json({"error":f"Your {user['role']} role does not allow this action"},403); return None
         if user.get("auth_method")=="session" and self.command in {"POST","PATCH","PUT","DELETE"} and self.headers.get("X-CSRF-Token","") != user["csrf_token"]:
             self.send_json({"error":"Invalid or missing CSRF token"},403); return None
@@ -2099,7 +2108,7 @@ class Handler(BaseHTTPRequestHandler):
                 counts=db.execute("SELECT (SELECT COUNT(*) FROM users WHERE instance_id=? AND active=1),(SELECT COUNT(*) FROM workspaces WHERE instance_id=? AND active=1),(SELECT COUNT(*) FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE w.instance_id=?),(SELECT COUNT(*) FROM sessions s JOIN users u ON u.id=s.user_id WHERE u.instance_id=? AND s.expires_at>?)",(actor["instance_id"],actor["instance_id"],actor["instance_id"],actor["instance_id"],int(time.time()))).fetchone()
                 return self.send_json({"data":{"status":"healthy","version":VERSION,"database":db.execute("PRAGMA integrity_check").fetchone()[0],"active_users":counts[0],"workspaces":counts[1],"runbooks":counts[2],"active_sessions":counts[3],"email_configured":mail_configuration()["configured"],"credential_encryption_configured":bool(os.getenv("FLOWOPS_SETTINGS_ENCRYPTION_KEY")),"realtime":"SSE"}})
             if path=="/api/admin/backups":
-                actor=self.require(db,"admin:access")
+                actor=self.require_any(db,{"admin:access","backups:read"})
                 if not actor:return
                 return self.send_json({"data":{"backups":list_backups(),"retain":BACKUP_RETAIN,"interval_hours":BACKUP_INTERVAL_HOURS}})
             if path.startswith("/api/admin/backups/"):

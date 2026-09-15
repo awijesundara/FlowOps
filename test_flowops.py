@@ -1890,6 +1890,15 @@ class FlowOpsTest(unittest.TestCase):
                 self.assertEqual(code,200)
                 filenames=[b['filename'] for b in listed['data']['backups']]
                 self.assertIn(created['data']['filename'],filenames)
+    def test_backups_read_scoped_token_can_list_backups_without_admin_access(self):
+        with tempfile.TemporaryDirectory() as backup_dir:
+            with patch('server.BACKUP_DIR', __import__('pathlib').Path(backup_dir)):
+                self.req('/api/admin/backups','POST',{})
+                _,scoped_token=self.req('/api/admin/api-tokens','POST',{'name':'List-only sync check','scopes':['backups:read']})
+                request=urllib.request.Request(self.base+'/api/admin/backups',headers={'Authorization':f"Bearer {scoped_token['data']['token']}"})
+                with urllib.request.urlopen(request) as res:
+                    self.assertEqual(res.status,200)
+                    self.assertTrue(json.load(res)['data']['backups'])
     def test_admin_can_download_a_backup_file_and_bytes_match_disk(self):
         with tempfile.TemporaryDirectory() as backup_dir:
             with patch('server.BACKUP_DIR', __import__('pathlib').Path(backup_dir)):
