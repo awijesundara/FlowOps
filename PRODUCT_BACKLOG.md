@@ -1186,6 +1186,14 @@ screens still require the same gate as they are introduced.
    - Regression evidence covers admin expand/collapse, desktop/mobile dialog geometry, and analytics rendering from real runbook/API state. Browser screenshots were inspected at desktop and mobile widths before MicroK8s delivery.
 9. ~~Administration expanded-rail typography stability.~~ Done 2026-09-13 in v0.4.11: isolated the compact rail's 16px icon treatment from the expanded global navigation so entering Administration or unfolding its rail no longer increases label text from the application-standard 14px. A real-Chrome computed-style regression compares the normal and Administration-expanded states in addition to the existing width, persistence and collapse checks.
 
+10. ~~Cutover parity pass.~~ Done 2026-09-28 in v0.6.0 (product-owner direction: "FlowOps the same as Cutover in every possible way"; behaviour only, FlowOps branding kept per AGENTS.md):
+   - **Live vs rehearsal runs**: `POST /api/runbooks/{id}/transition` with `run_type` `live`/`rehearsal` on ready → live. Rehearsals skip the type approval gate, ServiceOps/ServiceNow lifecycle and CTASK write-back, automation calls (task auto-completes as `rehearsal_skipped`) and message delivery. `POST /api/runbooks/{id}/reset` returns a started rehearsal to ready with every task cleared; live runs are final. Every finished, cancelled or abandoned run is kept in `runbook_runs` (planned vs actual, completed and late counts), shown as a Run history card.
+   - **Task types**: checklist items (`checklist_items`, max 50) that must all be ticked (`POST /api/tasks/{id}/checklist`) before completion; email tasks send `message` to `recipients` via SMTP on completion (SMS/Call record the outcome honestly — no provider); a new `runbook` task type starts its linked child runbook and completes when that child completes.
+   - **Execution controls**: fixed start time (`fixed_start_at`) holds a task back; admin force start (`POST /api/tasks/{id}/force-start`, audited reason) overrides dependencies/fixed start; OR-gated joins now start server-side on the first finished branch (previously only the scheduler honoured OR); per-task comment threads (`POST /api/tasks/{id}/comments`); `startable` state plus a `task.ready` audit/webhook event and Web Push to the owner/team when predecessors finish.
+   - **Views**: My tasks (`GET /api/my-tasks`, `/my-tasks`), runbook Gantt view with actual-vs-plan and now line, portfolio timeline on the Runbooks page (list items now carry dependency-aware `planned_minutes`), live forecast finish (`timing.forecast_end_at`/`forecast_variance_seconds`) projected from actual progress, rehearsal banner.
+   - **Evidence**: Excel export (`GET /api/runbooks/{id}/tasks.xlsx`, stdlib Office Open XML); filtered audit export (`since`/`until`/`actor`/`action`/`runbook_id`). Duplicate now preserves `dependency_logic` (previously dropped) and the new task fields.
+   - Tests: 14 new functional tests (`test_rehearsal_*`, `test_checklist_*`, `test_fixed_start_*`, `test_task_comments_*`, `test_finishing_a_task_marks_successors_ready_*`, `test_my_tasks_*`, `test_email_task_*`, `test_runbook_task_*`, `test_forecast_*`, `test_task_xlsx_*`, `test_audit_export_filters_*`, `test_runbook_list_reports_*`, `test_duplicate_preserves_*`) and 4 real-Chrome tests. Templates and snippets do not yet carry checklist/recipient/fixed-start/linked-runbook fields; Gantt bars do not yet shift for fixed start times (the forecast does).
+
 ## Guide Requirements Traceability
 
 These notes were reconciled from `Cutover Task Executor Guide.pdf` (TE) and
@@ -1197,19 +1205,19 @@ FlowOps, but remain subordinate to the phase and P0 ordering above.
 | Requirement | Source | Backlog mapping | Status |
 |---|---|---|---|
 | Registration invitation, email/password login, optional SSO handoff | TE p1; QS p4 | 1.1 | PARTIAL |
-| Home shows accessible workspaces, live/planning runbooks, assigned tasks | TE p2; QS p5 | 1.2, 1.5 | PARTIAL |
+| Home shows accessible workspaces, live/planning runbooks, assigned tasks | TE p2; QS p5 | 1.2, 1.5 | DONE (v0.6.0: My tasks view) |
 | Global navigation, search, profile, help, role-aware admin/settings | QS p6 | 1.1, 1.5 | PARTIAL |
 | Individual and CSV user onboarding with roles/workspace permissions | QS p7 | 1.1; 2.1; 2.5 | PARTIAL |
 | Task detail shows timings, description, owners, teams, dependencies | TE p2; QS p15, p21 | 1.3, 1.4 | PARTIAL |
-| My Tasks focuses on tasks assigned to the user or their team | TE p2; QS p18 | 1.3, 1.5 | PARTIAL |
+| My Tasks focuses on tasks assigned to the user or their team | TE p2; QS p18 | 1.3, 1.5 | DONE (v0.6.0) |
 | Only assigned user/team can start or complete a startable task | TE p3; QS p27 | 1.3, 1.4 | DONE |
 | Dependency-blocked tasks are visible but disabled | TE p3; QS p27 | 1.3 | DONE |
 | Start and completion capture actual timestamps and unlock successors | TE p3; QS p27 | 1.3 | DONE |
-| Normal, Milestone, Checklist, Validation, SMS, Email, Call behaviors | TE p4 | 1.3 | PARTIAL |
+| Normal, Milestone, Checklist, Validation, SMS, Email, Call behaviors | TE p4 | 1.3 | DONE (v0.6.0: checklist items, real email delivery; SMS/Call are recorded, no provider) |
 | Validation completion captures Pass, Fail, Not Tested and commentary | TE p4 | 1.3, 1.6 | DONE |
-| Live/rehearsal start, pause, resume, cancel and admin override | QS p26-p27 | 1.5 | PARTIAL |
+| Live/rehearsal start, pause, resume, cancel and admin override | QS p26-p27 | 1.5 | DONE (v0.6.0) |
 | Planning countdown, overdue-start warning, live elapsed clock, and final planned-versus-actual duration | QS p14, p26-p27 | 1.2, 1.5 | DONE |
-| Automatic ready-to-start and run-start notifications | TE p3; QS p28 | 1.5 | PARTIAL |
+| Automatic ready-to-start and run-start notifications | TE p3; QS p28 | 1.5 | DONE (v0.6.0: task.ready audit/webhook event + Web Push to owners) |
 | Live single-runbook dashboard updates without refresh | QS p16, p30 | 1.5 | DONE |
 | Runbook audit includes detail, stream, team, task, and timing changes | QS p16, p29 | 1.6 | PARTIAL |
 
@@ -1217,13 +1225,13 @@ FlowOps, but remain subordinate to the phase and P0 ordering above.
 
 | Requirement | Source | Backlog mapping | Status |
 |---|---|---|---|
-| Workspace list/table/timeline views, sorting, filters, saved views | QS p8-p13 | 2.2 | PARTIAL (list view with saved filters DONE; table/timeline view alternatives remain BACKLOG) |
+| Workspace list/table/timeline views, sorting, filters, saved views | QS p8-p13 | 2.2 | DONE (v0.6.0: portfolio timeline view added alongside the list/table) |
 | Folders, nested folders, sticky/applied filters | QS p13 | 2.2 | DONE |
 | Runbook type selection and blank/template creation | QS p19-p20 | 2.2, 2.3 | PARTIAL |
 | Central teams propagate membership into linked runbook teams | QS p10-p11, p22 | 2.4 | DONE |
 | Interactive dependency node map with critical path | QS p17 | 2.6 | DONE (reconciled 2026-09-11 — see Epic 2.6: depth-based column layout, critical-path badge) |
 | Runbook home/pages for operational instructions and links | QS p16 | 2.2 | DONE (reconciled 2026-09-11 — see Epic 2.2: `runbooks.home_content`, `test_runbook_home_content_is_editable_and_returned_in_document`) |
-| CSV task import, filtered export, Excel/timezone options | QS p23 | 2.5 | PARTIAL (reconciled 2026-09-11 — CSV import/export DONE, see Epic 2.5; Excel-format export and per-column timezone options are the genuine remaining gap) |
+| CSV task import, filtered export, Excel/timezone options | QS p23 | 2.5 | PARTIAL (Excel export DONE in v0.6.0; per-column timezone options remain) |
 | Approved reusable snippets, maximum 100 tasks | QS p10, p24 | 2.3 | DONE (reconciled 2026-09-11 — see Epic 2.3: `POST /api/runbooks/{id}/save-as-snippet`/`insert-snippet`, 100-task cap enforced) |
 
 ### Phase 3 and 4 guide requirements
@@ -1235,7 +1243,7 @@ FlowOps, but remain subordinate to the phase and P0 ordering above.
 | Linked-runbook dashboard aggregates child progress live | QS p25 | 4.1, 4.2 | DONE (reconciled 2026-09-11 — see Epic 4.1: `aggregate_progress`/`aggregate_status` on the parent, live via `runbook_document()`) |
 | Multi-runbook dashboard with filters and scheduled email sharing | QS p31 | 4.2 | DONE (reconciled 2026-09-11 — per-user configurable dashboard and scheduled-email sharing both DONE, see Epic 4.2) |
 | Post-implementation review after completion | QS p32 | 4.2 | DONE |
-| Downloadable, filterable audit evidence | QS p29 | 4.3 | PARTIAL (reconciled 2026-09-11 — checksummed, hash-chain-verified download DONE via `GET /api/admin/audit/export`, see Epic 4.3; server-side filtering by date/actor/action is the genuine remaining gap — the endpoint always returns the full tenant history) |
+| Downloadable, filterable audit evidence | QS p29 | 4.3 | DONE (v0.6.0: date/actor/action/runbook filters; chain still verified over full history) |
 
 ### Video-derived integration requirements
 
@@ -1249,7 +1257,7 @@ reviewed from the full 5:22 transcript on 2026-09-06.
 | ServiceOps API compatibility test validates JSON, authentication, and `tickets:read`, and explains additional lifecycle scopes | ServiceOps REST API v1 contract | 3.1 | DONE |
 | Test Connection validates the URL and API key currently entered in the browser before saving, rather than silently testing a stale deployment fallback | ServiceOps administrator workflow regression 2026-09-10 | 3.1 | DONE |
 | Browser-triggered ServiceOps synchronization uses the authenticated CSRF-aware API client, recovers a stale in-memory CSRF token from the authenticated session with one safe retry, and refreshes the runbook projection without a page reload | ServiceOps runbook synchronization regressions 2026-09-10 and 2026-09-11 | 3.1 | DONE |
-| Integration tasks execute only in Live; rehearsal safely skips them | 1:28-1:39 | 3.1 | DONE (no distinct rehearsal mode exists; all task types already gate on live-only execution) |
+| Integration tasks execute only in Live; rehearsal safely skips them | 1:28-1:39 | 3.1 | DONE (v0.6.0: real rehearsal runs skip automation, messages and ServiceOps/ServiceNow sync) |
 | Directory sign-in delegates AD/LDAP verification to ServiceOps and displays the configured AD domain | ServiceOps login behavior | 4.4 | DONE |
 | Queued/running progress and percentage update the task in real time | 1:42-2:25 | 1.5, 3.1 | DONE |
 | Removed unsupported automation-provider configuration from the product surface and API | Product-owner decision 2026-09-07 | 3.1 | DONE |

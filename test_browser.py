@@ -223,7 +223,7 @@ class FlowOpsBrowserTest(unittest.TestCase):
                 if item['impact'] in ('serious', 'critical')
             )
         self.page.evaluate("show('runbooks')")
-        self.page.locator('.trow[data-id]').first.click()
+        self.page.locator('.trow[data-id]', has_text='Payments platform release').first.click()
         self.page.wait_for_selector('#detail.view.active')
         result = self.page.evaluate("""async () => await axe.run(document, {
             runOnly: {type: 'tag', values: ['wcag2a', 'wcag2aa', 'wcag21aa']}
@@ -239,7 +239,7 @@ class FlowOpsBrowserTest(unittest.TestCase):
     def test_sidebar_stays_fixed_in_place_while_the_page_scrolls(self):
         self.page.click('[data-view="runbooks"]', force=True)
         self.page.wait_for_selector('#runbooks.view.active')
-        self.page.locator('.trow[data-id]').first.click()
+        self.page.locator('.trow[data-id]', has_text='Payments platform release').first.click()
         self.page.wait_for_selector('#detail.view.active')
         position = self.page.evaluate("getComputedStyle(document.querySelector('aside')).position")
         self.assertEqual(position, 'fixed', "the primary nav sidebar must be truly fixed, not sticky, so it never drifts during scroll")
@@ -266,7 +266,7 @@ class FlowOpsBrowserTest(unittest.TestCase):
             self.assertLessEqual(max(card_heights), 130, f'KPI cards are too tall at {width}px: {card_heights}')
             self.assertLessEqual(max(card_heights)-min(card_heights), 1, f'KPI cards are not equal-height at {width}px')
             self.page.evaluate("show('runbooks')")
-            self.page.locator('.trow[data-id]').first.click()
+            self.page.locator('.trow[data-id]', has_text='Payments platform release').first.click()
             self.page.wait_for_selector('#detail.view.active')
             if width > 1024:
                 columns = self.page.eval_on_selector('.detail-grid', "el => {const a=el.children[0].getBoundingClientRect().width,b=el.children[1].getBoundingClientRect().width;return {a,b,ratio:a/(a+b)}}")
@@ -413,7 +413,7 @@ class FlowOpsBrowserTest(unittest.TestCase):
     def test_monitor_view_opens_from_the_runbook_and_shows_live_task_state(self):
         self.page.click('[data-view="runbooks"]', force=True)
         self.page.wait_for_selector('#runbooks.view.active')
-        self.page.locator('.trow[data-id]').first.click()
+        self.page.locator('.trow[data-id]', has_text='Payments platform release').first.click()
         self.page.wait_for_selector('#detail.view.active')
         rid = self.page.evaluate('state.current.id')
         self.page.goto(f'{self.base}/monitor.html?rid={rid}')
@@ -433,7 +433,7 @@ class FlowOpsBrowserTest(unittest.TestCase):
     def test_dependency_gate_badges_show_entry_sequential_and_and_or_correctly(self):
         self.page.click('[data-view="runbooks"]', force=True)
         self.page.wait_for_selector('#runbooks.view.active')
-        self.page.locator('.trow[data-id]').first.click()
+        self.page.locator('.trow[data-id]', has_text='Payments platform release').first.click()
         self.page.wait_for_selector('#detail.view.active')
         badges = self.page.eval_on_selector_all(
             '.task .gate-badge',
@@ -480,7 +480,7 @@ class FlowOpsBrowserTest(unittest.TestCase):
         # app's dialog conversion, so this test fills that form instead.
         self.page.click('[data-view="runbooks"]', force=True)
         self.page.wait_for_selector('#runbooks.view.active')
-        self.page.locator('.trow[data-id]').first.click()
+        self.page.locator('.trow[data-id]', has_text='Payments platform release').first.click()
         self.page.wait_for_selector('#detail.view.active')
         self.page.locator('.task .escalate-btn').first.click()
         self.page.wait_for_selector('dialog.generic-dialog[open]')
@@ -517,7 +517,7 @@ class FlowOpsBrowserTest(unittest.TestCase):
         self.page.click('#menu')  # off-canvas sidebar below 900px -- open it first, like a real mobile user would
         self.page.click('.shell.menu-open [data-view="runbooks"]')
         self.page.wait_for_selector('#runbooks.view.active')
-        self.page.locator('.trow[data-id]').first.click()
+        self.page.locator('.trow[data-id]', has_text='Payments platform release').first.click()
         self.page.wait_for_selector('#detail.view.active')
         self.page.wait_for_selector('.task .task-actions button')
         overflow = self.page.evaluate('document.documentElement.scrollWidth - window.innerWidth')
@@ -527,7 +527,8 @@ class FlowOpsBrowserTest(unittest.TestCase):
             "els => els.map(el => { const r = el.getBoundingClientRect(); return {w: r.width, h: r.height}; })",
         )
         self.assertGreater(len(boxes), 0, 'expected at least one visible task action button')
-        undersized = [b for b in boxes if b['w'] < 44 or b['h'] < 44]
+        # Rounded: layout can report 43.9998px for a 44px box during the view-reveal animation.
+        undersized = [b for b in boxes if round(b['w'], 1) < 44 or round(b['h'], 1) < 44]
         self.assertEqual(undersized, [], f'task action buttons under the 44x44 touch target minimum at {width}x{height}: {undersized}')
 
     def test_task_execution_view_reflows_and_meets_touch_targets_at_375(self):
@@ -535,6 +536,72 @@ class FlowOpsBrowserTest(unittest.TestCase):
 
     def test_task_execution_view_reflows_and_meets_touch_targets_at_414(self):
         self._assert_task_execution_view_reflows_and_has_real_touch_targets(414, 896)
+
+    # ---- Cutover parity ----
+    def _make_runbook(self, name, tasks):
+        return self.page.evaluate("""async ([name, tasks]) => {
+            const rb = await api('/api/runbooks', {method: 'POST', body: JSON.stringify({name, scheduled_at: new Date().toISOString().slice(0, 16)})});
+            for (const t of tasks) await api(`/api/runbooks/${rb.id}/tasks`, {method: 'POST', body: JSON.stringify(t)});
+            await api(`/api/runbooks/${rb.id}/transition`, {method: 'POST', body: JSON.stringify({status: 'ready'})});
+            await load();
+            return rb.id;
+        }""", [name, tasks])
+
+    def test_starting_a_rehearsal_from_the_ui_shows_the_banner_and_reset_returns_it_to_ready(self):
+        rid = self._make_runbook('UI rehearsal', [{'title': 'Practice step'}])
+        self.page.evaluate('id => openRunbook(id)', rid)
+        self.page.click('.transition[data-status=live]')
+        self.page.select_option('.generic-dialog select[name=run_type]', 'rehearsal')
+        self.page.click('.generic-dialog button.primary')
+        self.page.wait_for_selector('.run-type-banner')
+        self.assertIn('rehearsal', self.page.inner_text('.detail-title'))
+        self.page.click('#resetRehearsal')
+        self.page.click('.generic-confirm-dialog .gd-ok')
+        self.page.wait_for_function('() => state.current && state.current.status === "ready"')
+        self.assertIsNone(self.page.query_selector('.run-type-banner'))
+        self.page.wait_for_selector('.run-history')
+        self.assertIn('Rehearsal', self.page.inner_text('.run-history'))
+
+    def test_checklist_comments_gantt_and_excel_export_work_in_the_runbook_view(self):
+        rid = self._make_runbook('UI checklist', [{'title': 'Pre-flight', 'task_type': 'checklist', 'checklist_items': ['Backups verified', 'Freeze announced']}])
+        self.page.evaluate("id => api(`/api/runbooks/${id}/transition`, {method: 'POST', body: JSON.stringify({status: 'live', run_type: 'live'})})", rid)
+        self.page.evaluate('id => openRunbook(id)', rid)
+        self.page.wait_for_selector('.task-checklist input')
+        self.page.check('.task-checklist input[data-index="0"]')
+        self.page.wait_for_function('() => state.current.tasks[0].checklist[0].done === true')
+        self.page.click('.task-comment-toggle')
+        self.page.fill('.task-thread input[name=body]', 'Backups confirmed by DBA')
+        self.page.click('.task-thread button.primary')
+        self.page.wait_for_function('() => state.current.tasks[0].comments.length === 1')
+        self.assertIn('Backups confirmed by DBA', self.page.inner_text('.task-thread'))
+        self.page.click('[data-gantt]')
+        self.page.wait_for_selector('.gantt .gantt-bar')
+        self.assertEqual(len(self.page.query_selector_all('.gantt-row')), 1)
+        self.assertIsNotNone(self.page.query_selector('#exportTasksXlsx'))
+
+    def test_my_tasks_view_lists_assigned_work_and_starts_it(self):
+        user_id = self.page.evaluate('state.user.id')
+        rid = self._make_runbook('UI my tasks', [{'title': 'Mine to start', 'owner_user_id': user_id}])
+        self.page.evaluate("id => api(`/api/runbooks/${id}/transition`, {method: 'POST', body: JSON.stringify({status: 'live', run_type: 'live'})})", rid)
+        self.page.click('.nav[data-view=mytasks]')
+        self.page.wait_for_selector('.mytask')
+        self.assertIn('/my-tasks', self.page.url)
+        card = self.page.locator('.mytask', has_text='Mine to start')
+        card.locator('button[data-status=running]').click()
+        self.page.wait_for_function("() => [...document.querySelectorAll('.mytask')].some(el => el.textContent.includes('Mine to start') && el.textContent.includes('running'))")
+        self.page.set_viewport_size({'width': 390, 'height': 844})
+        overflow = self.page.evaluate('document.documentElement.scrollWidth - window.innerWidth')
+        self.assertLessEqual(overflow, 1)
+
+    def test_runbooks_timeline_view_plots_scheduled_runbooks(self):
+        self._make_runbook('UI timeline', [{'title': 'Plotted', 'duration': 30}])
+        self.page.click('.nav[data-view=runbooks]')
+        self.page.click('[data-portfolio=timeline]')
+        self.page.wait_for_selector('#portfolioTimeline .gantt-row')
+        self.assertIn('UI timeline', self.page.inner_text('#portfolioTimeline'))
+        self.assertTrue(self.page.locator('#runbookTable').is_hidden())
+        self.page.click('[data-portfolio=list]')
+        self.assertTrue(self.page.locator('#runbookTable').is_visible())
 
 
 if __name__ == '__main__':

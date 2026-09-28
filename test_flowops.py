@@ -2229,5 +2229,166 @@ class FlowOpsTest(unittest.TestCase):
             self.assertEqual(self.req(f'/api/runbooks/{rid}','PATCH',{'name':'Should stay denied'})[0],403)
         finally:
             self.__class__.opener,self.__class__.csrf=admin_opener,admin_csrf
+    # ---- Cutover parity: rehearsals, task types, execution controls ----
+    def _live_runbook(self,name,tasks,run_type='live'):
+        _,created=self.req('/api/runbooks','POST',{'name':name});rid=created['data']['id'];ids=[]
+        for spec in tasks:
+            spec=dict(spec); deps=spec.pop('after',[])
+            _,doc=self.req(f'/api/runbooks/{rid}/tasks','POST',{**spec,'depends_on':[ids[i] for i in deps]});ids.append(doc['data']['tasks'][-1]['id'])
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})
+        code,_=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live','run_type':run_type});self.assertEqual(code,200)
+        return rid,ids
+    def test_rehearsal_run_skips_integrations_records_history_and_resets_for_the_next_run(self):
+        rid,(auto,step)=self._live_runbook('Rehearsal target',[{'title':'Call deploy job','task_type':'automation','automation_url':'https://automation.invalid/job'},{'title':'Verify','after':[0]}],run_type='rehearsal')
+        doc=self.req(f'/api/runbooks/{rid}')[1]['data'];self.assertEqual(doc['run_type'],'rehearsal');self.assertEqual(doc['timing']['run_type'],'rehearsal')
+        code,ran=self.req(f'/api/tasks/{auto}','PATCH',{'status':'running'});self.assertEqual(code,200)
+        automation=next(t for t in ran['data']['tasks'] if t['id']==auto)
+        self.assertEqual(automation['status'],'complete');self.assertEqual(automation['automation_status'],'rehearsal_skipped')
+        self.assertTrue(next(t for t in ran['data']['tasks'] if t['id']==step)['startable'])
+        self.req(f'/api/tasks/{step}','PATCH',{'status':'running'});self.req(f'/api/tasks/{step}','PATCH',{'status':'complete'})
+        code,done=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'complete'});self.assertEqual(code,200)
+        self.assertEqual(len(done['data']['runs']),1);run=done['data']['runs'][0]
+        self.assertEqual((run['run_type'],run['outcome'],run['task_count'],run['completed_count']),('rehearsal','complete',2,2))
+        code,reset=self.req(f'/api/runbooks/{rid}/reset','POST',{});self.assertEqual(code,200)
+        self.assertEqual(reset['data']['status'],'ready');self.assertIsNone(reset['data']['actual_started_at'])
+        self.assertTrue(all(t['status']=='pending' and t['started_at'] is None for t in reset['data']['tasks']))
+        self.assertEqual(len(reset['data']['runs']),1,'run history survives the reset')
+        self.assertEqual(self.req(f'/api/runbooks/{rid}/reset','POST',{})[0],409)
+        self.assertEqual(self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})[1]['data']['run_type'],'live')
+        self.assertEqual(self.req(f'/api/runbooks/{rid}/reset','POST',{})[0],409,'live runs are final and cannot be reset')
+        self.assertEqual(self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live','run_type':'drill'})[0],409)
+    def test_rehearsal_is_allowed_before_approval_but_live_is_not(self):
+        _,ws=self.req('/api/workspaces'); workspace_id=ws['data'][0]['id']
+        _,rtype=self.req('/api/runbook-types','POST',{'name':'Rehearsable change','workspace_id':workspace_id,'requires_approval':True})
+        _,created=self.req('/api/runbooks','POST',{'name':'Unapproved','workspace_id':workspace_id,'runbook_type_id':rtype['data']['id']}); rid=created['data']['id']
+        self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Step'});self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})
+        self.assertEqual(self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live','run_type':'live'})[0],409)
+        self.assertEqual(self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live','run_type':'rehearsal'})[0],200)
+    def test_checklist_task_requires_every_item_ticked_before_completion(self):
+        rid,(tid,)=self._live_runbook('Checklist run',[{'title':'Pre-flight','task_type':'checklist','checklist_items':['Backups verified','Freeze announced','  ']}])
+        doc=self.req(f'/api/runbooks/{rid}')[1]['data'];self.assertEqual([i['text'] for i in doc['tasks'][0]['checklist']],['Backups verified','Freeze announced'])
+        code,body=self.req(f'/api/tasks/{tid}','PATCH',{'status':'complete'});self.assertEqual(code,409);self.assertIn('2 open',body['error'])
+        self.assertEqual(self.req(f'/api/tasks/{tid}/checklist','POST',{'index':0,'done':True})[0],200)
+        self.assertEqual(self.req(f'/api/tasks/{tid}/checklist','POST',{'index':9,'done':True})[0],404)
+        self.assertEqual(self.req(f'/api/tasks/{tid}','PATCH',{'status':'complete'})[0],409)
+        self.req(f'/api/tasks/{tid}/checklist','POST',{'index':1,'done':True})
+        self.assertEqual(self.req(f'/api/tasks/{tid}','PATCH',{'status':'complete'})[0],200)
+        self.assertEqual(self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Too long','task_type':'checklist','checklist_items':[str(i) for i in range(51)]})[0],400)
+    def test_fixed_start_holds_a_task_and_admin_force_start_overrides_with_an_audited_reason(self):
+        rid,(first,held)=self._live_runbook('Fixed start run',[{'title':'Upstream'},{'title':'Window opens','fixed_start_at':'2999-01-01T00:00:00+00:00'}])
+        doc=self.req(f'/api/runbooks/{rid}')[1]['data'];task=doc['tasks'][1]
+        self.assertTrue(task['fixed_start_pending']);self.assertFalse(task['startable'])
+        code,body=self.req(f'/api/tasks/{held}','PATCH',{'status':'running'});self.assertEqual(code,409);self.assertIn('fixed start',body['error'])
+        self.assertEqual(self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Bad','fixed_start_at':'tomorrow'})[0],400)
+        self.assertEqual(self.req(f'/api/tasks/{held}/force-start','POST',{})[0],400)
+        code,forced=self.req(f'/api/tasks/{held}/force-start','POST',{'reason':'Vendor window opened early'});self.assertEqual(code,200)
+        task=next(t for t in forced['data']['tasks'] if t['id']==held);self.assertEqual(task['status'],'running');self.assertEqual(task['force_started'],1)
+        self.assertTrue(any(a['action']=='task.force_started' and 'Vendor window' in a['detail'] for a in forced['data']['audit']))
+        self.assertEqual(self.req(f'/api/tasks/{held}','PATCH',{'status':'complete'})[0],200)
+        self.assertEqual(self.req(f'/api/tasks/{held}/force-start','POST',{'reason':'again'})[0],409)
+    def test_task_comments_are_stored_per_task_and_audited(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Task comments'});rid=created['data']['id']
+        _,doc=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Discuss me'});tid=doc['data']['tasks'][0]['id']
+        self.assertEqual(self.req(f'/api/tasks/{tid}/comments','POST',{'body':'  '})[0],400)
+        code,body=self.req(f'/api/tasks/{tid}/comments','POST',{'body':'Waiting on DBA sign-off'});self.assertEqual(code,201)
+        task=body['data']['tasks'][0];self.assertEqual([c['body'] for c in task['comments']],['Waiting on DBA sign-off'])
+        self.assertEqual(body['data']['audit'][0]['action'],'task.commented')
+        self.assertEqual(self.req('/api/tasks/999999/comments','POST',{'body':'x'})[0],404)
+    def test_finishing_a_task_marks_successors_ready_and_notifies_their_owner(self):
+        _,users=self.req('/api/admin/users');operator=next(u for u in users['data'] if u['username']=='operator')
+        _,created=self.req('/api/runbooks','POST',{'name':'Ready notifications'});rid=created['data']['id']
+        _,a=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'First'});first=a['data']['tasks'][0]['id']
+        _,b=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Second','depends_on':[first],'owner_user_id':operator['id']});second=b['data']['tasks'][1]['id']
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'});self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        with patch('server.notify_task_assignment') as notify:
+            self.req(f'/api/tasks/{first}','PATCH',{'status':'running'})
+            notify.assert_not_called()
+            code,done=self.req(f'/api/tasks/{first}','PATCH',{'status':'complete'});self.assertEqual(code,200)
+        self.assertEqual([call.args[2] for call in notify.call_args_list],[operator['id']])
+        self.assertTrue(any(e['action']=='task.ready' and 'Second' in e['detail'] for e in done['data']['audit']))
+        self.assertTrue(next(t for t in done['data']['tasks'] if t['id']==second)['startable'])
+    def test_my_tasks_lists_assigned_work_across_runbooks_with_startable_first(self):
+        _,me=self.req('/api/auth/me');admin_id=me['data']['user']['id']
+        _,one=self.req('/api/runbooks','POST',{'name':'Mine A'});ra=one['data']['id']
+        _,d=self.req(f'/api/runbooks/{ra}/tasks','POST',{'title':'Queued behind','owner_user_id':admin_id});gate=d['data']['tasks'][0]['id']
+        self.req(f'/api/runbooks/{ra}/tasks','POST',{'title':'Waiting on gate','owner_user_id':admin_id,'depends_on':[gate]})
+        self.req(f'/api/runbooks/{ra}/tasks','POST',{'title':'Someone else'})
+        _,two=self.req('/api/runbooks','POST',{'name':'Mine B'});rb=two['data']['id']
+        self.req(f'/api/runbooks/{rb}/tasks','POST',{'title':'Do this now','owner_user_id':admin_id})
+        self.req(f'/api/runbooks/{rb}/transition','POST',{'status':'ready'});self.req(f'/api/runbooks/{rb}/transition','POST',{'status':'live'})
+        code,mine=self.req('/api/my-tasks');self.assertEqual(code,200)
+        titles=[t['title'] for t in mine['data'] if t['runbook_id'] in (ra,rb)]
+        self.assertEqual(set(titles),{'Queued behind','Waiting on gate','Do this now'});self.assertNotIn('Someone else',titles)
+        self.assertEqual(titles[0],'Do this now','startable work in a live runbook sorts first')
+        self.assertTrue(next(t for t in mine['data'] if t['title']=='Waiting on gate')['blocked'])
+    def test_email_task_sends_to_each_recipient_on_completion_but_not_in_rehearsal(self):
+        def run(run_type):
+            rid,(tid,)=self._live_runbook(f'Comms {run_type}',[{'title':'Notify business','task_type':'email','recipients':'a@example.com, b@example.com','message':'Cutover has started'}],run_type=run_type)
+            with patch('server.send_mail') as send:
+                self.assertEqual(self.req(f'/api/tasks/{tid}','PATCH',{'status':'complete'})[0],200)
+                deadline=time.monotonic()+3;result=None
+                while time.monotonic()<deadline:
+                    result=next(t for t in self.req(f'/api/runbooks/{rid}')[1]['data']['tasks'] if t['id']==tid)['communication_result']
+                    if result: break
+                    time.sleep(0.05)
+            return send,result
+        send,result=run('live')
+        self.assertEqual(sorted(c.args[0] for c in send.call_args_list),['a@example.com','b@example.com'])
+        self.assertEqual(send.call_args_list[0].args[2],'Cutover has started');self.assertIn('sent to 2 of 2',result)
+        send,result=run('rehearsal');send.assert_not_called();self.assertIn('Rehearsal',result)
+    def test_runbook_task_starts_the_linked_child_and_completes_when_the_child_completes(self):
+        _,child=self.req('/api/runbooks','POST',{'name':'Child runbook'});cid=child['data']['id']
+        _,cdoc=self.req(f'/api/runbooks/{cid}/tasks','POST',{'title':'Child step'});child_task=cdoc['data']['tasks'][0]['id']
+        rid,(launch,)=self._live_runbook('Parent runbook',[{'title':'Start child','task_type':'runbook','linked_runbook_id':cid}])
+        self.assertEqual(self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Self','task_type':'runbook','linked_runbook_id':rid})[0],400)
+        code,body=self.req(f'/api/tasks/{launch}','PATCH',{'status':'running'});self.assertEqual(code,409);self.assertIn('must be ready',body['error'])
+        self.req(f'/api/runbooks/{cid}/transition','POST',{'status':'ready'})
+        self.assertEqual(self.req(f'/api/tasks/{launch}','PATCH',{'status':'running'})[0],200)
+        self.assertEqual(self.req(f'/api/runbooks/{cid}')[1]['data']['status'],'live')
+        self.assertEqual(self.req(f'/api/tasks/{launch}','PATCH',{'status':'complete'})[0],409)
+        self.req(f'/api/tasks/{child_task}','PATCH',{'status':'running'});self.req(f'/api/tasks/{child_task}','PATCH',{'status':'complete'})
+        self.req(f'/api/runbooks/{cid}/transition','POST',{'status':'complete'})
+        parent=self.req(f'/api/runbooks/{rid}')[1]['data'];self.assertEqual(parent['tasks'][0]['status'],'complete')
+        self.assertEqual(parent['tasks'][0]['linked_runbook']['status'],'complete')
+    def test_forecast_finish_moves_out_when_a_running_task_overruns(self):
+        rid,(tid,)=self._live_runbook('Forecast run',[{'title':'Long step','duration':10}])
+        self.req(f'/api/tasks/{tid}','PATCH',{'status':'running'})
+        thirty_ago=(server.datetime.now(server.timezone.utc)-server.timedelta(minutes=30)).isoformat(timespec='seconds')
+        with server.connect() as db:
+            db.execute('UPDATE runbooks SET actual_started_at=? WHERE id=?',(thirty_ago,rid));db.execute('UPDATE tasks SET started_at=? WHERE id=?',(thirty_ago,tid));db.commit()
+        timing=self.req(f'/api/runbooks/{rid}')[1]['data']['timing']
+        self.assertIsNotNone(timing['forecast_end_at']);self.assertAlmostEqual(timing['forecast_variance_seconds'],1200,delta=30)
+    def test_task_xlsx_export_is_a_valid_workbook_containing_the_tasks(self):
+        import io,zipfile
+        _,created=self.req('/api/runbooks','POST',{'name':'Excel export'});rid=created['data']['id']
+        self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Export <me> & check'})
+        with self.opener.open(self.base+f'/api/runbooks/{rid}/tasks.xlsx') as res:
+            self.assertEqual(res.headers['Content-Type'],'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');body=res.read()
+        with zipfile.ZipFile(io.BytesIO(body)) as book:
+            self.assertIn('xl/workbook.xml',book.namelist());sheet=book.read('xl/worksheets/sheet1.xml').decode()
+        self.assertIn('Export &lt;me&gt; &amp; check',sheet);self.assertIn('<t xml:space="preserve">title</t>',sheet)
+    def test_audit_export_filters_by_action_and_runbook_while_verifying_the_full_chain(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Audit filter target'});rid=created['data']['id']
+        self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Audited task'})
+        code,body=self.req(f'/api/admin/audit/export?runbook_id={rid}&action=task.')
+        self.assertEqual(code,200);events=body['data']['events']
+        self.assertEqual([e['action'] for e in events],['task.created']);self.assertTrue(body['data']['chain_verified'])
+        self.assertEqual(body['data']['filters'],{'runbook_id':str(rid),'action':'task.'})
+        self.assertEqual(self.req('/api/admin/audit/export?runbook_id=abc')[0],400)
+    def test_runbook_list_reports_dependency_aware_planned_minutes(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Planned minutes'});rid=created['data']['id']
+        _,a=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'A','duration':10});first=a['data']['tasks'][0]['id']
+        self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'B','duration':20,'depends_on':[first]})
+        self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Parallel','duration':5})
+        listed=next(r for r in self.req('/api/runbooks')[1]['data'] if r['id']==rid);self.assertEqual(listed['planned_minutes'],30)
+    def test_duplicate_preserves_dependency_logic_and_cutover_task_fields(self):
+        _,created=self.req('/api/runbooks','POST',{'name':'Duplicate fidelity'});rid=created['data']['id']
+        _,a=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'A'});x=a['data']['tasks'][0]['id']
+        _,b=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'B'});y=b['data']['tasks'][1]['id']
+        self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Join','depends_on':[x,y],'dependency_logic':'or','task_type':'checklist','checklist_items':['One']})
+        self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Mail','task_type':'email','recipients':'ops@example.com','message':'Hello'})
+        _,copy=self.req(f'/api/runbooks/{rid}/duplicate','POST',{});tasks={t['title']:t for t in copy['data']['tasks']}
+        self.assertEqual(tasks['Join']['dependency_logic'],'or');self.assertEqual(tasks['Join']['checklist'],[{'text':'One','done':False}])
+        self.assertEqual((tasks['Mail']['recipients'],tasks['Mail']['message']),('ops@example.com','Hello'))
 
 if __name__=='__main__': unittest.main()
