@@ -14,7 +14,7 @@ async function load(){
       rows.push({path,method:method.toUpperCase(),op});
     }
   }
-  list.innerHTML=rows.map((r,i)=>`<button class="admin-cat-row" data-i="${i}" style="width:100%;text-align:left;border:0;border-bottom:1px solid var(--line);background:transparent;padding:12px 8px;cursor:pointer"><span class="chip" style="margin-right:8px">${r.method}</span><b style="font-size:12px">${esc(r.path)}</b><br><small class="muted">${esc(r.op.summary||'')}</small></button>`).join('');
+  list.innerHTML=rows.map((r,i)=>`<button class="admin-cat-row" data-i="${i}" style="width:100%;text-align:left;border:0;border-bottom:1px solid var(--line);background:transparent;padding:12px 8px;cursor:pointer"><span class="chip" style="margin-right:8px">${r.method}</span><code style="font-size:12px;font-weight:700;color:var(--ink);overflow-wrap:anywhere">${esc(r.path)}</code><br><small class="muted">${esc(r.op.summary||'')}</small></button>`).join('');
   list.querySelectorAll('[data-i]').forEach(btn=>btn.onclick=()=>renderDetail(rows[Number(btn.dataset.i)]));
 }
 function paramFields(op){

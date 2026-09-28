@@ -606,6 +606,41 @@ class FlowOpsBrowserTest(unittest.TestCase):
         self.page.click('[data-portfolio=list]')
         self.assertTrue(self.page.locator('#runbookTable').is_visible())
 
+    def test_task_panel_is_padded_and_its_header_does_not_overlap_the_timing_card(self):
+        rid = self._make_runbook('UI panel geometry', [{'title': 'A task with a long enough title to wrap onto two lines in the panel'}])
+        self.page.evaluate('id => openRunbook(id)', rid)
+        self.page.click('#tasks .task.cx-row .cx-open')
+        self.page.wait_for_selector('.cx-panel')
+        geometry = self.page.evaluate("""() => {
+            const side = document.querySelector('.detail-side').getBoundingClientRect();
+            const q = s => document.querySelector(s).getBoundingClientRect();
+            const touching = [...document.querySelectorAll('.cx-panel .cx-pbody *, .cx-panel .cx-ph *')].filter(e => { const r = e.getBoundingClientRect(); return r.width && (r.left < side.left + 8 || r.right > side.right - 8); }).length;
+            return {chipsBottom: q('.cx-ph .cx-chips').bottom, headerBottom: q('.cx-ph').bottom, cardTop: q('.cx-timecard').top, touching};
+        }""")
+        self.assertLessEqual(geometry['chipsBottom'], geometry['headerBottom'])
+        self.assertLess(geometry['headerBottom'], geometry['cardTop'])
+        self.assertEqual(geometry['touching'], 0, 'panel content must keep its padding from the panel edges')
+
+    def test_plan_views_and_admin_matrices_do_not_overflow_the_page_on_a_phone(self):
+        self.page.set_viewport_size({'width': 390, 'height': 844})
+        self.page.evaluate("openRunbook(state.runbooks.find(r => r.name === 'Payments platform release').id)")
+        self.page.wait_for_selector('.cx-row')
+        for selector in ('[data-mode=map]', '[data-gantt]', '[data-cx-table]'):
+            self.page.click(selector)
+            self.page.wait_for_timeout(150)
+            overflow = self.page.evaluate('document.documentElement.scrollWidth - document.documentElement.clientWidth')
+            self.assertLessEqual(overflow, 0, f'{selector} overflows the page by {overflow}px')
+        for tool in ('roles', 'sessions'):
+            self.page.evaluate(f"show('admin'); openAdminTool('{tool}')")
+            self.page.wait_for_timeout(400)
+            overflow = self.page.evaluate('document.documentElement.scrollWidth - document.documentElement.clientWidth')
+            self.assertLessEqual(overflow, 0, f'admin {tool} overflows the page by {overflow}px')
+
+    def test_administration_sidenav_heading_is_readable(self):
+        self.page.evaluate("show('admin')")
+        color = self.page.eval_on_selector('.admin-sidenav-head strong', 'e => getComputedStyle(e).color')
+        self.assertNotEqual(color, 'rgb(215, 217, 228)', 'admin heading inherited the dark-sidebar text colour on a white panel')
+
 
 if __name__ == '__main__':
     unittest.main()
