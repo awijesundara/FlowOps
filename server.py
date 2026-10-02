@@ -151,7 +151,9 @@ WEBHOOK_EVENT_ACTIONS = (
     "runbook.edited","runbook.rehearsal_reset","runbook.reviewed","runbook.transition","runbook_type.created",
     "runbook_type.deleted","servicenow.lifecycle","servicenow.synced","serviceops.ctask_sync_failed",
     "serviceops.ctask_synced","serviceops.ctasks_imported","serviceops.ctasks_synced",
-    "serviceops.lifecycle","serviceops.sync_failed","serviceops.synced","snippet.deleted",
+    "serviceops.change_withdrawn","serviceops.ctask_state_received","serviceops.event_received",
+    "serviceops.events_secret_rotated","serviceops.evidence_failed","serviceops.evidence_recorded",
+    "serviceops.lifecycle","serviceops.sync_failed","serviceops.synced","serviceops.writeback_retried","snippet.deleted",
     "snippet.inserted","snippet.saved","stream.created","stream.deleted","stream.renamed",
     "task.automation_result","task.automation_running","task.automation_test_fired",
     "task.bulk_edited","task.checklist_updated","task.commented","task.communication_sent","task.created","task.csv_imported","task.edited","task.escalated","task.force_started","task.ready",
@@ -815,6 +817,19 @@ def init_db() -> None:
           key TEXT NOT NULL, value TEXT NOT NULL, updated_at TEXT NOT NULL,
           PRIMARY KEY(instance_id,key)
         );
+        CREATE TABLE IF NOT EXISTS serviceops_outbox (
+          id INTEGER PRIMARY KEY, instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+          runbook_id INTEGER REFERENCES runbooks(id) ON DELETE SET NULL, kind TEXT NOT NULL, label TEXT NOT NULL,
+          method TEXT NOT NULL, resource TEXT NOT NULL, body_json TEXT, idempotency_key TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at REAL NOT NULL,
+          last_error TEXT, created_at TEXT NOT NULL, delivered_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS serviceops_outbox_due ON serviceops_outbox(status,next_attempt_at);
+        CREATE TABLE IF NOT EXISTS serviceops_inbound_events (
+          instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+          event_id TEXT NOT NULL, event_type TEXT NOT NULL, outcome TEXT NOT NULL, received_at TEXT NOT NULL,
+          PRIMARY KEY(instance_id,event_id)
+        );
         CREATE TABLE IF NOT EXISTS integration_credentials (
           instance_id INTEGER NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
           provider TEXT NOT NULL, secret_encrypted TEXT NOT NULL,
@@ -894,7 +909,8 @@ def init_db() -> None:
           "serviceops_type":"TEXT","serviceops_title":"TEXT","serviceops_state":"TEXT",
           "serviceops_priority":"TEXT","serviceops_synced_at":"TEXT","serviceops_request_id":"TEXT",
           "automation_context_json":"TEXT",
-          "servicenow_change_number":"TEXT","servicenow_sys_id":"TEXT","servicenow_state":"TEXT","servicenow_synced_at":"TEXT"
+          "servicenow_change_number":"TEXT","servicenow_sys_id":"TEXT","servicenow_state":"TEXT","servicenow_synced_at":"TEXT",
+          "serviceops_alert":"TEXT"
         }.items():
             if column not in columns: db.execute(f"ALTER TABLE runbooks ADD COLUMN {column} {definition}")
         task_columns={row[1] for row in db.execute("PRAGMA table_info(tasks)")}
@@ -902,7 +918,7 @@ def init_db() -> None:
           "task_type":"TEXT NOT NULL DEFAULT 'normal'", "scheduled_offset":"INTEGER NOT NULL DEFAULT 0",
           "owner_user_id":"INTEGER REFERENCES users(id)", "owner_team_id":"INTEGER REFERENCES runbook_teams(id)",
           "validation_result":"TEXT", "validation_comment":"TEXT", "blocked_reason":"TEXT",
-          "serviceops_ctask":"TEXT", "serviceops_ctask_team":"TEXT",
+          "serviceops_ctask":"TEXT", "serviceops_ctask_team":"TEXT", "serviceops_ctask_state":"TEXT",
           "automation_status":"TEXT NOT NULL DEFAULT 'idle'", "automation_result":"TEXT",
           "automation_attempts":"INTEGER NOT NULL DEFAULT 0", "skip_reason":"TEXT",
           "escalated":"INTEGER NOT NULL DEFAULT 0", "escalation_reason":"TEXT",
@@ -975,7 +991,7 @@ def init_db() -> None:
             db.execute("INSERT INTO users(username,display_name,email,role,team,password_hash,created_at,instance_id) VALUES(?,?,?,?,?,?,?,?)",
                        ("operator","Release Operator","operator@flowops.local","Member","Release Engineering",password_hash("Operator!Preview2026"),now(),default_instance))
         defaults={"workspace_name":"Resilience Operations","timezone":"Asia/Tokyo","require_approval":"true","session_hours":"8","serviceops_enabled":"true","directory_enabled":"false","directory_domain":"",
-          "serviceops_url":os.getenv("SERVICEOPS_URL","http://host.docker.internal:8080"),"serviceops_sync_on_live":"true","serviceops_sync_on_complete":"true","serviceops_require_approved":"true","serviceops_trigger_workflow":"false",
+          "serviceops_url":os.getenv("SERVICEOPS_URL","http://host.docker.internal:8080"),"serviceops_sync_on_live":"true","serviceops_sync_on_complete":"true","serviceops_require_approved":"true","serviceops_trigger_workflow":"false","serviceops_record_evidence":"true",
         }
         for key,value in defaults.items(): db.execute("INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES(?,?,?)",(key,value,now()))
         for key,value in defaults.items():
@@ -1671,6 +1687,291 @@ def webhook_dispatcher_loop() -> None:
         time.sleep(2)
 
 
+# --- ServiceOps collaboration -------------------------------------------
+# FlowOps writes CTASK progress and execution evidence back to ServiceOps
+# and follows change/CTASK state made directly in ServiceOps. Writes go
+# through a transactional outbox: the row is inserted in the same
+# transaction as the task transition, and a background worker delivers it
+# with no database connection held. Previously the PATCH ran inside the
+# request's write transaction, so a slow or unreachable ServiceOps held
+# SQLite's write lock for up to the 8-second timeout, and a failed write
+# was only audited, never retried -- leaving the change unable to close.
+class ServiceOpsError(RuntimeError):
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message); self.status = status
+
+
+# Seconds to wait before attempt 2, 3, ... A write still failing after the
+# last step is parked as failed for an administrator to retry.
+SERVICEOPS_RETRY_SCHEDULE = (15, 60, 300, 900, 3600, 3600)
+SERVICEOPS_OUTBOX_LEASE_SECONDS = 120
+SERVICEOPS_EVENT_TOLERANCE_SECONDS = 300
+# Change states that mean the work is no longer authorised.
+SERVICEOPS_UNAUTHORISED_CHANGE_STATES = {"Cancelled", "Rejected", "New", "Awaiting Approval"}
+SERVICEOPS_AUTHORISED_CHANGE_STATES = {"Approved", "In Progress", "Resolved", "Closed"}
+# How a CTASK state set in ServiceOps maps onto a FlowOps task status, and
+# which FlowOps statuses each may be applied from.
+SERVICEOPS_CTASK_INBOUND = {
+    "Work in Progress": ("running", {"pending", "blocked"}),
+    "Closed Complete": ("complete", {"pending", "running", "blocked", "failed"}),
+    "Cancelled": ("skipped", {"pending", "running", "blocked", "failed"}),
+    "Closed Incomplete": ("failed", {"running"}),
+}
+
+
+def serviceops_endpoint(db: sqlite3.Connection, instance_id: int) -> tuple[str, str]:
+    row = db.execute("SELECT value FROM instance_settings WHERE instance_id=? AND key='serviceops_url'", (instance_id,)).fetchone()
+    base = (row[0] if row else os.getenv("SERVICEOPS_URL", "")).rstrip("/")
+    base = base if base.endswith("/api/v1") else f"{base}/api/v1"
+    token, _ = integration_credential(db, instance_id, "serviceops")
+    if not base or base == "/api/v1" or not token:
+        raise ServiceOpsError("Configure the ServiceOps URL and a scoped API token in Administration → Connections")
+    return base, token
+
+
+def serviceops_http(base: str, token: str, method: str, resource: str, body: Any = None, idempotency_key: str | None = None) -> tuple[Any, str, int]:
+    encoded = json.dumps(body).encode() if body is not None else None
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json", "X-Request-ID": str(uuid.uuid4())}
+    if encoded is not None: headers["Content-Type"] = "application/json"
+    if idempotency_key: headers["Idempotency-Key"] = idempotency_key
+    request = urllib.request.Request(f"{base}/{resource.lstrip('/')}", data=encoded, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            document = json.load(response); request_id = response.headers.get("X-Request-ID", headers["X-Request-ID"])
+            return document.get("data", document), request_id, response.status
+    except urllib.error.HTTPError as exc:
+        try: problem = json.load(exc); detail = problem.get("detail") or problem.get("error")
+        except Exception: detail = None
+        raise ServiceOpsError(f"ServiceOps returned HTTP {exc.code}{': '+str(detail) if detail else ''}", exc.code) from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise ServiceOpsError("ServiceOps is unreachable") from exc
+
+
+def enqueue_serviceops_write(db: sqlite3.Connection, instance_id: int, runbook_id: int | None, kind: str, label: str, method: str, resource: str, body: Any, idempotency_key: str) -> None:
+    """Records a ServiceOps write in the caller's transaction. A repeat of
+    the same idempotency key while an earlier copy is still undelivered is
+    dropped, since ServiceOps would replay the stored response anyway."""
+    if db.execute("SELECT 1 FROM serviceops_outbox WHERE instance_id=? AND idempotency_key=? AND status='pending'", (instance_id, idempotency_key)).fetchone():
+        return
+    db.execute(
+        "INSERT INTO serviceops_outbox(instance_id,runbook_id,kind,label,method,resource,body_json,idempotency_key,status,attempts,next_attempt_at,created_at) VALUES(?,?,?,?,?,?,?,?,'pending',0,?,?)",
+        (instance_id, runbook_id, kind, label[:200], method, resource, json.dumps(body) if body is not None else None, idempotency_key[:128], time.time(), now()),
+    )
+
+
+def claim_serviceops_writes(limit: int = 20, include_future: bool = False) -> list[dict[str, Any]]:
+    """Leases due outbox rows (BEGIN IMMEDIATE, as claim_new_audit_events
+    does) so two replicas never deliver the same write at once. A lease
+    that expires because a worker died makes the row due again."""
+    db = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
+    db.row_factory = sqlite3.Row
+    try:
+        db.execute("PRAGMA journal_mode=WAL"); db.execute("BEGIN IMMEDIATE")
+        cutoff = float("inf") if include_future else time.time()
+        due = rows(db.execute("SELECT * FROM serviceops_outbox WHERE status='pending' AND next_attempt_at<=? ORDER BY id LIMIT ?", (cutoff, limit)))
+        lease = time.time() + SERVICEOPS_OUTBOX_LEASE_SECONDS
+        for item in due:
+            db.execute("UPDATE serviceops_outbox SET next_attempt_at=? WHERE id=?", (lease, item["id"]))
+        db.execute("COMMIT")
+        return due
+    except Exception:
+        db.execute("ROLLBACK"); raise
+    finally:
+        db.close()
+
+
+def serviceops_failure_is_permanent(status: int | None) -> bool:
+    # A 4xx means ServiceOps refused this exact request (bad scope, invalid
+    # transition, unknown field); repeating it cannot succeed. Timeouts,
+    # throttling, 5xx and network errors are worth retrying.
+    return status is not None and 400 <= status < 500 and status not in {408, 425, 429}
+
+
+def resolve_serviceops_endpoints(db: sqlite3.Connection, items: list[dict[str, Any]]) -> dict[int, tuple[str, str] | ServiceOpsError]:
+    endpoints: dict[int, tuple[str, str] | ServiceOpsError] = {}
+    for item in items:
+        if item["instance_id"] in endpoints: continue
+        try: endpoints[item["instance_id"]] = serviceops_endpoint(db, item["instance_id"])
+        except ServiceOpsError as exc: endpoints[item["instance_id"]] = exc
+        except RuntimeError as exc: endpoints[item["instance_id"]] = ServiceOpsError(str(exc))
+    return endpoints
+
+
+def perform_serviceops_write(item: dict[str, Any], endpoint: tuple[str, str] | ServiceOpsError) -> tuple[str | None, int | None]:
+    try:
+        if isinstance(endpoint, ServiceOpsError): raise endpoint
+        body = json.loads(item["body_json"]) if item["body_json"] else None
+        serviceops_http(endpoint[0], endpoint[1], item["method"], item["resource"], body, item["idempotency_key"])
+        return None, None
+    except ServiceOpsError as exc:
+        return str(exc), exc.status
+
+
+def record_serviceops_results(db: sqlite3.Connection, results: list[tuple[dict[str, Any], str | None, int | None]]) -> None:
+    for item, error, status in results:
+        attempts = item["attempts"] + 1
+        evidence = item["kind"] == "ctask_evidence"
+        if error is None:
+            db.execute("UPDATE serviceops_outbox SET status='delivered',attempts=?,delivered_at=?,last_error=NULL WHERE id=?", (attempts, now(), item["id"]))
+            if evidence: append_audit(db, item["runbook_id"], "serviceops.evidence_recorded", item["label"], "FlowOps", item["instance_id"])
+            else: append_audit(db, item["runbook_id"], "serviceops.ctask_synced", item["label"], "FlowOps", item["instance_id"])
+        elif serviceops_failure_is_permanent(status) or attempts > len(SERVICEOPS_RETRY_SCHEDULE):
+            db.execute("UPDATE serviceops_outbox SET status='failed',attempts=?,last_error=? WHERE id=?", (attempts, error[:500], item["id"]))
+            if evidence: append_audit(db, item["runbook_id"], "serviceops.evidence_failed", f"{item['label']}: {error}", "FlowOps", item["instance_id"])
+            else: append_audit(db, item["runbook_id"], "serviceops.ctask_sync_failed", f"{item['label']}: {error}", "FlowOps", item["instance_id"])
+        else:
+            db.execute("UPDATE serviceops_outbox SET attempts=?,last_error=?,next_attempt_at=? WHERE id=?", (attempts, error[:500], time.time() + SERVICEOPS_RETRY_SCHEDULE[attempts - 1], item["id"]))
+
+
+def dispatch_serviceops_outbox(include_future: bool = False) -> int:
+    """One worker pass. Returns the number of writes attempted. Credentials
+    are read with a short connection, delivery runs with none open, and
+    outcomes are persisted with a second short connection."""
+    items = claim_serviceops_writes(include_future=include_future)
+    if not items:
+        return 0
+    with connect() as db:
+        endpoints = resolve_serviceops_endpoints(db, items)
+    results = [(item, *perform_serviceops_write(item, endpoints[item["instance_id"]])) for item in items]
+    with connect() as db:
+        record_serviceops_results(db, results); db.commit()
+    return len(results)
+
+
+def flush_serviceops_writes_for_runbook(db: sqlite3.Connection, runbook_id: int) -> int:
+    """Delivers a runbook's outstanding CTASK writes inline. Used right
+    before the runbook resolves its change, because ServiceOps refuses to
+    resolve a change while a required CTASK is still open. Writes that keep
+    failing stay queued for the worker; ServiceOps' idempotency keys make a
+    concurrent delivery by the worker harmless."""
+    items = rows(db.execute("SELECT * FROM serviceops_outbox WHERE runbook_id=? AND status='pending' ORDER BY id", (runbook_id,)))
+    if not items:
+        return 0
+    endpoints = resolve_serviceops_endpoints(db, items)
+    record_serviceops_results(db, [(item, *perform_serviceops_write(item, endpoints[item["instance_id"]])) for item in items])
+    return len(items)
+
+
+def serviceops_outbox_loop() -> None:
+    while True:
+        try:
+            dispatch_serviceops_outbox()
+        except Exception as exc:
+            print(f"serviceops outbox error: {exc}")
+        time.sleep(2)
+
+
+def serviceops_evidence_note(runbook: dict[str, Any], task: dict[str, Any], target: str, actor_name: str, validation_result: str = "", skip_reason: str = "") -> str:
+    verb = {"complete": "completed", "skipped": "skipped"}.get(target, target)
+    parts = [f'FlowOps runbook "{runbook["name"]}" (#{runbook["id"]}): "{task["title"]}" {verb} by {actor_name}.']
+    started = parse_instant(task["started_at"])
+    if target == "complete" and started:
+        actual = max(0, round((datetime.now(timezone.utc) - started).total_seconds() / 60))
+        parts.append(f"Planned {task['duration']} min, actual {actual} min.")
+    if validation_result: parts.append(f"Validation: {validation_result}.")
+    if skip_reason: parts.append(f"Reason: {skip_reason}.")
+    return " ".join(parts)
+
+
+def queue_serviceops_ctask_writeback(db: sqlite3.Connection, task: dict[str, Any], target: str, actor_name: str, validation_result: str = "", skip_reason: str = "") -> None:
+    """Queues the CTASK state (and, on completion or skip, an append-only
+    evidence note) for delivery. Never raises and never calls ServiceOps
+    from the request thread."""
+    state = {"running": "Work in Progress", "complete": "Closed Complete", "skipped": "Cancelled"}.get(target)
+    if not state: return
+    rb = db.execute("SELECT r.*,w.instance_id FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE r.id=?", (task["runbook_id"],)).fetchone()
+    ticket = str(rb["serviceops_ticket"] or "").strip() if rb else ""
+    if not ticket: return
+    settings = instance_settings(db, rb["instance_id"])
+    if settings.get("serviceops_enabled", "true") != "true": return
+    ctask = task["serviceops_ctask"]
+    resource = f"tickets/{urllib.parse.quote(ticket)}/ctasks/{urllib.parse.quote(ctask)}"
+    enqueue_serviceops_write(db, rb["instance_id"], rb["id"], "ctask_state", f"{ctask} → {state}", "PATCH", resource, {"state": state}, f"flowops-ctask-{ctask}-{target}")
+    if target in {"complete", "skipped"} and settings.get("serviceops_record_evidence", "true") == "true":
+        note = serviceops_evidence_note(dict(rb), dict(task), target, actor_name, validation_result, skip_reason)
+        enqueue_serviceops_write(db, rb["instance_id"], rb["id"], "ctask_evidence", f"{ctask} execution evidence", "PATCH", resource, {"append_work_notes": note}, f"flowops-ctask-{ctask}-{target}-evidence-{task['id']}")
+
+
+def verify_serviceops_signature(secret: str, timestamp: str, signature: str, raw: bytes, current_time: float | None = None) -> bool:
+    """Checks X-ServiceOps-Signature (sha256=HMAC(secret, "<ts>.<body>"))
+    and the replay window. ServiceOps releases before the signed-bytes fix
+    signed a compact, key-sorted encoding while sending a differently
+    formatted body, so that canonical form is accepted as well."""
+    if not secret or not signature.startswith("sha256="): return False
+    try: stamp = int(timestamp)
+    except (TypeError, ValueError): return False
+    if abs((current_time if current_time is not None else time.time()) - stamp) > SERVICEOPS_EVENT_TOLERANCE_SECONDS: return False
+    provided = signature[len("sha256="):].strip().lower()
+    candidates = [raw]
+    try: candidates.append(json.dumps(json.loads(raw), sort_keys=True, separators=(",", ":")).encode())
+    except (ValueError, UnicodeDecodeError): pass
+    for body in candidates:
+        expected = hmac.new(secret.encode(), timestamp.encode() + b"." + body, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(expected, provided): return True
+    return False
+
+
+def apply_serviceops_change_event(db: sqlite3.Connection, instance_id: int, data: dict[str, Any]) -> dict[str, int]:
+    number = str(data.get("number") or "").strip(); state = str(data.get("state") or "").strip()[:80]
+    previous = str(data.get("previous_state") or "").strip()[:80]
+    if not number or not state: raise ValueError("change.state_changed requires number and state")
+    affected = rows(db.execute("SELECT r.id,r.name,r.status,r.serviceops_alert FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE w.instance_id=? AND UPPER(r.serviceops_ticket)=UPPER(?)", (instance_id, number)))
+    alerts = 0
+    for rb in affected:
+        db.execute("UPDATE runbooks SET serviceops_state=?,serviceops_synced_at=?,updated_at=? WHERE id=?", (state, now(), now(), rb["id"]))
+        append_audit(db, rb["id"], "serviceops.event_received", f"{number}: {previous or '?'} → {state}", "ServiceOps", instance_id)
+        if state in SERVICEOPS_UNAUTHORISED_CHANGE_STATES and rb["status"] in {"ready", "live", "paused"}:
+            alert = f"ServiceOps change {number} is now {state}. The work is no longer authorised; confirm with the change manager before continuing."
+            db.execute("UPDATE runbooks SET serviceops_alert=? WHERE id=?", (alert, rb["id"]))
+            append_audit(db, rb["id"], "serviceops.change_withdrawn", f"{number} moved to {state} while the runbook is {rb['status']}", "ServiceOps", instance_id)
+            alerts += 1
+        elif state in SERVICEOPS_AUTHORISED_CHANGE_STATES and rb["serviceops_alert"]:
+            db.execute("UPDATE runbooks SET serviceops_alert=NULL WHERE id=?", (rb["id"],))
+    return {"runbooks": len(affected), "alerts": alerts}
+
+
+def apply_serviceops_ctask_event(db: sqlite3.Connection, instance_id: int, data: dict[str, Any]) -> tuple[dict[str, int], list[tuple[int, dict[str, Any]]]]:
+    """Mirrors a CTASK state set in ServiceOps. During a live run (never a
+    rehearsal) the matching FlowOps task follows it; nothing is written
+    back, so the event cannot echo between the two systems. Returns counts
+    and the tasks that became startable, for notification after commit."""
+    number = str(data.get("number") or "").strip(); ticket = str(data.get("ticket") or "").strip()
+    state = str(data.get("state") or "").strip()[:40]
+    if not number or not state: raise ValueError("change_task.state_changed requires number and state")
+    query = "SELECT t.*,r.status runbook_status,r.run_type FROM tasks t JOIN runbooks r ON r.id=t.runbook_id JOIN workspaces w ON w.id=r.workspace_id WHERE w.instance_id=? AND UPPER(t.serviceops_ctask)=UPPER(?)"
+    params: list[Any] = [instance_id, number]
+    if ticket: query += " AND UPPER(r.serviceops_ticket)=UPPER(?)"; params.append(ticket)
+    tasks = rows(db.execute(query, params))
+    applied = 0; ready: list[tuple[int, dict[str, Any]]] = []
+    for task in tasks:
+        db.execute("UPDATE tasks SET serviceops_ctask_state=? WHERE id=?", (state, task["id"]))
+        if state in {"Closed Complete", "Closed Incomplete", "Cancelled"}:
+            # ServiceOps has the final word on a closed CTASK: an older queued
+            # state write would only be refused and reported as a failure.
+            db.execute(
+                "UPDATE serviceops_outbox SET status='superseded',last_error=? WHERE runbook_id=? AND kind='ctask_state' AND status='pending' AND resource LIKE ?",
+                (f"Superseded: {number} was set to {state} in ServiceOps", task["runbook_id"], f"%/ctasks/{urllib.parse.quote(number)}"),
+            )
+        mapping = SERVICEOPS_CTASK_INBOUND.get(state)
+        live = task["runbook_status"] == "live" and task["run_type"] != "rehearsal"
+        if not mapping or not live or task["status"] == mapping[0] or task["status"] not in mapping[1]:
+            append_audit(db, task["runbook_id"], "serviceops.ctask_state_received", f"{number}: {state} (task '{task['title']}' stays {task['status']})", "ServiceOps", instance_id)
+            continue
+        target = mapping[0]; stamp = now()
+        db.execute(
+            "UPDATE tasks SET status=?,started_at=CASE WHEN ? IN ('running','complete') THEN COALESCE(started_at,?) ELSE started_at END,completed_at=CASE WHEN ? IN ('complete','skipped') THEN ? ELSE NULL END,skip_reason=CASE WHEN ?='skipped' THEN ? ELSE skip_reason END WHERE id=?",
+            (target, target, stamp, target, stamp, target, f"{number} cancelled in ServiceOps", task["id"]),
+        )
+        append_audit(db, task["runbook_id"], "task.transition", f"{task['title']}: {task['status']} → {target} ({number} set to {state} in ServiceOps)", "ServiceOps", instance_id)
+        db.execute("UPDATE runbooks SET updated_at=? WHERE id=?", (stamp, task["runbook_id"]))
+        applied += 1
+        if target in {"complete", "skipped"}:
+            for successor in newly_startable_tasks(db, task["runbook_id"], task["id"]):
+                append_audit(db, task["runbook_id"], "task.ready", f"{successor['title']} is ready to start ({successor['owner_display']})", "FlowOps", instance_id)
+                ready.append((instance_id, successor))
+    return {"tasks": len(tasks), "applied": applied}, ready
+
+
 def runbook_document(db: sqlite3.Connection, rid: int, user: dict[str,Any] | None=None) -> dict[str, Any] | None:
     if user and not owns_runbook(db,rid,user["instance_id"]):
         return None
@@ -1838,6 +2139,8 @@ def runbook_document(db: sqlite3.Connection, rid: int, user: dict[str,Any] | Non
         forecast_ts = max((projected_finish(t["id"]) for t in all_tasks), default=now_ts)
         forecast_end = datetime.fromtimestamp(forecast_ts, timezone.utc)
     doc["runs"] = rows(db.execute("SELECT * FROM runbook_runs WHERE runbook_id=? ORDER BY id DESC LIMIT 20", (rid,)))
+    writeback = db.execute("SELECT SUM(status='pending'),SUM(status='failed') FROM serviceops_outbox WHERE runbook_id=?", (rid,)).fetchone()
+    doc["serviceops_writeback"] = {"pending": writeback[0] or 0, "failed": writeback[1] or 0}
     doc["timing"] = {
         "forecast_end_at": forecast_end.isoformat(timespec="seconds") if forecast_end else None,
         "forecast_variance_seconds": int(forecast_end.timestamp() - (started.timestamp() + planned_seconds)) if forecast_end and started else None,
@@ -2265,7 +2568,18 @@ class Handler(BaseHTTPRequestHandler):
                   "servicenow":{"enabled":values.get("servicenow_enabled","false"),"url":values.get("servicenow_url",""),"username":values.get("servicenow_username",""),"credential_configured":bool(servicenow_token),"credential_source":servicenow_source,"credential_editable":bool(os.getenv("FLOWOPS_SETTINGS_ENCRYPTION_KEY")),"sync_on_live":values.get("servicenow_sync_on_live","true"),"sync_on_complete":values.get("servicenow_sync_on_complete","true")},
                   "oidc":{"enabled":values.get("oidc_enabled","false"),"url":values.get("oidc_url",""),"client_id":values.get("oidc_client_id",""),"credential_configured":bool(oidc_token),"credential_source":oidc_source,"credential_editable":bool(os.getenv("FLOWOPS_SETTINGS_ENCRYPTION_KEY")),"login_url":"/auth/oidc/login"}
                 }
+                data["serviceops"]["record_evidence"]=values.get("serviceops_record_evidence","true")
+                data["serviceops"]["events"]=self.serviceops_events_status(db,actor["instance_id"])
+                counts=db.execute("SELECT SUM(status='pending'),SUM(status='failed'),SUM(status='delivered') FROM serviceops_outbox WHERE instance_id=?",(actor["instance_id"],)).fetchone()
+                data["serviceops"]["writeback"]={"pending":counts[0] or 0,"failed":counts[1] or 0,"delivered":counts[2] or 0}
                 return self.send_json({"data":data})
+            if path=="/api/admin/integrations/serviceops/outbox":
+                actor=self.require(db,"admin:settings")
+                if not actor: return
+                items=rows(db.execute("SELECT o.id,o.runbook_id,r.name runbook_name,o.kind,o.label,o.status,o.attempts,o.last_error,o.created_at,o.delivered_at,o.next_attempt_at FROM serviceops_outbox o LEFT JOIN runbooks r ON r.id=o.runbook_id WHERE o.instance_id=? ORDER BY o.status='delivered',o.id DESC LIMIT 100",(actor["instance_id"],)))
+                for item in items:
+                    item["next_attempt_at"]=datetime.fromtimestamp(item["next_attempt_at"],timezone.utc).isoformat(timespec="seconds") if item["status"]=="pending" else None
+                return self.send_json({"data":items})
             if path=="/api/admin/workspaces":
                 actor=self.require(db,"admin:settings")
                 if not actor: return
@@ -2548,6 +2862,7 @@ class Handler(BaseHTTPRequestHandler):
     def _do_POST(self):
         path=urllib.parse.urlparse(self.path).path
         if path.startswith("/scim/v2/"): return self.scim_dispatch()
+        if path.startswith("/api/integrations/serviceops/events/"): return self.receive_serviceops_event(path)
         try: payload=self.body()
         except (ValueError,json.JSONDecodeError) as exc: return self.send_json({"error":str(exc)},400)
         with connect() as db:
@@ -2960,6 +3275,30 @@ class Handler(BaseHTTPRequestHandler):
                 db.execute("INSERT INTO instance_settings(instance_id,key,value,updated_at) VALUES(?,?,?,?) ON CONFLICT(instance_id,key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",(actor["instance_id"],"audit_retention_checkpoint",checkpoint,now()))
                 append_audit(db,None,"audit.retention_purged",f"Purged {len(purge_ids)} events older than {retention_days} days",actor["display_name"],actor["instance_id"]); db.commit()
                 return self.send_json({"data":{"purged":len(purge_ids)}})
+            if path=="/api/admin/integrations/serviceops/events-secret":
+                actor=self.require(db,"admin:settings")
+                if not actor:return
+                if payload.get("revoke") is True:
+                    db.execute("DELETE FROM integration_credentials WHERE instance_id=? AND provider='serviceops_events'",(actor["instance_id"],))
+                    append_audit(db,None,"serviceops.events_secret_rotated","Inbound ServiceOps event secret revoked",actor["display_name"],actor["instance_id"]);db.commit()
+                    return self.send_json({"data":self.serviceops_events_status(db,actor["instance_id"])})
+                secret=f"whsec_{secrets.token_urlsafe(32)}"
+                try:encrypted=settings_cipher().encrypt(secret.encode()).decode()
+                except RuntimeError as exc:return self.send_json({"error":str(exc)},503)
+                db.execute("INSERT INTO integration_credentials(instance_id,provider,secret_encrypted,updated_by,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(instance_id,provider) DO UPDATE SET secret_encrypted=excluded.secret_encrypted,updated_by=excluded.updated_by,updated_at=excluded.updated_at",(actor["instance_id"],"serviceops_events",encrypted,actor["id"],now()))
+                append_audit(db,None,"serviceops.events_secret_rotated","Inbound ServiceOps event secret generated",actor["display_name"],actor["instance_id"]);db.commit()
+                # Shown once: paste it as the signing secret of the ServiceOps webhook connection.
+                return self.send_json({"data":{**self.serviceops_events_status(db,actor["instance_id"]),"secret":secret}},201)
+            outbox_retry=re.fullmatch(r"/api/admin/integrations/serviceops/outbox/(\d+)/retry",path)
+            if outbox_retry:
+                actor=self.require(db,"admin:settings")
+                if not actor:return
+                item=db.execute("SELECT * FROM serviceops_outbox WHERE id=? AND instance_id=?",(int(outbox_retry.group(1)),actor["instance_id"])).fetchone()
+                if not item:return self.send_json({"error":"Not found"},404)
+                if item["status"]=="delivered":return self.send_json({"error":"This write was already delivered"},409)
+                db.execute("UPDATE serviceops_outbox SET status='pending',attempts=0,next_attempt_at=?,last_error=NULL WHERE id=?",(time.time(),item["id"]))
+                append_audit(db,item["runbook_id"],"serviceops.writeback_retried",f"{item['label']} requeued by an administrator",actor["display_name"],actor["instance_id"]);db.commit()
+                return self.send_json({"data":{"id":item["id"],"status":"pending"}})
             if path in {"/api/admin/integrations","/api/admin/integrations/test"}:
                 actor=self.require(db,"admin:settings")
                 if not actor:return
@@ -2970,7 +3309,7 @@ class Handler(BaseHTTPRequestHandler):
                     if provider=="oidc": return self.test_oidc_integration(db,actor,payload)
                     return self.test_integration(db,provider,actor,payload)
                 allowed={"enabled","url","sync_on_live","sync_on_complete"}
-                if provider=="serviceops": allowed|={"require_approved","trigger_workflow"}
+                if provider=="serviceops": allowed|={"require_approved","trigger_workflow","record_evidence"}
                 if provider=="servicenow": allowed|={"username"}
                 if provider=="oidc": allowed={"enabled","url","client_id"}
                 if "secret" in payload or "token" in payload:return self.send_json({"error":"Use the one-way credential field; secrets are never returned to the browser"},400)
@@ -3681,7 +4020,7 @@ class Handler(BaseHTTPRequestHandler):
                 db.execute("UPDATE runbooks SET status='live',mode='live',run_type=?,actual_started_at=COALESCE(actual_started_at,?),updated_at=? WHERE id=?",(runbook["run_type"] or "live",stamp,stamp,linked_child["id"]))
                 append_audit(db,linked_child["id"],"runbook.transition",f"ready → live (started by task '{task['title']}')"+(" (rehearsal)" if rehearsal else ""),actor["display_name"])
             if task["serviceops_ctask"] and not rehearsal:
-                self.push_serviceops_ctask_state(db,task["runbook_id"],task["serviceops_ctask"],target)
+                queue_serviceops_ctask_writeback(db,task,target,actor["display_name"],validation_result,skip_reason)
             ready=newly_startable_tasks(db,task["runbook_id"],tid) if target in {"complete","skipped"} else []
             for successor in ready:
                 append_audit(db,task["runbook_id"],"task.ready",f"{successor['title']} is ready to start ({successor['owner_display']})","FlowOps")
@@ -3873,28 +4212,65 @@ class Handler(BaseHTTPRequestHandler):
             if not user:return self.send_json({"error":"User not found"},404)
             db.execute("DELETE FROM users WHERE id=?",(uid,)); append_audit(db,None,"admin.user_deleted",user["username"],actor["display_name"],actor["instance_id"]); db.commit(); return self.send_json({"data":{"ok":True}})
 
-    def serviceops_api_base(self, db, instance_id):
-        row=db.execute("SELECT value FROM instance_settings WHERE instance_id=? AND key='serviceops_url'",(instance_id,)).fetchone()
-        base=(row[0] if row else os.getenv("SERVICEOPS_URL","")).rstrip("/")
-        return base if base.endswith("/api/v1") else f"{base}/api/v1"
-
     def serviceops_request(self, db, instance_id, method, resource, body=None, idempotency_key=None):
-        base=self.serviceops_api_base(db,instance_id);token,_=integration_credential(db,instance_id,"serviceops")
-        if not base or base=="/api/v1" or not token:raise RuntimeError("Configure the ServiceOps URL and a scoped API token in Administration → Connections")
-        encoded=json.dumps(body).encode() if body is not None else None
-        headers={"Authorization":f"Bearer {token}","Accept":"application/json","X-Request-ID":str(uuid.uuid4())}
-        if encoded is not None:headers["Content-Type"]="application/json"
-        if idempotency_key:headers["Idempotency-Key"]=idempotency_key
-        request=urllib.request.Request(f"{base}/{resource.lstrip('/')}",data=encoded,method=method,headers=headers)
-        try:
-            with urllib.request.urlopen(request,timeout=8) as response:
-                document=json.load(response);request_id=response.headers.get("X-Request-ID",headers["X-Request-ID"])
-                return document.get("data",document),request_id,response.status
-        except urllib.error.HTTPError as exc:
-            try: problem=json.load(exc);detail=problem.get("detail") or problem.get("error")
-            except Exception:detail=None
-            raise RuntimeError(f"ServiceOps returned HTTP {exc.code}{': '+str(detail) if detail else ''}") from exc
-        except (urllib.error.URLError,TimeoutError) as exc:raise RuntimeError("ServiceOps is unreachable") from exc
+        base,token=serviceops_endpoint(db,instance_id)
+        return serviceops_http(base,token,method,resource,body,idempotency_key)
+
+    def serviceops_events_status(self, db, instance_id):
+        slug=db.execute("SELECT slug FROM instances WHERE id=?",(instance_id,)).fetchone()[0]
+        configured=bool(db.execute("SELECT 1 FROM integration_credentials WHERE instance_id=? AND provider='serviceops_events'",(instance_id,)).fetchone())
+        last=db.execute("SELECT event_type,outcome,received_at FROM serviceops_inbound_events WHERE instance_id=? ORDER BY received_at DESC,rowid DESC LIMIT 1",(instance_id,)).fetchone()
+        public=os.getenv("FLOWOPS_PUBLIC_URL","").strip().rstrip("/")
+        receiver=f"/api/integrations/serviceops/events/{slug}"
+        return {"configured":configured,"receiver_path":receiver,"receiver_url":f"{public}{receiver}" if public else None,
+                "subscribed_events":["change.state_changed","change_task.state_changed"],
+                "last_event":dict(last) if last else None}
+
+    def receive_serviceops_event(self, path):
+        """Signed ServiceOps webhook receiver. Authenticated by HMAC, not by
+        a session or token, so it sits outside the CSRF-protected API. Only
+        events for this FlowOps instance's own runbooks are applied."""
+        slug=urllib.parse.unquote(path.rsplit("/",1)[-1]).strip().lower()
+        retry=check_rate_limit(f"serviceops-events:{self.client_address[0]}",600,60)
+        if retry:return self.send_json({"error":"Too many requests"},429,{"Retry-After":str(retry)})
+        try:length=int(self.headers.get("Content-Length","0"))
+        except ValueError:return self.send_json({"error":"Invalid Content-Length"},400)
+        if length<=0 or length>MAX_BODY:return self.send_json({"error":"A JSON body is required"},400 if length<=0 else 413)
+        raw=self.rfile.read(length)
+        with connect() as db:
+            instance=db.execute("SELECT id FROM instances WHERE slug=? AND active=1",(slug,)).fetchone()
+            try:secret=integration_credential(db,instance["id"],"serviceops_events")[0] if instance else ""
+            except RuntimeError:secret=""
+            if not verify_serviceops_signature(secret,self.headers.get("X-ServiceOps-Timestamp",""),self.headers.get("X-ServiceOps-Signature",""),raw):
+                return self.send_json({"error":"Invalid or expired ServiceOps signature"},401)
+            try:event=json.loads(raw)
+            except (ValueError,UnicodeDecodeError):return self.send_json({"error":"Invalid JSON"},400)
+            if not isinstance(event,dict) or not isinstance(event.get("data"),dict):return self.send_json({"error":"Expected a ServiceOps event envelope"},400)
+            event_id=str(self.headers.get("X-ServiceOps-Event-ID") or event.get("id") or "").strip()[:64]
+            event_type=str(event.get("type") or "").strip()[:80]
+            if not event_id or not event_type:return self.send_json({"error":"Event id and type are required"},400)
+            instance_id=instance["id"]
+            if db.execute("SELECT 1 FROM serviceops_inbound_events WHERE instance_id=? AND event_id=?",(instance_id,event_id)).fetchone():
+                return self.send_json({"data":{"event_id":event_id,"duplicate":True}})
+            ready=[]
+            try:
+                if event_type=="change.state_changed":
+                    result=apply_serviceops_change_event(db,instance_id,event["data"])
+                elif event_type=="change_task.state_changed":
+                    result,ready=apply_serviceops_ctask_event(db,instance_id,event["data"])
+                else:
+                    result={"ignored":True}
+            except ValueError as exc:
+                db.rollback();return self.send_json({"error":str(exc)},400)
+            outcome="ignored" if result.get("ignored") else "applied"
+            try:db.execute("INSERT INTO serviceops_inbound_events(instance_id,event_id,event_type,outcome,received_at) VALUES(?,?,?,?,?)",(instance_id,event_id,event_type,outcome,now()))
+            except sqlite3.IntegrityError:
+                # A concurrent delivery of the same event won the race.
+                db.rollback();return self.send_json({"data":{"event_id":event_id,"duplicate":True}})
+            db.execute("DELETE FROM serviceops_inbound_events WHERE instance_id=? AND received_at<?",(instance_id,(datetime.now(timezone.utc)-timedelta(days=30)).isoformat(timespec="seconds")))
+            db.commit()
+            for ready_instance,successor in ready: notify_task_ready(db,ready_instance,successor)
+            return self.send_json({"data":{"event_id":event_id,"type":event_type,**result}},202 if outcome=="ignored" else 200)
 
     def store_serviceops_ticket(self,db,rid,ticket,request_id):
         db.execute("UPDATE runbooks SET serviceops_ticket=?,serviceops_type=?,serviceops_title=?,serviceops_state=?,serviceops_priority=?,serviceops_synced_at=?,serviceops_request_id=?,updated_at=? WHERE id=?",(
@@ -3923,6 +4299,7 @@ class Handler(BaseHTTPRequestHandler):
         rb=db.execute("SELECT r.*,w.instance_id FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE r.id=?",(rid,)).fetchone();ticket_number=str(rb["serviceops_ticket"] or "").strip()
         settings={r["key"]:r["value"] for r in db.execute("SELECT key,value FROM instance_settings WHERE instance_id=? AND key LIKE 'serviceops_%'",(rb["instance_id"],))}
         if not ticket_number or settings.get("serviceops_enabled","true")!="true" or target not in {"live","complete"}:return None
+        if target=="complete": flush_serviceops_writes_for_runbook(db,rid)
         ticket,request_id,_=self.serviceops_request(db,rb["instance_id"],"GET",f"tickets/{urllib.parse.quote(ticket_number)}")
         if target=="live" and settings.get("serviceops_require_approved","true")=="true" and ticket.get("type")=="change" and ticket.get("state") not in {"Approved","In Progress"}:
             raise PermissionError(f"ServiceOps change {ticket_number} is {ticket.get('state','not approved')}; approval is required before Live")
@@ -3970,24 +4347,6 @@ class Handler(BaseHTTPRequestHandler):
         if created: append_audit(db,rid,"serviceops.ctasks_imported",f"Imported {len(created)} change task(s) from {ticket_number}")
         if updated: append_audit(db,rid,"serviceops.ctasks_synced",f"Updated {len(updated)} change task(s) from {ticket_number}")
         return created
-
-    def push_serviceops_ctask_state(self, db, rid, ctask_number, target):
-        """Best-effort: reflect a FlowOps task's completion back onto the
-        matching ServiceOps CTASK, so the change's own required-task gate
-        (which blocks Resolve while a required CTASK stays open) doesn't
-        surface a confusing conflict once every FlowOps task is done.
-        Never raises -- a ServiceOps outage must not block local task
-        execution, only get audited."""
-        state = {"running": "Work in Progress", "complete": "Closed Complete", "skipped": "Cancelled"}.get(target)
-        if not state: return
-        rb=db.execute("SELECT r.serviceops_ticket,w.instance_id FROM runbooks r JOIN workspaces w ON w.id=r.workspace_id WHERE r.id=?",(rid,)).fetchone()
-        ticket=str(rb["serviceops_ticket"] or "").strip() if rb else ""
-        if not ticket: return
-        try:
-            self.serviceops_request(db,rb["instance_id"],"PATCH",f"tickets/{urllib.parse.quote(ticket)}/ctasks/{urllib.parse.quote(ctask_number)}",{"state":state},f"flowops-ctask-{ctask_number}-{target}")
-            append_audit(db,rid,"serviceops.ctask_synced",f"{ctask_number} → {state}")
-        except RuntimeError as exc:
-            append_audit(db,rid,"serviceops.ctask_sync_failed",f"{ctask_number}: {exc}")
 
     def apply_serviceops_sync(self, db, rid, ticket):
         """Fetch a linked change ticket, store its status, and import its CTASKs
@@ -4457,6 +4816,7 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     init_db()
     threading.Thread(target=webhook_dispatcher_loop, daemon=True).start()
+    threading.Thread(target=serviceops_outbox_loop, daemon=True).start()
     threading.Thread(target=backup_loop, daemon=True).start()
     threading.Thread(target=dashboard_email_loop, daemon=True).start()
     host=os.getenv("FLOWOPS_HOST","127.0.0.1"); port=int(os.getenv("FLOWOPS_PORT","8080"))
