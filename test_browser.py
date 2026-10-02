@@ -636,6 +636,37 @@ class FlowOpsBrowserTest(unittest.TestCase):
             overflow = self.page.evaluate('document.documentElement.scrollWidth - document.documentElement.clientWidth')
             self.assertLessEqual(overflow, 0, f'admin {tool} overflows the page by {overflow}px')
 
+    def test_serviceops_events_and_writeback_cards_generate_a_secret_shown_once(self):
+        self.page.evaluate("show('admin'); openAdminTool('connections')")
+        self.page.wait_for_selector('.so-events-card')
+        self.assertIn('/api/integrations/serviceops/events/flowops', self.page.inner_text('.so-receiver'))
+        self.page.wait_for_selector('.so-outbox p, .so-outbox .so-outbox-row')
+        self.page.click('#soGenerateSecret')
+        self.page.wait_for_selector('#soSecretValue')
+        secret = self.page.inner_text('#soSecretValue')
+        self.assertTrue(secret.startswith('whsec_'))
+        self.assertIn('Receiving', self.page.inner_text('.so-events-card .connection-state'))
+        # The secret is never sent back to the browser after this response.
+        integrations = self.page.evaluate("api('/api/admin/integrations')")
+        self.assertNotIn(secret, str(integrations))
+        self.page.set_viewport_size({'width': 390, 'height': 844})
+        self.page.wait_for_timeout(200)
+        overflow = self.page.evaluate('document.documentElement.scrollWidth - document.documentElement.clientWidth')
+        self.assertLessEqual(overflow, 0, f'ServiceOps connection cards overflow the page by {overflow}px')
+        self.page.evaluate("api('/api/admin/integrations/serviceops/events-secret', {method:'POST', body: JSON.stringify({revoke:true})})")
+
+    def test_withdrawn_serviceops_change_shows_an_alert_on_the_runbook(self):
+        rid = self._make_runbook('Withdrawn change UI', [{'title': 'Step'}])
+        with server.connect() as db:
+            db.execute("UPDATE runbooks SET serviceops_ticket='CHG0000900',serviceops_state='Cancelled',serviceops_alert=? WHERE id=?",
+                       ('ServiceOps change CHG0000900 is now Cancelled. The work is no longer authorised; confirm with the change manager before continuing.', rid))
+            db.commit()
+        self.page.evaluate('id => openRunbook(id)', rid)
+        self.page.wait_for_selector('#soAlert')
+        self.assertTrue(self.page.is_visible('#soAlert'))
+        self.assertEqual(self.page.get_attribute('#soAlert', 'role'), 'alert')
+        self.assertIn('CHG0000900 is now Cancelled', self.page.inner_text('#soAlert'))
+
     def test_administration_sidenav_heading_is_readable(self):
         self.page.evaluate("show('admin')")
         color = self.page.eval_on_selector('.admin-sidenav-head strong', 'e => getComputedStyle(e).color')

@@ -449,12 +449,70 @@ credential lifecycle, and safe connection tests are `DONE`; a reusable
 named-connection abstraction (as opposed to a per-task URL) remains
 `BACKLOG`.
 
-The first-party ServiceOps REST v1 connector is now `PARTIAL`: ticket retrieval,
-server-side bearer authentication, request correlation, change approval checks,
-idempotent Live/complete state write-back, optional workflow triggering, local
-audit evidence, and ticket projection are implemented. ServiceOps API client
-creation/revocation remains owned by ServiceOps; inbound signed events and
-asynchronous delivery retry remain under Epic 3.5.
+The first-party ServiceOps REST v1 connector is `DONE` (2026-10-02, v0.7.0):
+ticket retrieval, server-side bearer authentication, request correlation,
+change approval checks, idempotent Live/complete state write-back, optional
+workflow triggering, local audit evidence, and ticket projection were already
+implemented; inbound signed events and durable, retried CTASK write-back now
+close the remaining gap (see "ServiceOps two-way collaboration" below).
+ServiceOps API client creation/revocation remains owned by ServiceOps.
+
+ServiceOps two-way collaboration (2026-10-02, v0.7.0): `DONE`.
+- **Durable CTASK write-back.** A CTASK state change used to be PATCHed to
+  ServiceOps inside the task-transition request's SQLite write transaction:
+  a slow or unreachable ServiceOps held the write lock for up to the 8-second
+  timeout (the same class of defect fixed earlier in the webhook dispatcher),
+  and a failure was only audited, never retried, leaving the change unable to
+  resolve while a required CTASK stayed open. Writes are now inserted into a
+  `serviceops_outbox` table in the same transaction as the task transition
+  and delivered by a background worker with no connection held (claimed with
+  `BEGIN IMMEDIATE` and a lease, safe across replicas). Transient failures
+  retry at 15 s, 1 min, 5 min, 15 min, 1 h, 1 h; a 4xx other than
+  408/425/429 is parked as `failed` immediately, because repeating a refused
+  request cannot succeed. Administration → Connections lists recent writes
+  with their errors and a Retry action
+  (`GET /api/admin/integrations/serviceops/outbox`,
+  `POST /api/admin/integrations/serviceops/outbox/{id}/retry`). The runbook
+  document carries `serviceops_writeback` (`pending`/`failed`), shown on the
+  ServiceOps record card. Completing a runbook first delivers its outstanding
+  CTASK writes inline, so ServiceOps never refuses the Resolved transition
+  for a CTASK FlowOps already finished.
+- **Execution evidence.** Completing or skipping a CTASK-linked task also
+  queues an append-only work note (runbook, task, actor, planned versus
+  actual minutes, validation result, skip reason) through ServiceOps'
+  `append_work_notes` field, which keeps the owning team's own notes. It is a
+  separate outbox item, so an older ServiceOps that rejects the field never
+  blocks the state write. `serviceops_record_evidence` (default on) turns it
+  off.
+- **Signed inbound events.** `POST /api/integrations/serviceops/events/{instance}`
+  accepts ServiceOps webhook deliveries authenticated by
+  `X-ServiceOps-Signature` (HMAC-SHA256 over `<timestamp>.<body>`), a
+  five-minute timestamp window, and per-instance de-duplication on
+  `X-ServiceOps-Event-ID` (30-day window). The verifier also accepts the
+  compact key-sorted encoding that ServiceOps releases before 1.109 signed
+  while sending a differently formatted body. Administrators generate or
+  rotate the signing secret (shown once, encrypted at rest) and see the
+  receiver URL and last event under Administration → Connections.
+  `change.state_changed` refreshes the ticket projection; a move to
+  Cancelled, Rejected, New or Awaiting Approval while the runbook is ready,
+  live or paused sets `serviceops_alert`, audited as
+  `serviceops.change_withdrawn` and shown as a banner on the runbook, and a
+  return to an authorised state clears it. `change_task.state_changed`
+  mirrors the CTASK state onto the task (`serviceops_ctask_state`); during a
+  live run, never a rehearsal, the task follows it (Closed Complete →
+  complete, Cancelled → skipped, Work in Progress → running, Closed
+  Incomplete → failed), successors are released and notified, and nothing is
+  written back, so an event cannot echo between the systems.
+- Covered by `test_completing_a_task_pushes_its_ctask_state_back_to_serviceops`
+  (rewritten: the request makes no ServiceOps call, delivery, evidence,
+  backoff), `test_serviceops_signature_verification_accepts_raw_and_legacy_canonical_bodies`,
+  `test_serviceops_events_secret_is_shown_once_and_receiver_rejects_bad_signatures`,
+  `test_serviceops_change_event_updates_projection_flags_withdrawal_and_dedupes`,
+  `test_serviceops_ctask_event_drives_live_task_without_echoing_back`,
+  `test_serviceops_permanent_writeback_failure_parks_and_admin_can_retry`,
+  `test_runbook_completion_flushes_ctask_writes_before_resolving_the_change`,
+  and browser tests `test_serviceops_events_and_writeback_cards_generate_a_secret_shown_once`
+  and `test_withdrawn_serviceops_change_shows_an_alert_on_the_runbook`.
 
 CTASK sub-task visibility (2026-09-11): `DONE`. A linked change ticket's
 CTASKs now surface their owning team and assigned person as distinct
@@ -1195,6 +1253,7 @@ screens still require the same gate as they are introduced.
    - Tests: 14 new functional tests (`test_rehearsal_*`, `test_checklist_*`, `test_fixed_start_*`, `test_task_comments_*`, `test_finishing_a_task_marks_successors_ready_*`, `test_my_tasks_*`, `test_email_task_*`, `test_runbook_task_*`, `test_forecast_*`, `test_task_xlsx_*`, `test_audit_export_filters_*`, `test_runbook_list_reports_*`, `test_duplicate_preserves_*`) and 4 real-Chrome tests. Templates and snippets do not yet carry checklist/recipient/fixed-start/linked-runbook fields; Gantt bars do not yet shift for fixed start times (the forecast does).
 
 11. ~~Cutover-style runbook workspace.~~ Done 2026-09-28 in v0.6.0 (product-owner reference screenshots): compact runbook header (type tile, name, run badge, Tasks/Dashboard tabs, large run clock, task-completion ring); task toolbar (filters toggle, search, My tasks, Active, visible/total count, List/Nodemap/Gantt/Table); task list on a stream-coloured vertical spine with planned/actual start times, task-type shapes (circle normal, diamond milestone, square checklist/validation, hexagon automation, ringed communication, runbook-link) and state glyphs (play when startable, spinning when running, check/skip/fail/block), inline result badges, message-sent state, duration and planned-vs-actual variance, avatars; a right-hand task panel (live timer, start/finish variance, primary START/COMPLETE, checklist, predecessors/successors, assignments, custom fields, comments) and an icon rail for runbook details, teams, conversation and history. Timing, KPIs, stream progress and late tasks moved to the Dashboard tab. FlowOps colours and name kept; no Cutover assets used.
+12. ~~ServiceOps two-way collaboration.~~ Done 2026-10-02 in v0.7.0: durable, retried CTASK write-back off the request thread, append-only execution evidence on CTASKs, signed inbound `change.state_changed`/`change_task.state_changed` events with a withdrawn-change alert, and an administrator write-back queue. See Epic 3.1. Paired ServiceOps change: `change_task.state_changed` webhook event, `append_work_notes` on the CTASK PATCH, and signed webhooks that send the exact signed bytes. Evidence: 147 functional tests and 37 browser tests pass (2 environment skips).
 
 ## Guide Requirements Traceability
 
@@ -1265,7 +1324,7 @@ reviewed from the full 5:22 transcript on 2026-09-06.
 | Removed unsupported automation-provider configuration from the product surface and API | Product-owner decision 2026-09-07 | 3.1 | DONE |
 | Missing-job errors return actionable detail; operator can retry or audited-skip | 2:55-3:50 | 1.6, 3.1 | DONE |
 | Only authorized executors can trigger potentially destructive external jobs | 4:38-5:03 | 1.1, 3.1 | DONE |
-| ServiceOps owns approval/risk/record lifecycle; FlowOps returns execution state and evidence | Product integration decision | 3.1, 3.5 | PARTIAL |
+| ServiceOps owns approval/risk/record lifecycle; FlowOps returns execution state and evidence | Product integration decision | 3.1, 3.5 | DONE (v0.7.0: durable CTASK write-back, append-only evidence notes, signed inbound change/CTASK events) |
 | Use ServiceOps REST v1 ticket, update, and workflow APIs with scoped bearer identity, request IDs, and idempotency keys | ServiceOps `docs/API_REFERENCE.md` §§1-3, 5, 7-8 | 3.1 | DONE |
 | Block a linked change from Live when ServiceOps reports it is not approved | ServiceOps lifecycle guard and FlowOps integration policy | 3.1 | DONE |
 | Persist a minimal ServiceOps ticket projection and show its state in the runbook | ServiceOps ticket document contract | 3.1, 3.2 | DONE |

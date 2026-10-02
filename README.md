@@ -43,7 +43,29 @@ FLOWOPS_PORT=8088 python3 server.py
    FlowOps to write status back).
 2. In FlowOps: **Administration → Connections** → paste the `sop_…` key.
 3. Link a ServiceOps ticket number when creating a runbook, then use
-   **Sync ServiceOps** on the runbook page.
+   **Sync ServiceOps** on the runbook page. The change's CTASKs become tasks.
+
+What flows each way:
+
+| Direction | What | How |
+|---|---|---|
+| ServiceOps → FlowOps | Approval gate before Live | Checked on the ready → live transition |
+| ServiceOps → FlowOps | Change withdrawn or re-opened for approval | Signed `change.state_changed` event; the runbook shows an alert |
+| ServiceOps → FlowOps | CTASK closed or cancelled in ServiceOps | Signed `change_task.state_changed` event; the live task follows |
+| FlowOps → ServiceOps | Change In Progress / Resolved | Live and complete transitions |
+| FlowOps → ServiceOps | CTASK state and execution evidence | Queued, retried write-back with an append-only work note |
+
+To receive events, open **Administration → Connections → Events from
+ServiceOps**, generate a signing secret, then in ServiceOps add a **Webhook**
+integration pointing at `/api/integrations/serviceops/events/<instance>`
+with that secret, subscribed to `change.state_changed` and
+`change_task.state_changed`. Set `FLOWOPS_PUBLIC_URL` so the page shows the
+full receiver URL. Execution evidence needs ServiceOps 1.109 or later; older
+releases still receive CTASK state.
+
+CTASK writes never block task execution. If ServiceOps is unreachable they
+retry with backoff, and anything ServiceOps refuses is listed with its error
+and a **Retry** action under **Write-back to ServiceOps**.
 
 In MicroK8s, use the in-cluster URL
 (`http://serviceops.operations.svc.cluster.local`) — the public

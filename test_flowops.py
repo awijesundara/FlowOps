@@ -1,5 +1,7 @@
 import base64
 import hashlib
+import hmac
+import io
 import json
 import os
 import tempfile
@@ -575,7 +577,7 @@ class FlowOpsTest(unittest.TestCase):
                     {'number':'CTASK0000011','title':'Restore traffic','state':'Open','sequence':2,'assignee':None},
                 ]}).encode())
             if '/ctasks/' in request.full_url:
-                return Response(json.dumps({'data':{'number':'CTASK0000010','state':json.loads(request.data)['state']}}).encode())
+                return Response(json.dumps({'data':{'number':'CTASK0000010','state':json.loads(request.data).get('state','Closed Complete')}}).encode())
             return Response(b'{"data":{"number":"CHG0000044","type":"change","title":"Push-back change","state":"Approved","priority":"P2"}}')
         with patch('server.urllib.request.urlopen',fake_open):
             self.req(f'/api/runbooks/{rid}/serviceops-sync','POST',{})
@@ -589,24 +591,205 @@ class FlowOpsTest(unittest.TestCase):
         with patch('server.urllib.request.urlopen',fake_open):
             code,body=self.req(f'/api/tasks/{task_id}','PATCH',{'status':'running'})
         self.assertEqual(code,200)
+        # The request thread never calls ServiceOps: the write is queued
+        # in the same transaction as the task transition.
+        self.assertFalse([r for r in captured if '/ctasks/' in r.full_url])
+        self.assertEqual(body['data']['serviceops_writeback'],{'pending':1,'failed':0})
+        with patch('server.urllib.request.urlopen',fake_open):self.assertEqual(server.dispatch_serviceops_outbox(),1)
         running_push=next(r for r in captured if '/ctasks/CTASK0000010' in r.full_url)
         self.assertEqual(running_push.method,'PATCH')
         self.assertEqual(json.loads(running_push.data),{'state':'Work in Progress'})
+        self.assertEqual(running_push.get_header('Idempotency-key'),'flowops-ctask-CTASK0000010-running')
         captured.clear()
         with patch('server.urllib.request.urlopen',fake_open):
             code,body=self.req(f'/api/tasks/{task_id}','PATCH',{'status':'complete'})
-        self.assertEqual(code,200)
-        complete_push=next(r for r in captured if '/ctasks/CTASK0000010' in r.full_url)
-        self.assertEqual(json.loads(complete_push.data),{'state':'Closed Complete'})
+            self.assertEqual(code,200)
+            self.assertEqual(server.dispatch_serviceops_outbox(),2)
+        pushes=[r for r in captured if '/ctasks/CTASK0000010' in r.full_url]
+        self.assertEqual(json.loads(pushes[0].data),{'state':'Closed Complete'})
+        # Completion also records append-only execution evidence on the CTASK.
+        evidence=json.loads(pushes[1].data)['append_work_notes']
+        self.assertIn('FlowOps runbook "Push-back change"',evidence);self.assertIn('"Drain traffic" completed by',evidence);self.assertIn('Planned 15 min, actual',evidence)
         runbook=self.req(f'/api/runbooks/{rid}')[1]['data']
         self.assertTrue(any(a['action']=='serviceops.ctask_synced' for a in runbook['audit']))
-        # a ServiceOps outage during a task transition must not block the local transition
-        def broken(request,timeout=0):raise __import__('urllib.error',fromlist=['URLError']).URLError('unreachable')
+        self.assertTrue(any(a['action']=='serviceops.evidence_recorded' for a in runbook['audit']))
+        self.assertEqual(runbook['serviceops_writeback'],{'pending':0,'failed':0})
+        # A ServiceOps outage never blocks the local transition and the write
+        # is retried on a backoff schedule instead of being dropped.
+        def broken(request,timeout=0):raise urllib.error.URLError('unreachable')
         with patch('server.urllib.request.urlopen',broken):
             code,body=self.req(f'/api/tasks/{task2_id}','PATCH',{'status':'running'})
-        self.assertEqual(code,200)
-        self.assertEqual(next(t['status'] for t in body['data']['tasks'] if t['id']==task2_id),'running')
+            self.assertEqual(code,200)
+            self.assertEqual(next(t['status'] for t in body['data']['tasks'] if t['id']==task2_id),'running')
+            self.assertEqual(server.dispatch_serviceops_outbox(),1)
+            self.assertEqual(server.dispatch_serviceops_outbox(),0,'a failed write waits for its backoff, not the next pass')
+        with server.connect() as db:
+            row=db.execute("SELECT status,attempts,last_error,next_attempt_at FROM serviceops_outbox WHERE label='CTASK0000011 → Work in Progress'").fetchone()
+        self.assertEqual((row['status'],row['attempts'],row['last_error']),('pending',1,'ServiceOps is unreachable'))
+        self.assertGreater(row['next_attempt_at'],time.time()+10)
+        captured.clear()
+        with patch('server.urllib.request.urlopen',fake_open):self.assertEqual(server.dispatch_serviceops_outbox(include_future=True),1)
+        self.assertEqual(json.loads(next(r for r in captured if '/ctasks/CTASK0000011' in r.full_url).data),{'state':'Work in Progress'})
         self.req('/api/admin/integrations','POST',{'provider':'serviceops','revoke_credential':True})
+    # --- ServiceOps collaboration: signed inbound events and durable write-back ---
+    def serviceops_fake(self,captured,ticket_state='Approved',ctasks=None,ctask_status=200):
+        """A ServiceOps REST double for urllib.request.urlopen."""
+        class Response:
+            status=200
+            headers={'X-Request-ID':'so-request'}
+            def __init__(self,body):self.body=body
+            def __enter__(self):return self
+            def __exit__(self,*_):return False
+            def read(self,*_):return self.body
+        def fake_open(request,timeout=0):
+            captured.append(request)
+            if request.full_url.endswith('/ctasks'):
+                return Response(json.dumps({'data':ctasks or []}).encode())
+            if '/ctasks/' in request.full_url:
+                if ctask_status!=200:raise urllib.error.HTTPError(request.full_url,ctask_status,'Refused',{},io.BytesIO(b'{"detail":"Unknown fields: append_work_notes."}'))
+                return Response(b'{"data":{"number":"CTASK","state":"Closed Complete"}}')
+            number=request.full_url.rsplit('/',1)[-1]
+            state=json.loads(request.data)['state'] if request.data else ticket_state
+            return Response(json.dumps({'data':{'number':number,'type':'change','title':'Governed','state':state,'priority':'P2'}}).encode())
+        return fake_open
+    def linked_runbook(self,name,ticket,ctasks):
+        self.req('/api/admin/integrations','POST',{'provider':'serviceops','url':'https://serviceops.example','credential':'sop_collab','enabled':True})
+        _,created=self.req('/api/runbooks','POST',{'name':name});rid=created['data']['id']
+        with patch('server.urllib.request.urlopen',self.serviceops_fake([],ctasks=ctasks)):
+            self.req(f'/api/runbooks/{rid}/serviceops-sync','POST',{'ticket':ticket})
+        return rid,{t['serviceops_ctask']:t['id'] for t in self.req(f'/api/runbooks/{rid}')[1]['data']['tasks'] if t['serviceops_ctask']}
+    def events_secret(self):
+        code,body=self.req('/api/admin/integrations/serviceops/events-secret','POST',{})
+        self.assertEqual(code,201);return body['data']['secret'],body['data']['receiver_path']
+    def post_event(self,path,secret,event,timestamp=None,legacy_body=False,event_id=None):
+        canonical=json.dumps(event,sort_keys=True,separators=(',',':')).encode()
+        raw=json.dumps(event).encode() if legacy_body else canonical
+        stamp=str(int(timestamp if timestamp is not None else time.time()))
+        signature=hmac.new(secret.encode(),stamp.encode()+b'.'+canonical,hashlib.sha256).hexdigest()
+        headers={'Content-Type':'application/json','X-ServiceOps-Timestamp':stamp,'X-ServiceOps-Signature':f'sha256={signature}','X-ServiceOps-Event-ID':event_id or event['id']}
+        request=urllib.request.Request(self.base+path,data=raw,method='POST',headers=headers)
+        try:
+            with urllib.request.urlopen(request) as res:return res.status,json.load(res)
+        except urllib.error.HTTPError as err:return err.code,json.load(err)
+    def test_serviceops_signature_verification_accepts_raw_and_legacy_canonical_bodies(self):
+        secret='whsec_test';stamp=str(int(time.time()));body=b'{"data":{"b":1,"a":2},"id":"e"}'
+        sign=lambda payload:'sha256='+hmac.new(secret.encode(),stamp.encode()+b'.'+payload,hashlib.sha256).hexdigest()
+        self.assertTrue(server.verify_serviceops_signature(secret,stamp,sign(body),body))
+        # ServiceOps <= 1.108 signed the sorted compact form but sent requests' json= encoding.
+        sent=b'{"id": "e", "data": {"b": 1, "a": 2}}'
+        self.assertTrue(server.verify_serviceops_signature(secret,stamp,sign(b'{"data":{"a":2,"b":1},"id":"e"}'),sent))
+        self.assertFalse(server.verify_serviceops_signature(secret,stamp,sign(body),body+b' '),'a modified body must fail')
+        self.assertFalse(server.verify_serviceops_signature('other',stamp,sign(body),body))
+        self.assertFalse(server.verify_serviceops_signature(secret,str(int(stamp)-301),sign(body),body),'outside the replay window')
+        self.assertFalse(server.verify_serviceops_signature('',stamp,sign(body),body),'no secret configured')
+        self.assertFalse(server.verify_serviceops_signature(secret,'soon',sign(body),body))
+    def test_serviceops_events_secret_is_shown_once_and_receiver_rejects_bad_signatures(self):
+        secret,path=self.events_secret()
+        self.assertTrue(secret.startswith('whsec_'));self.assertEqual(path,'/api/integrations/serviceops/events/flowops')
+        _,connections=self.req('/api/admin/integrations');events=connections['data']['serviceops']['events']
+        self.assertTrue(events['configured']);self.assertNotIn('secret',events)
+        self.assertEqual(events['subscribed_events'],['change.state_changed','change_task.state_changed'])
+        with server.connect() as db:stored=db.execute("SELECT secret_encrypted FROM integration_credentials WHERE provider='serviceops_events'").fetchone()[0]
+        self.assertNotIn(secret,stored)
+        event={'id':'evt-bad','type':'change.state_changed','data':{'number':'CHG0000700','state':'Approved'}}
+        self.assertEqual(self.post_event(path,'wrong-secret',event)[0],401)
+        self.assertEqual(self.post_event(path,secret,event,timestamp=time.time()-600)[0],401)
+        self.assertEqual(self.post_event('/api/integrations/serviceops/events/no-such-instance',secret,event)[0],401)
+        code,body=self.post_event(path,secret,{'id':'evt-unknown','type':'incident.created','data':{}})
+        self.assertEqual(code,202);self.assertTrue(body['data']['ignored'])
+        self.assertEqual(self.req('/api/admin/integrations/serviceops/events-secret','POST',{'revoke':True})[0],200)
+        self.assertEqual(self.post_event(path,secret,{'id':'evt-after-revoke','type':'incident.created','data':{}})[0],401)
+    def test_serviceops_change_event_updates_projection_flags_withdrawal_and_dedupes(self):
+        secret,path=self.events_secret()
+        rid,_=self.linked_runbook('Withdrawn change','CHG0000710',[])
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})
+        event={'id':'evt-710-cancel','type':'change.state_changed','data':{'number':'chg0000710','state':'Cancelled','previous_state':'Approved'}}
+        code,body=self.post_event(path,secret,event,legacy_body=True)
+        self.assertEqual(code,200);self.assertEqual((body['data']['runbooks'],body['data']['alerts']),(1,1))
+        doc=self.req(f'/api/runbooks/{rid}')[1]['data']
+        self.assertEqual(doc['serviceops_state'],'Cancelled');self.assertIn('no longer authorised',doc['serviceops_alert'])
+        actions=[a['action'] for a in doc['audit']]
+        self.assertIn('serviceops.change_withdrawn',actions);self.assertIn('serviceops.event_received',actions)
+        # ServiceOps retries deliveries; the same event id is applied once.
+        code,body=self.post_event(path,secret,event)
+        self.assertEqual(code,200);self.assertTrue(body['data']['duplicate'])
+        self.assertEqual([a['action'] for a in self.req(f'/api/runbooks/{rid}')[1]['data']['audit']].count('serviceops.change_withdrawn'),1)
+        self.post_event(path,secret,{'id':'evt-710-approved','type':'change.state_changed','data':{'number':'CHG0000710','state':'Approved','previous_state':'Awaiting Approval'}})
+        self.assertIsNone(self.req(f'/api/runbooks/{rid}')[1]['data']['serviceops_alert'])
+        _,connections=self.req('/api/admin/integrations')
+        self.assertEqual(connections['data']['serviceops']['events']['last_event']['event_type'],'change.state_changed')
+        self.req('/api/admin/integrations','POST',{'provider':'serviceops','revoke_credential':True})
+    def test_serviceops_ctask_event_drives_live_task_without_echoing_back(self):
+        secret,path=self.events_secret()
+        rid,tasks=self.linked_runbook('Inbound CTASK change','CHG0000720',[
+            {'number':'CTASK0000720','title':'Snapshot','state':'Open','sequence':1},
+            {'number':'CTASK0000721','title':'Upgrade','state':'Open','sequence':2}])
+        # Before the run, an event only mirrors the ServiceOps state.
+        self.post_event(path,secret,{'id':'evt-720-plan','type':'change_task.state_changed','data':{'number':'CTASK0000720','ticket':'CHG0000720','state':'Work in Progress'}})
+        task=next(t for t in self.req(f'/api/runbooks/{rid}')[1]['data']['tasks'] if t['id']==tasks['CTASK0000720'])
+        self.assertEqual((task['status'],task['serviceops_ctask_state']),('pending','Work in Progress'))
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})
+        with patch('server.urllib.request.urlopen',self.serviceops_fake([])):
+            self.assertEqual(self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})[0],200)
+        code,body=self.post_event(path,secret,{'id':'evt-720-done','type':'change_task.state_changed','data':{'number':'CTASK0000720','ticket':'CHG0000720','state':'Closed Complete','previous_state':'Work in Progress'}})
+        self.assertEqual(code,200);self.assertEqual(body['data']['applied'],1)
+        doc=self.req(f'/api/runbooks/{rid}')[1]['data'];by_id={t['id']:t for t in doc['tasks']}
+        self.assertEqual(by_id[tasks['CTASK0000720']]['status'],'complete');self.assertTrue(by_id[tasks['CTASK0000720']]['completed_at'])
+        self.assertTrue(by_id[tasks['CTASK0000721']]['startable'],'the successor is released')
+        transition=next(a for a in doc['audit'] if a['action']=='task.transition')
+        self.assertEqual(transition['actor'],'ServiceOps');self.assertIn('CTASK0000720 set to Closed Complete in ServiceOps',transition['detail'])
+        self.assertEqual(doc['serviceops_writeback'],{'pending':0,'failed':0},'an inbound change is never written back')
+        # A queued FlowOps write for a CTASK that ServiceOps then closes is
+        # superseded rather than delivered stale and reported as failed.
+        self.assertEqual(self.req(f'/api/tasks/{tasks["CTASK0000721"]}','PATCH',{'status':'running'})[0],200)
+        self.post_event(path,secret,{'id':'evt-721-done','type':'change_task.state_changed','data':{'number':'CTASK0000721','ticket':'CHG0000720','state':'Closed Complete'}})
+        with server.connect() as db:
+            row=db.execute("SELECT status,last_error FROM serviceops_outbox WHERE label='CTASK0000721 → Work in Progress'").fetchone()
+        self.assertEqual(row['status'],'superseded');self.assertIn('set to Closed Complete in ServiceOps',row['last_error'])
+        self.assertEqual(self.req(f'/api/runbooks/{rid}')[1]['data']['serviceops_writeback'],{'pending':0,'failed':0})
+        # An event for a CTASK linked under a different change is ignored.
+        code,body=self.post_event(path,secret,{'id':'evt-720-other','type':'change_task.state_changed','data':{'number':'CTASK0000720','ticket':'CHG0009999','state':'Cancelled'}})
+        self.assertEqual(body['data']['tasks'],0)
+        with patch('server.urllib.request.urlopen',self.serviceops_fake([])):server.dispatch_serviceops_outbox(include_future=True)
+        self.req('/api/admin/integrations','POST',{'provider':'serviceops','revoke_credential':True})
+    def test_serviceops_permanent_writeback_failure_parks_and_admin_can_retry(self):
+        rid,tasks=self.linked_runbook('Refused write-back','CHG0000730',[{'number':'CTASK0000730','title':'Drain','state':'Open','sequence':1}])
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})
+        with patch('server.urllib.request.urlopen',self.serviceops_fake([])):self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        self.req(f'/api/tasks/{tasks["CTASK0000730"]}','PATCH',{'status':'running'})
+        captured=[]
+        with patch('server.urllib.request.urlopen',self.serviceops_fake(captured,ctask_status=403)):server.dispatch_serviceops_outbox(include_future=True)
+        doc=self.req(f'/api/runbooks/{rid}')[1]['data']
+        self.assertEqual(doc['serviceops_writeback'],{'pending':0,'failed':1},'a 4xx is not retried blindly')
+        self.assertTrue(any(a['action']=='serviceops.ctask_sync_failed' and 'HTTP 403' in a['detail'] for a in doc['audit']))
+        _,outbox=self.req('/api/admin/integrations/serviceops/outbox')
+        failed=next(item for item in outbox['data'] if item['runbook_id']==rid)
+        self.assertEqual((failed['status'],failed['attempts'],failed['runbook_name']),('failed',1,'Refused write-back'))
+        _,connections=self.req('/api/admin/integrations');self.assertGreaterEqual(connections['data']['serviceops']['writeback']['failed'],1)
+        self.assertEqual(self.req(f'/api/admin/integrations/serviceops/outbox/{failed["id"]}/retry','POST',{})[0],200)
+        captured.clear()
+        with patch('server.urllib.request.urlopen',self.serviceops_fake(captured)):self.assertEqual(server.dispatch_serviceops_outbox(),1)
+        self.assertEqual(self.req(f'/api/runbooks/{rid}')[1]['data']['serviceops_writeback'],{'pending':0,'failed':0})
+        self.assertEqual(self.req(f'/api/admin/integrations/serviceops/outbox/{failed["id"]}/retry','POST',{})[0],409)
+        self.assertEqual(self.req('/api/admin/integrations/serviceops/outbox/999999/retry','POST',{})[0],404)
+        self.req('/api/admin/integrations','POST',{'provider':'serviceops','revoke_credential':True})
+    def test_runbook_completion_flushes_ctask_writes_before_resolving_the_change(self):
+        """ServiceOps refuses to resolve a change while a required CTASK is
+        open, so queued CTASK writes must land before the Resolved PATCH."""
+        rid,tasks=self.linked_runbook('Flush before resolve','CHG0000740',[{'number':'CTASK0000740','title':'Only step','state':'Open','sequence':1}])
+        self.req('/api/admin/integrations','POST',{'provider':'serviceops','record_evidence':False})
+        self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})
+        with patch('server.urllib.request.urlopen',self.serviceops_fake([])):self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        self.req(f'/api/tasks/{tasks["CTASK0000740"]}','PATCH',{'status':'running'})
+        self.req(f'/api/tasks/{tasks["CTASK0000740"]}','PATCH',{'status':'complete'})
+        captured=[]
+        with patch('server.urllib.request.urlopen',self.serviceops_fake(captured)):
+            code,_=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'complete'})
+        self.assertEqual(code,200)
+        writes=[(r.full_url.rsplit('/',1)[-1],json.loads(r.data)) for r in captured if r.method=='PATCH']
+        self.assertEqual(writes,[('CTASK0000740',{'state':'Work in Progress'}),('CTASK0000740',{'state':'Closed Complete'}),('CHG0000740',{'state':'Resolved'})])
+        self.assertEqual(self.req(f'/api/runbooks/{rid}')[1]['data']['serviceops_writeback'],{'pending':0,'failed':0})
+        self.req('/api/admin/integrations','POST',{'provider':'serviceops','record_evidence':True,'revoke_credential':True})
     def test_serviceops_change_approval_gate_and_idempotent_live_writeback(self):
         self.req('/api/admin/integrations','POST',{'provider':'serviceops','url':'https://serviceops.example','credential':'sop_lifecycle_test','enabled':True,'require_approved':True,'sync_on_live':True})
         _,created=self.req('/api/runbooks','POST',{'name':'API-governed run','serviceops_ticket':'CHG0000043'});rid=created['data']['id'];self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})
