@@ -53,6 +53,73 @@ class FlowOpsBrowserTest(unittest.TestCase):
     def tearDown(self):
         self.page.close()
 
+    def test_temporary_session_check_failure_does_not_attempt_sso_or_show_login(self):
+        calls = []
+        self.page.route('**/api/auth/me', lambda route: route.fulfill(
+            status=503, content_type='application/json', body='{"error":"Temporarily unavailable"}'))
+        self.page.route('**/api/auth/sso', lambda route: (calls.append('sso'), route.fulfill(
+            status=401, content_type='application/json', body='{"error":"No identity"}')))
+        self.page.reload()
+        self.page.wait_for_timeout(700)
+        self.assertEqual(calls, [])
+        self.assertFalse(self.page.locator('#enterpriseLoginForm').is_visible())
+        self.page.unroute('**/api/auth/me')
+        self.page.wait_for_selector('.shell:not(.app-hidden)', timeout=8000)
+
+    def test_failed_logout_keeps_authenticated_workspace(self):
+        self.page.route('**/api/auth/logout', lambda route: route.fulfill(
+            status=503, content_type='application/json', body='{"error":"Temporarily unavailable"}'))
+        self.page.evaluate("document.querySelector('#logout').click()")
+        self.page.wait_for_timeout(300)
+        self.assertTrue(self.page.locator('.shell').is_visible())
+        self.assertTrue(self.page.evaluate('!!state.user'))
+
+    def test_workspace_render_error_does_not_replace_valid_session_with_sso(self):
+        calls = []
+        self.page.route('**/api/auth/sso', lambda route: calls.append('sso'))
+        self.page.evaluate("applyIdentity = () => {throw new Error('Workspace render failed')}; boot()")
+        self.page.wait_for_timeout(400)
+        self.assertEqual(calls, [])
+        self.assertFalse(self.page.locator('#loginScreen').is_visible())
+        self.assertTrue(self.page.evaluate('!!state.user'))
+
+    def test_live_disconnect_checks_session_without_logging_out_on_network_failure(self):
+        self.page.route('**/api/auth/me', lambda route: route.fulfill(
+            status=503, content_type='application/json', body='{"error":"Temporarily unavailable"}'))
+        self.page.evaluate('lastLiveSessionCheck=0; checkLiveSession()')
+        self.assertTrue(self.page.evaluate('!!state.user'))
+        self.page.unroute('**/api/auth/me')
+        self.page.route('**/api/auth/me', lambda route: route.fulfill(
+            status=401, content_type='application/json', body='{"error":"Authentication required"}'))
+        self.page.evaluate('lastLiveSessionCheck=0; checkLiveSession()')
+        self.assertFalse(self.page.evaluate('!!state.user'))
+
+    def test_sign_out_clears_previous_users_activity_and_task_filters(self):
+        self.page.evaluate("announceActivity({data:JSON.stringify({action:'comment.added',actor:'Previous user',detail:'Private activity',created_at:new Date().toISOString()})}); cxMine=true; document.querySelector('#logout').click()")
+        self.page.wait_for_selector('#enterpriseLoginForm', state='visible')
+        self.assertEqual(self.page.evaluate('activity.length'), 0)
+        self.assertFalse(self.page.evaluate('cxMine'))
+
+    def test_expired_session_returns_to_sign_in_and_stops_live_feed(self):
+        self.page.route('**/api/runbooks', lambda route: route.fulfill(
+            status=401, content_type='application/json', body='{"error":"Authentication required"}'))
+        self.page.evaluate('load()')
+        self.page.wait_for_selector('#enterpriseLoginForm', state='visible')
+        self.assertFalse(self.page.evaluate('!!state.user'))
+        self.assertTrue(self.page.evaluate('liveFeed === null'))
+
+    def test_live_refresh_preserves_task_comment_draft_and_focus(self):
+        self.page.evaluate('openRunbook(state.runbooks[0].id)')
+        self.page.wait_for_selector('#detail.view.active .cx-row')
+        self.page.evaluate('cxOpenTask(state.current.tasks[0].id)')
+        field = self.page.locator('.cx-panel input[name=body]')
+        field.fill('Keep this unfinished comment')
+        field.focus()
+        self.page.evaluate('liveRefresh()')
+        self.page.wait_for_timeout(600)
+        self.assertEqual(field.input_value(), 'Keep this unfinished comment')
+        self.assertTrue(field.evaluate('(el) => el === document.activeElement'))
+
     def test_notification_bell_has_no_visible_badge_with_no_unread_activity(self):
         badge = self.page.query_selector('.unread-count')
         self.assertIsNotNone(badge, "unread-count badge element should exist in the DOM")

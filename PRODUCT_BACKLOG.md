@@ -1255,6 +1255,38 @@ screens still require the same gate as they are introduced.
 11. ~~Cutover-style runbook workspace.~~ Done 2026-09-28 in v0.6.0 (product-owner reference screenshots): compact runbook header (type tile, name, run badge, Tasks/Dashboard tabs, large run clock, task-completion ring); task toolbar (filters toggle, search, My tasks, Active, visible/total count, List/Nodemap/Gantt/Table); task list on a stream-coloured vertical spine with planned/actual start times, task-type shapes (circle normal, diamond milestone, square checklist/validation, hexagon automation, ringed communication, runbook-link) and state glyphs (play when startable, spinning when running, check/skip/fail/block), inline result badges, message-sent state, duration and planned-vs-actual variance, avatars; a right-hand task panel (live timer, start/finish variance, primary START/COMPLETE, checklist, predecessors/successors, assignments, custom fields, comments) and an icon rail for runbook details, teams, conversation and history. Timing, KPIs, stream progress and late tasks moved to the Dashboard tab. FlowOps colours and name kept; no Cutover assets used.
 12. ~~ServiceOps two-way collaboration.~~ Done 2026-10-02 in v0.7.0: durable, retried CTASK write-back off the request thread, append-only execution evidence on CTASKs, signed inbound `change.state_changed`/`change_task.state_changed` events with a withdrawn-change alert, and an administrator write-back queue. See Epic 3.1. Paired ServiceOps change: `change_task.state_changed` webhook event, `append_work_notes` on the CTASK PATCH, and signed webhooks that send the exact signed bytes. Evidence: 147 functional tests and 37 browser tests pass (2 environment skips).
 
+## Session and refresh reliability review — 2026-10-03
+
+Candidate v0.7.1 maps to Epic 1.1 (login and session expiry), Epic 1.5
+(live execution view), and Epic 4.4 (Cloudflare Access SSO). Implementation
+and local acceptance are complete. User approval was received and MicroK8s
+delivery completed on 2026-10-03: one ready v0.7.1 replica, no restarts,
+health/readiness passed, signing-key retrieval restored, 4 runbooks / 2 users /
+6 tasks preserved with database integrity confirmed, and public Access HTTP 302.
+
+- Temporary session-check failures show reconnecting and retry, rather than
+  attempting SSO and presenting a false sign-out. Workspace-render failures
+  no longer replace a valid session with SSO.
+- Failed logout retains the authenticated workspace and reports failure.
+  Confirmed expiry/revocation clears the stale session and closes its live
+  feed; a disconnected feed checks session health without treating network
+  errors as logout. The configured eight-hour expiry remains enforced.
+- Live refresh preserves task/runbook comment drafts, focus and selection.
+  Sign-out clears the previous user's activity and task-view filters.
+- Live SSO key retrieval was reproduced failing with network unreachable:
+  the live policy permits DNS and ServiceOps but no Cloudflare HTTPS.
+  The reviewed policy in `../k8s/flowops.yaml` allows TCP 443 only to
+  Cloudflare's published IPv4 ranges. Server dry-run passed; applying it was
+  initially rejected by automatic approval review because it expands the
+  production network boundary without explicit authorization. After the user
+  approved it, the policy was applied and retrieval of two signing keys passed.
+- Evidence: 147 backend tests passed; 44 real-Chrome browser tests passed,
+  with two existing environment-dependent skips (axe bundle and Web Push).
+  Seven new browser regressions cover the above paths. The initial four
+  regressions failed before their fixes. The amd64 Docker candidate is
+  healthy, with real login/session/list/logout checks, and available at
+  `http://localhost:8099`. See `docs/SESSION_RELIABILITY_REVIEW.md`.
+
 ## Guide Requirements Traceability
 
 These notes were reconciled from `Cutover Task Executor Guide.pdf` (TE) and
