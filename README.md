@@ -6,6 +6,15 @@ records and governance, FlowOps owns coordinated execution.
 
 Development is tracked in [PRODUCT_BACKLOG.md](PRODUCT_BACKLOG.md).
 
+[![CI](https://github.com/awijesundara/FlowOps/actions/workflows/ci.yml/badge.svg)](https://github.com/awijesundara/FlowOps/actions/workflows/ci.yml)
+[![Last commit](https://img.shields.io/github/last-commit/awijesundara/FlowOps/main)](https://github.com/awijesundara/FlowOps/commits/main)
+[![Top language](https://img.shields.io/github/languages/top/awijesundara/FlowOps)](https://github.com/awijesundara/FlowOps)
+[![Code size](https://img.shields.io/github/languages/code-size/awijesundara/FlowOps)](https://github.com/awijesundara/FlowOps)
+[![version](https://img.shields.io/badge/version-0.7.1-003E4C)](VERSION)
+[![python](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)](requirements.txt)
+[![docker](https://img.shields.io/badge/docker-compose%20%7C%20kubernetes-2496ED?logo=docker&logoColor=white)](#quick-start)
+[![pairs with](https://img.shields.io/badge/pairs%20with-ServiceOps-0C7C68)](https://github.com/awijesundara/ServiceOps)
+
 ## Quick start
 
 ```bash
@@ -103,3 +112,15 @@ python -m pytest test_browser.py -v          # Playwright + axe-core a11y
 FlowOps is an original implementation of common operational-orchestration
 concepts (runbooks, dependency gates, live execution tracking) — not a copy
 of any proprietary product's code, branding, or design.
+
+## Project statistics
+
+| Metric | Value |
+|---|---|
+| Tracked files | 28 |
+| Lines of code (non-blank) | 9,612 |
+| Languages | Python 8,113, JavaScript 1,011, CSS 172, Shell 136, HTML 109 |
+| Automated tests | 195 |
+| Commits | 88 |
+
+CI compiles the server, syntax-checks the UI and runs the unit and browser tests on each push to `main`.
