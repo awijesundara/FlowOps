@@ -190,7 +190,10 @@ class AdminRoutes(BaseHandler):
         if path=="/api/admin/settings":
             actor=self.require(db,"admin:settings")
             if not actor:return
-            allowed={"workspace_name","timezone","require_approval","session_hours","serviceops_enabled","directory_enabled","directory_domain","audit_retention_days","dashboard_email_frequency","dashboard_email_hour","dashboard_email_recipients"}
+            allowed={"workspace_name","timezone","require_approval","session_hours","serviceops_enabled","directory_enabled","directory_domain","audit_retention_days","dashboard_email_frequency","dashboard_email_hour","dashboard_email_recipients","local_auth_enabled","login_max_attempts","login_lockout_minutes"}
+            for key,low,high in (("login_max_attempts",1,50),("login_lockout_minutes",1,1440)):
+                if key in payload and not (str(payload[key]).isdigit() and low<=int(payload[key])<=high):
+                    return self.send_json({"error":f"{key.replace('_',' ').capitalize()} must be between {low} and {high}"},400)
             if "dashboard_email_frequency" in payload and payload["dashboard_email_frequency"] not in {"off","daily","weekly"}:
                 return self.send_json({"error":"dashboard_email_frequency must be off, daily, or weekly"},400)
             for key,value in payload.items():

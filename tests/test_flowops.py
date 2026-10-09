@@ -16,6 +16,8 @@ from unittest.mock import MagicMock, patch
 tmp=tempfile.NamedTemporaryFile(suffix='.db',delete=False); tmp.close()
 os.environ['FLOWOPS_DB']=tmp.name
 os.environ['FLOWOPS_PREVIEW_TOKENS']='true'
+os.environ['FLOWOPS_BOOTSTRAP_PASSWORD']='FlowOps!Preview2026'
+os.environ['FLOWOPS_BOOTSTRAP_EMAIL']='admin@flowops.local'
 os.environ['FLOWOPS_SETTINGS_ENCRYPTION_KEY']='a1J1M20wV3JlbklvNWt1a2NTYk9pQ3VHTW5PRzFjTFI='
 import flowops.backups
 import flowops.config
@@ -36,6 +38,8 @@ from http.server import ThreadingHTTPServer
 from datetime import datetime, timedelta, timezone
 import sqlite3
 
+OPERATOR_PASSWORD='Operator!Test-Only-2026'
+
 def unrestricted_urlopen(url,data=None,headers=None,method='GET',timeout=8,allow_private_network=False,max_redirects=3):
     """A drop-in replacement for flowops.net.safe_urlopen used ONLY to bypass the
     SSRF loopback rejection in tests that need to point at a real receiver
@@ -50,7 +54,12 @@ def unrestricted_urlopen(url,data=None,headers=None,method='GET',timeout=8,allow
 class FlowOpsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        flowops.schema.init_db(); cls.http=ThreadingHTTPServer(('127.0.0.1',0),flowops.web.handler.Handler)
+        flowops.schema.init_db()
+        # The app no longer seeds a Member account; create the one these tests use.
+        with flowops.db.connect() as db:
+            db.execute("INSERT OR IGNORE INTO users(username,display_name,email,role,team,password_hash,created_at,instance_id) VALUES(?,?,?,?,?,?,?,(SELECT id FROM instances WHERE slug=?))",
+                       ('operator','Release Operator','operator@flowops.local','Member','Release Engineering',flowops.crypto.password_hash(OPERATOR_PASSWORD),flowops.db.now(),flowops.config.DEFAULT_INSTANCE_SLUG))
+        cls.http=ThreadingHTTPServer(('127.0.0.1',0),flowops.web.handler.Handler)
         cls.base=f'http://127.0.0.1:{cls.http.server_port}'; threading.Thread(target=cls.http.serve_forever,daemon=True).start(); cls.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())); cls.csrf=''
         _,login=cls.req('/api/auth/login','POST',{'username':'admin','password':'FlowOps!Preview2026'}); cls.csrf=login['data']['csrf_token']
     @classmethod
@@ -189,7 +198,7 @@ class FlowOpsTest(unittest.TestCase):
         self.assertIn('rejected the API key',result['error'])
         self.assertNotIn('latency_ms',result)
     def test_login_sources_use_local_administrator_and_configured_directory_domain(self):
-        _,sources=self.req('/api/auth/sources');self.assertEqual(sources['data']['sources'],[{'id':'local','label':'Local administrator','placeholder':'Username'}])
+        _,sources=self.req('/api/auth/sources');self.assertEqual(sources['data']['sources'],[{'id':'local','label':'Local account','placeholder':'Username'}])
         self.req('/api/admin/settings','POST',{'directory_enabled':'true','directory_domain':'corp.example.com'})
         _,sources=self.req('/api/auth/sources');self.assertEqual(sources['data']['default'],'ldap');self.assertEqual(sources['data']['sources'][0]['label'],'corp.example.com');self.assertEqual(sources['data']['sources'][0]['placeholder'],'jsmith or jsmith@corp.example.com')
     def test_invitation_and_password_reset_use_smtp_without_returning_tokens(self):
@@ -1043,7 +1052,7 @@ class FlowOpsTest(unittest.TestCase):
         self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'}); self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
         admin_opener,admin_csrf=self.opener,self.csrf
         self.__class__.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())); self.__class__.csrf=''
-        _,login=self.req('/api/auth/login','POST',{'username':'operator','password':'Operator!Preview2026'}); self.__class__.csrf=login['data']['csrf_token']
+        _,login=self.req('/api/auth/login','POST',{'username':'operator','password':OPERATOR_PASSWORD}); self.__class__.csrf=login['data']['csrf_token']
         code,rejected=self.req(f'/api/tasks/{tid}','PATCH',{'status':'running'})
         self.assertEqual(code,403)
         self.assertIn('editor-level',rejected['error'])
@@ -1527,7 +1536,7 @@ class FlowOpsTest(unittest.TestCase):
         assigned_id=assigned['data']['tasks'][0]['id']
         self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'});self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
         admin_opener,admin_csrf=self.opener,self.csrf;self.__class__.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()));self.__class__.csrf=''
-        _,login=self.req('/api/auth/login','POST',{'username':'operator','password':'Operator!Preview2026'});self.__class__.csrf=login['data']['csrf_token']
+        _,login=self.req('/api/auth/login','POST',{'username':'operator','password':OPERATOR_PASSWORD});self.__class__.csrf=login['data']['csrf_token']
         self.assertEqual(self.req(f'/api/tasks/{assigned_id}','PATCH',{'status':'running'})[0],200)
         self.__class__.opener,self.__class__.csrf=admin_opener,admin_csrf
         self.req(f'/api/central-teams/{central_id}/members/{operator_id}','DELETE')
@@ -1596,7 +1605,7 @@ class FlowOpsTest(unittest.TestCase):
         code,review=self.req(f'/api/runbooks/{rid}/review','PATCH',{'what_went_well':'Smooth rollout','what_went_wrong':'Late start','follow_up_actions':'Automate the manual step'})
         self.assertEqual(code,200)
         self.assertEqual(review['data']['review']['what_went_well'],'Smooth rollout')
-        self.assertEqual(review['data']['review']['reviewed_by'],'Anushka')
+        self.assertEqual(review['data']['review']['reviewed_by'],'Administrator')
         _,doc=self.req(f'/api/runbooks/{rid}')
         self.assertEqual(doc['data']['review']['what_went_wrong'],'Late start')
     def test_nested_folders_track_parent_and_reject_invalid_parent(self):
@@ -1960,7 +1969,7 @@ class FlowOpsTest(unittest.TestCase):
     def test_operator_privilege_boundaries(self):
         opener=self.opener; csrf=self.csrf
         self.__class__.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())); self.__class__.csrf=''
-        _,login=self.req('/api/auth/login','POST',{'username':'operator','password':'Operator!Preview2026'}); self.__class__.csrf=login['data']['csrf_token']
+        _,login=self.req('/api/auth/login','POST',{'username':'operator','password':OPERATOR_PASSWORD}); self.__class__.csrf=login['data']['csrf_token']
         self.assertEqual(self.req('/api/runbooks')[0],200)
         self.assertEqual(self.req('/api/runbooks','POST',{'name':'Forbidden'})[0],403)
         self.assertEqual(self.req('/api/admin/users')[0],403)
@@ -1973,7 +1982,7 @@ class FlowOpsTest(unittest.TestCase):
         _,unassigned=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Admin task'});unassigned_id=unassigned['data']['tasks'][1]['id']
         self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'});self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
         admin_opener,admin_csrf=self.opener,self.csrf;self.__class__.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()));self.__class__.csrf=''
-        _,login=self.req('/api/auth/login','POST',{'username':'operator','password':'Operator!Preview2026'});self.__class__.csrf=login['data']['csrf_token']
+        _,login=self.req('/api/auth/login','POST',{'username':'operator','password':OPERATOR_PASSWORD});self.__class__.csrf=login['data']['csrf_token']
         _,doc=self.req(f'/api/runbooks/{rid}');self.assertEqual([t['title'] for t in doc['data']['tasks']],['Assigned task'])
         self.assertEqual(self.req(f'/api/tasks/{assigned_id}','PATCH',{'status':'complete'})[0],200)
         self.assertEqual(self.req(f'/api/tasks/{unassigned_id}','PATCH',{'status':'running'})[0],403)
@@ -1986,7 +1995,7 @@ class FlowOpsTest(unittest.TestCase):
         _,hidden_rb=self.req('/api/runbooks','POST',{'name':'Member hidden runbook'});hidden_rid=hidden_rb['data']['id']
         admin_opener,admin_csrf=self.opener,self.csrf
         self.__class__.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()));self.__class__.csrf=''
-        _,login=self.req('/api/auth/login','POST',{'username':'operator','password':'Operator!Preview2026'});self.__class__.csrf=login['data']['csrf_token']
+        _,login=self.req('/api/auth/login','POST',{'username':'operator','password':OPERATOR_PASSWORD});self.__class__.csrf=login['data']['csrf_token']
         _,listing=self.req('/api/runbooks')
         visible_ids={r['id'] for r in listing['data']}
         self.assertIn(assigned_rid,visible_ids)
@@ -2011,7 +2020,7 @@ class FlowOpsTest(unittest.TestCase):
         code,fallback=self.req('/api/profile','PATCH',{'locale':'xx-not-real'})
         self.assertEqual(code,200); self.assertEqual(fallback['data']['locale'],'en')
         # restore for other tests relying on the seeded display name
-        self.req('/api/profile','PATCH',{'display_name':'Anushka','title':''})
+        self.req('/api/profile','PATCH',{'display_name':'Administrator','title':''})
     def test_self_service_profile_update_requires_csrf_token(self):
         request=urllib.request.Request(self.base+'/api/profile',data=json.dumps({'display_name':'No CSRF'}).encode(),method='PATCH',headers={'Content-Type':'application/json'})
         try:
@@ -2320,7 +2329,7 @@ class FlowOpsTest(unittest.TestCase):
             line=stream.readline().decode().strip(); lines.append(line)
             if line=='event: workspace':
                 payload=json.loads(stream.readline().decode().removeprefix('data: ').strip());break
-        stream.close(); self.assertIn('event: workspace',lines);self.assertEqual(payload['action'],'runbook.created');self.assertEqual(payload['actor'],'Anushka')
+        stream.close(); self.assertIn('event: workspace',lines);self.assertEqual(payload['action'],'runbook.created');self.assertEqual(payload['actor'],'Administrator')
     def test_task_csv_import_creates_tasks_and_backfills_unknown_type_to_normal(self):
         _,created=self.req('/api/runbooks','POST',{'name':'CSV import target'}); rid=created['data']['id']
         csv_text='title,stream,duration,task_type,scheduled_offset,description\nRestore snapshot,Database,30,normal,0,Restore from last good backup\nVerify integrity,Database,15,bogus_type,30,\nGo live milestone,Cutover,,milestone,60,'

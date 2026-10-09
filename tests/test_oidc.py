@@ -32,6 +32,8 @@ if RUN:
     tmp.close()
     os.environ["FLOWOPS_DB"] = tmp.name
     os.environ["FLOWOPS_PREVIEW_TOKENS"] = "true"
+    os.environ['FLOWOPS_BOOTSTRAP_PASSWORD']='FlowOps!Preview2026'
+    os.environ['FLOWOPS_BOOTSTRAP_EMAIL']='admin@flowops.local'
     os.environ["FLOWOPS_SETTINGS_ENCRYPTION_KEY"] = "a1J1M20wV3JlbklvNWt1a2NTYk9pQ3VHTW5PRzFjTFI="
     import flowops.config
     import flowops.crypto

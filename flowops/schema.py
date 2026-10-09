@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 from pathlib import Path
 
 from flowops.audit import append_audit
 from flowops.config import DB_PATH, DEFAULT_INSTANCE_SLUG
-from flowops.crypto import password_hash
+from flowops.crypto import password_hash, password_valid
 from flowops.db import connect, now
 
 
@@ -313,8 +314,23 @@ def init_db() -> None:
           "avatar_path":"TEXT", "title":"TEXT NOT NULL DEFAULT ''",
           "timezone":"TEXT NOT NULL DEFAULT 'Asia/Tokyo'", "date_format":"TEXT NOT NULL DEFAULT 'system'",
           "locale":"TEXT NOT NULL DEFAULT 'en'",
+          # Sign-in hardening (ServiceOps parity): which provider owns the
+          # account, persistent lockout, TOTP multi-factor, and a version
+          # bumped by password/MFA changes to void half-finished sign-ins.
+          "auth_provider":"TEXT NOT NULL DEFAULT 'local'", "external_id":"TEXT NOT NULL DEFAULT ''",
+          "failed_login_count":"INTEGER NOT NULL DEFAULT 0", "locked_until":"INTEGER",
+          "mfa_enabled":"INTEGER NOT NULL DEFAULT 0", "mfa_secret_encrypted":"TEXT",
+          "mfa_pending_secret_encrypted":"TEXT", "mfa_backup_codes":"TEXT", "mfa_last_step":"INTEGER",
+          "auth_version":"INTEGER NOT NULL DEFAULT 1",
         }.items():
             if column not in user_columns: db.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
+        if "nonce" not in {row[1] for row in db.execute("PRAGMA table_info(oidc_states)")}:
+            db.execute("ALTER TABLE oidc_states ADD COLUMN nonce TEXT")
+        db.execute("""CREATE TABLE IF NOT EXISTS mfa_challenges (
+          token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          auth_version INTEGER NOT NULL, source TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+          expires_at INTEGER NOT NULL, created_at TEXT NOT NULL
+        )""")
         session_columns={row[1] for row in db.execute("PRAGMA table_info(sessions)")}
         for column,definition in {"ip_address":"TEXT NOT NULL DEFAULT ''","user_agent":"TEXT NOT NULL DEFAULT ''"}.items():
             if column not in session_columns:db.execute(f"ALTER TABLE sessions ADD COLUMN {column} {definition}")
@@ -354,20 +370,35 @@ def init_db() -> None:
                 (stream_rid, stream, pos, now()),
             )
         if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
-            password=os.getenv("FLOWOPS_BOOTSTRAP_PASSWORD","FlowOps!Preview2026")
-            if password=="FlowOps!Preview2026":
-                # This only fires once, at the exact moment the admin account
-                # is actually created (subsequent restarts skip this whole
-                # block since users already exist) -- exactly when an
-                # operator deploying for real needs to see it, and never
-                # again afterward regardless of log retention.
-                print(json.dumps({"ts":now(),"level":"warning","message":"FLOWOPS_BOOTSTRAP_PASSWORD was not set; the admin account was created with the documented default preview password. Change it immediately if this is not a local/preview deployment."},separators=(",",":")))
+            # The bootstrap administrator never gets a known password: use
+            # FLOWOPS_BOOTSTRAP_PASSWORD, or generate one and print it once,
+            # at the only moment it is created.
+            password=os.getenv("FLOWOPS_BOOTSTRAP_PASSWORD","")
+            if len(password)<12:
+                password=secrets.token_urlsafe(18)
+                print(json.dumps({"ts":now(),"level":"warning","message":"FLOWOPS_BOOTSTRAP_PASSWORD was not set (or is under 12 characters). Generated a one-time administrator password; sign in as admin and change it now.","bootstrap_password":password},separators=(",",":")),flush=True)
             db.execute("INSERT INTO users(username,display_name,email,role,team,password_hash,created_at,instance_id) VALUES(?,?,?,?,?,?,?,?)",
-                       ("admin","Anushka","admin@flowops.local","Admin","Platform Operations",password_hash(password),now(),default_instance))
-            db.execute("INSERT INTO users(username,display_name,email,role,team,password_hash,created_at,instance_id) VALUES(?,?,?,?,?,?,?,?)",
-                       ("operator","Release Operator","operator@flowops.local","Member","Release Engineering",password_hash("Operator!Preview2026"),now(),default_instance))
+                       ("admin","Administrator",os.getenv("FLOWOPS_BOOTSTRAP_EMAIL","").strip().lower(),"Admin","",password_hash(password),now(),default_instance))
+        # Earlier releases seeded these accounts with passwords published in
+        # the README. Disable a seeded operator that still has its published
+        # password (kept, not deleted, so audit history stays intact) and
+        # warn while the administrator still uses its published default.
+        for username,published in (("operator","Operator!Preview2026"),("admin","FlowOps!Preview2026")):
+            row=db.execute("SELECT * FROM users WHERE username=? AND active=1 AND auth_provider='local'",(username,)).fetchone()
+            if not row or not password_valid(published,row["password_hash"]): continue
+            if username=="operator":
+                db.execute("UPDATE users SET active=0 WHERE id=?",(row["id"],))
+                db.execute("DELETE FROM sessions WHERE user_id=?",(row["id"],))
+                append_audit(db,None,"auth.default_account_disabled","operator: still had its published preview password","FlowOps",row["instance_id"])
+            elif os.getenv("FLOWOPS_PREVIEW_TOKENS","false").lower()!="true":
+                print(json.dumps({"ts":now(),"level":"warning","message":"The admin account still uses the published preview password. Change it now."},separators=(",",":")),flush=True)
         defaults={"workspace_name":"Resilience Operations","timezone":"Asia/Tokyo","require_approval":"true","session_hours":"8","serviceops_enabled":"true","directory_enabled":"false","directory_domain":"",
           "serviceops_url":os.getenv("SERVICEOPS_URL","http://host.docker.internal:8080"),"serviceops_sync_on_live":"true","serviceops_sync_on_complete":"true","serviceops_require_approved":"true","serviceops_trigger_workflow":"false","serviceops_record_evidence":"true",
+          "local_auth_enabled":"true","login_max_attempts":"5","login_lockout_minutes":"15",
+          "ldap_enabled":"false","ldap_url":"","ldap_bind_dn":"","ldap_base_dn":"","ldap_user_filter":"(&(objectClass=user)(sAMAccountName={username}))",
+          "ldap_group_base_dn":"","ldap_group_search_filter":"","ldap_nested_groups":"false","ldap_start_tls":"true","ldap_validate_cert":"true",
+          "ldap_require_access_group":"false","ldap_role_mappings":"{}","ldap_team_mappings":"{}","ldap_default_role":"Member","ldap_domain":"",
+          "oidc_auto_provision":"false","oidc_role_claim":"realm_access.roles","oidc_role_mappings":"{}","oidc_team_mappings":"{}","oidc_default_role":"Member","oidc_required_acr":"",
         }
         for key,value in defaults.items(): db.execute("INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES(?,?,?)",(key,value,now()))
         for key,value in defaults.items():

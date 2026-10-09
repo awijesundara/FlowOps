@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -11,6 +12,8 @@ import urllib.parse
 import urllib.request
 
 import flowops.mail
+from flowops import ldap_auth
+from flowops.accounts import clear_failures
 from flowops.audit import append_audit
 from flowops.config import ROLE_PERMISSIONS
 from flowops.crypto import password_hash
@@ -25,7 +28,7 @@ class UserAdminRoutes(BaseHandler):
         if path=="/api/admin/users":
             actor=self.require(db,"admin:users")
             if not actor: return
-            data=rows(db.execute("SELECT id,username,display_name,email,role,team,active,last_login_at,created_at FROM users WHERE instance_id=? ORDER BY display_name",(actor["instance_id"],)))
+            data=rows(db.execute("SELECT id,username,display_name,email,role,team,active,last_login_at,created_at,auth_provider,mfa_enabled,CASE WHEN locked_until>CAST(strftime('%s','now') AS INTEGER) THEN locked_until END locked_until FROM users WHERE instance_id=? ORDER BY display_name",(actor["instance_id"],)))
             return self.send_json({"data":data})
         if path=="/api/admin/scoped-role-grants":
             actor=self.require(db,"admin:users")
@@ -37,6 +40,32 @@ class UserAdminRoutes(BaseHandler):
         return NOT_HANDLED
 
     def _post_users_db(self, db, path, payload):
+        account_action=re.fullmatch(r"/api/admin/users/(\d+)/(unlock|reset-mfa)",path)
+        if account_action:
+            actor=self.require(db,"admin:users")
+            if not actor:return
+            user=db.execute("SELECT * FROM users WHERE id=? AND instance_id=?",(int(account_action.group(1)),actor["instance_id"])).fetchone()
+            if not user:return self.send_json({"error":"User not found"},404)
+            if account_action.group(2)=="unlock":
+                clear_failures(db,user["id"])
+                append_audit(db,None,"auth.account_unlocked",f"{user['username']} unlocked",actor["display_name"],actor["instance_id"])
+            else:
+                # Lost device: remove the factor and sign the user out everywhere
+                # so they enrol again on next sign-in.
+                db.execute("UPDATE users SET mfa_enabled=0,mfa_secret_encrypted=NULL,mfa_pending_secret_encrypted=NULL,mfa_backup_codes=NULL,mfa_last_step=NULL,auth_version=auth_version+1 WHERE id=?",(user["id"],))
+                db.execute("DELETE FROM sessions WHERE user_id=?",(user["id"],))
+                append_audit(db,None,"auth.mfa_reset",f"{user['username']}: multi-factor sign-in reset by an administrator",actor["display_name"],actor["instance_id"])
+            db.commit(); return self.send_json({"data":{"ok":True}})
+        if path=="/api/admin/directory/check":
+            actor=self.require(db,"admin:settings")
+            if not actor:return
+            username=str(payload.get("username","")).strip()
+            if not username:return self.send_json({"error":"Enter a directory username"},400)
+            config=ldap_auth.directory_config(db,actor["instance_id"])
+            if not ldap_auth.enabled(config):return self.send_json({"error":"Directory sign-in is not configured"},400)
+            try:result=ldap_auth.check_user(config,username)
+            except (ldap_auth.DirectoryError,ValueError) as exc:return self.send_json({"error":str(exc)},502)
+            return self.send_json({"data":result})
         if path=="/api/admin/users":
             actor=self.require(db,"admin:users")
             if not actor:return
@@ -104,8 +133,9 @@ class UserAdminRoutes(BaseHandler):
                 if uid==actor["id"] and (role!="Admin" or not active):return self.send_json({"error":"You cannot remove your own administrator access"},409)
                 password=payload.get("password")
                 if password is not None and len(str(password))<12:return self.send_json({"error":"Password must be at least 12 characters"},400)
+                if password is not None and user["auth_provider"]!="local":return self.send_json({"error":"This account's password is managed by its sign-in provider"},409)
                 db.execute("UPDATE users SET display_name=?,email=?,role=?,team=?,active=? WHERE id=?",(str(payload.get("display_name",user["display_name"]))[:120],str(payload.get("email",user["email"]))[:180],role,str(payload.get("team",user["team"]))[:120],active,uid))
-                if password is not None: db.execute("UPDATE users SET password_hash=? WHERE id=?",(password_hash(str(password)),uid)); db.execute("DELETE FROM sessions WHERE user_id=?",(uid,))
+                if password is not None: db.execute("UPDATE users SET password_hash=?,auth_version=auth_version+1 WHERE id=?",(password_hash(str(password)),uid)); db.execute("DELETE FROM sessions WHERE user_id=?",(uid,))
                 append_audit(db,None,"admin.user_updated",f"{user['username']}: role={role}, active={bool(active)}",actor["display_name"],actor["instance_id"]); db.commit(); return self.send_json({"data":{"ok":True}})
         return NOT_HANDLED
 

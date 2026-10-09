@@ -19,11 +19,16 @@ jobs:
       - name: Check JS syntax
         run: node --check static/app.js
       - name: Install test dependencies
-        run: pip install pytest playwright
+        run: |
+          pip install -r requirements.txt pytest playwright
+          sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y slapd ldap-utils
+          sudo systemctl stop slapd || true
       - name: Install Playwright browser
         run: python3 -m playwright install --with-deps chromium
       - name: Run server test suite
         run: python3 -m pytest tests/test_flowops.py -v
+      - name: Run sign-in and directory suite (real slapd)
+        run: python3 -m pytest tests/test_identity.py -v
       - name: Run browser regression suite
         run: python3 -m pytest tests/test_browser.py -v
 

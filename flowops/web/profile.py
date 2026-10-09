@@ -8,12 +8,17 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from flowops import identity, ldap_auth
+from flowops.accounts import verify_mfa_code
 from flowops.audit import append_audit
 from flowops.config import AVATAR_DIR, SUPPORTED_LOCALES
-from flowops.crypto import password_hash, password_valid
+from flowops.crypto import password_hash, password_valid, settings_cipher
+from flowops.ratelimit import check_rate_limit
 from flowops.db import connect, now, rows
 from flowops.push import vapid_keypair
 from flowops.web.base import BaseHandler, NOT_HANDLED
+
+PROVIDER_LABELS={"ldap":"your corporate directory","oidc":"your single sign-on provider"}
 
 
 class ProfileRoutes(BaseHandler):
@@ -91,14 +96,71 @@ class ProfileRoutes(BaseHandler):
             if actor.get("auth_method")=="session" and self.headers.get("X-CSRF-Token","") != actor["csrf_token"]: return self.send_json({"error":"Invalid or missing CSRF token"},403)
             current_password=str(payload.get("current_password","")); new_password=str(payload.get("new_password",""))
             user=db.execute("SELECT * FROM users WHERE id=?",(actor["id"],)).fetchone()
+            if user["auth_provider"]!="local": return self.send_json({"error":f"Your password is managed by {PROVIDER_LABELS.get(user['auth_provider'],user['auth_provider'])}"},409)
             if not password_valid(current_password,user["password_hash"]): return self.send_json({"error":"Current password is incorrect"},401)
             if len(new_password)<12: return self.send_json({"error":"New password must be at least 12 characters"},400)
-            db.execute("UPDATE users SET password_hash=? WHERE id=?",(password_hash(new_password),actor["id"]))
+            db.execute("UPDATE users SET password_hash=?,auth_version=auth_version+1 WHERE id=?",(password_hash(new_password),actor["id"]))
             current_token=next((item.strip().split("=",1)[1] for item in self.headers.get("Cookie","").split(";") if item.strip().startswith("flowops_session=")),"")
             db.execute("DELETE FROM sessions WHERE user_id=? AND token_hash!=?",(actor["id"],hashlib.sha256(current_token.encode()).hexdigest()))
             append_audit(db,None,"profile.password_changed","Password changed via self-service",actor["display_name"],actor["instance_id"]); db.commit()
             return self.send_json({"data":{"ok":True}})
+        if path.startswith("/api/profile/mfa/"):
+            return self.profile_mfa(db,path.rsplit("/",1)[-1],payload)
         return NOT_HANDLED
+
+    def profile_mfa(self, db, action, payload):
+        """Self-service TOTP enrolment: setup (re-authenticate, get a secret)
+        -> enable (prove a code, receive backup codes once) -> disable or
+        regenerate backup codes (prove a current code)."""
+        actor=self.current_user(db)
+        if not actor or actor.get("auth_method")!="session": return self.send_json({"error":"Authentication required"},401)
+        if self.headers.get("X-CSRF-Token","") != actor["csrf_token"]: return self.send_json({"error":"Invalid or missing CSRF token"},403)
+        user=db.execute("SELECT * FROM users WHERE id=?",(actor["id"],)).fetchone()
+        if user["auth_provider"]=="oidc": return self.send_json({"error":"Multi-factor sign-in for single sign-on accounts is managed by your identity provider"},409)
+        retry_after=check_rate_limit(f"mfa-profile:{user['id']}",limit=10,window_seconds=300)
+        if retry_after: return self.send_json({"error":"Too many attempts. Try again later."},429,headers={"Retry-After":str(retry_after)})
+        if action=="setup":
+            if user["mfa_enabled"]: return self.send_json({"error":"Multi-factor sign-in is already on. Turn it off first to enrol a new device."},409)
+            if not self.reauthenticate(db,user,str(payload.get("password",""))): return self.send_json({"error":"Your password is incorrect"},401)
+            secret=identity.new_totp_secret()
+            try: encrypted=settings_cipher().encrypt(secret.encode()).decode()
+            except RuntimeError as exc: return self.send_json({"error":str(exc)},503)
+            db.execute("UPDATE users SET mfa_pending_secret_encrypted=? WHERE id=?",(encrypted,user["id"])); db.commit()
+            return self.send_json({"data":{"secret":secret,"otpauth_uri":identity.totp_uri(secret,user["username"])}})
+        if action=="enable":
+            if user["mfa_enabled"] or not user["mfa_pending_secret_encrypted"]: return self.send_json({"error":"Start multi-factor setup first"},409)
+            secret=settings_cipher().decrypt(user["mfa_pending_secret_encrypted"].encode()).decode()
+            step=identity.totp_match(secret,str(payload.get("code","")))
+            if step is None: return self.send_json({"error":"That code does not match. Check the time on your device and try again."},400)
+            codes=identity.new_backup_codes()
+            db.execute("UPDATE users SET mfa_enabled=1,mfa_secret_encrypted=mfa_pending_secret_encrypted,mfa_pending_secret_encrypted=NULL,mfa_backup_codes=?,mfa_last_step=?,auth_version=auth_version+1 WHERE id=?",
+                       (json.dumps([identity.hash_backup_code(c) for c in codes]),step,user["id"]))
+            append_audit(db,None,"auth.mfa_enabled",f"{user['username']} turned on multi-factor sign-in",actor["display_name"],actor["instance_id"]); db.commit()
+            return self.send_json({"data":{"enabled":True,"backup_codes":codes}})
+        if action in {"disable","backup-codes"}:
+            if not user["mfa_enabled"]: return self.send_json({"error":"Multi-factor sign-in is not on"},409)
+            if not verify_mfa_code(db,user,str(payload.get("code",""))):
+                db.commit(); return self.send_json({"error":"Invalid verification code"},400)
+            if action=="disable":
+                db.execute("UPDATE users SET mfa_enabled=0,mfa_secret_encrypted=NULL,mfa_backup_codes=NULL,mfa_last_step=NULL,auth_version=auth_version+1 WHERE id=?",(user["id"],))
+                append_audit(db,None,"auth.mfa_disabled",f"{user['username']} turned off multi-factor sign-in",actor["display_name"],actor["instance_id"]); db.commit()
+                return self.send_json({"data":{"enabled":False}})
+            codes=identity.new_backup_codes()
+            db.execute("UPDATE users SET mfa_backup_codes=? WHERE id=?",(json.dumps([identity.hash_backup_code(c) for c in codes]),user["id"]))
+            append_audit(db,None,"auth.mfa_backup_codes_regenerated",f"{user['username']} generated new backup codes",actor["display_name"],actor["instance_id"]); db.commit()
+            return self.send_json({"data":{"enabled":True,"backup_codes":codes}})
+        return self.send_json({"error":"Not found"},404)
+
+    def reauthenticate(self, db, user, password) -> bool:
+        """Prove the signed-in person knows their password: the local hash, or
+        a fresh directory bind for directory accounts."""
+        if user["auth_provider"]=="local": return password_valid(password,user["password_hash"])
+        if user["auth_provider"]=="ldap":
+            config=ldap_auth.directory_config(db,user["instance_id"])
+            if not ldap_auth.enabled(config): return False
+            try: return ldap_auth.authenticate(config,user["username"],password).user is not None
+            except ldap_auth.DirectoryError: return False
+        return False
 
     def _patch_profile(self, path, parts, payload):
         if parts==["api","profile"]:

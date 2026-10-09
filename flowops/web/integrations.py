@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 import flowops.net
 import flowops.runbooks
+from flowops import identity, ldap_auth
 from flowops.audit import append_audit
 from flowops.config import MAX_BODY
 from flowops.crypto import settings_cipher
@@ -23,6 +24,9 @@ from flowops.ratelimit import check_rate_limit
 from flowops.runbooks import notify_task_ready
 from flowops.serviceops import apply_serviceops_change_event, apply_serviceops_ctask_event, flush_serviceops_writes_for_runbook, serviceops_endpoint, serviceops_http, verify_serviceops_signature
 from flowops.web.base import BaseHandler, NOT_HANDLED
+
+# Keycloak/OIDC sign-in policy, stored as oidc_<key>.
+OIDC_POLICY_KEYS=("auto_provision","role_claim","role_mappings","team_mappings","default_role","required_acr")
 
 
 class IntegrationRoutes(BaseHandler):
@@ -269,6 +273,16 @@ class IntegrationRoutes(BaseHandler):
         append_audit(db,None,"integration.tested",f"servicenow: {result['message']}",actor["display_name"],actor["instance_id"]);db.commit()
         return self.send_json({"data":result})
 
+    def test_ldap_integration(self, db, actor, overrides=None):
+        started=time.monotonic()
+        config=ldap_auth.directory_config(db,actor["instance_id"],overrides)
+        if not config.get("url","").strip():return self.send_json({"error":"Enter the directory server URL first"},400)
+        try:result=ldap_auth.test_connection(config)
+        except ldap_auth.DirectoryError as exc:return self.send_json({"error":str(exc)},502)
+        result.update({"provider":"ldap","latency_ms":round((time.monotonic()-started)*1000),"tested_unsaved_credential":bool((overrides or {}).get("credential"))})
+        append_audit(db,None,"integration.tested",f"ldap: {result['message']}",actor["display_name"],actor["instance_id"]);db.commit()
+        return self.send_json({"data":result})
+
     def test_integration(self, db, provider, actor, overrides=None):
         overrides=overrides or {}
         values={r["key"]:r["value"] for r in db.execute("SELECT key,value FROM instance_settings WHERE instance_id=? AND key LIKE ?",(actor["instance_id"],f"{provider}_%"))}
@@ -312,10 +326,15 @@ class IntegrationRoutes(BaseHandler):
             except RuntimeError:servicenow_token,servicenow_source="","Encrypted credential unavailable"
             try:oidc_token,oidc_source=integration_credential(db,actor["instance_id"],"oidc")
             except RuntimeError:oidc_token,oidc_source="","Encrypted credential unavailable"
+            try:ldap_token,ldap_source=integration_credential(db,actor["instance_id"],"ldap")
+            except RuntimeError:ldap_token,ldap_source="","Encrypted credential unavailable"
             data={
               "serviceops":{"enabled":values.get("serviceops_enabled","true"),"url":values.get("serviceops_url",os.getenv("SERVICEOPS_URL","")),"credential_configured":bool(serviceops_token),"credential_source":serviceops_source,"credential_editable":bool(os.getenv("FLOWOPS_SETTINGS_ENCRYPTION_KEY")),"sync_on_live":values.get("serviceops_sync_on_live","true"),"sync_on_complete":values.get("serviceops_sync_on_complete","true"),"require_approved":values.get("serviceops_require_approved","true"),"trigger_workflow":values.get("serviceops_trigger_workflow","false"),"api_version":"v1","required_scopes":["tickets:read","tickets:update","workflows:execute"]},
               "servicenow":{"enabled":values.get("servicenow_enabled","false"),"url":values.get("servicenow_url",""),"username":values.get("servicenow_username",""),"credential_configured":bool(servicenow_token),"credential_source":servicenow_source,"credential_editable":bool(os.getenv("FLOWOPS_SETTINGS_ENCRYPTION_KEY")),"sync_on_live":values.get("servicenow_sync_on_live","true"),"sync_on_complete":values.get("servicenow_sync_on_complete","true")},
-              "oidc":{"enabled":values.get("oidc_enabled","false"),"url":values.get("oidc_url",""),"client_id":values.get("oidc_client_id",""),"credential_configured":bool(oidc_token),"credential_source":oidc_source,"credential_editable":bool(os.getenv("FLOWOPS_SETTINGS_ENCRYPTION_KEY")),"login_url":"/auth/oidc/login"}
+              "oidc":{"enabled":values.get("oidc_enabled","false"),"url":values.get("oidc_url",""),"client_id":values.get("oidc_client_id",""),"credential_configured":bool(oidc_token),"credential_source":oidc_source,"credential_editable":bool(os.getenv("FLOWOPS_SETTINGS_ENCRYPTION_KEY")),"login_url":"/auth/oidc/login",
+                      **{key:values.get(f"oidc_{key}","") for key in OIDC_POLICY_KEYS},"redirect_uri":os.getenv("FLOWOPS_PUBLIC_URL","").strip().rstrip("/")+"/auth/oidc/callback"},
+              "ldap":{**{key:values.get(f"ldap_{key}","") for key in ldap_auth.SETTING_KEYS},"credential_configured":bool(ldap_token),"credential_source":ldap_source,"credential_editable":bool(os.getenv("FLOWOPS_SETTINGS_ENCRYPTION_KEY"))},
+              "local":{"local_auth_enabled":values.get("local_auth_enabled","true"),"login_max_attempts":values.get("login_max_attempts","5"),"login_lockout_minutes":values.get("login_lockout_minutes","15")},
             }
             data["serviceops"]["record_evidence"]=values.get("serviceops_record_evidence","true")
             data["serviceops"]["events"]=self.serviceops_events_status(db,actor["instance_id"])
@@ -364,15 +383,24 @@ class IntegrationRoutes(BaseHandler):
             actor=self.require(db,"admin:settings")
             if not actor:return
             provider=str(payload.get("provider","")).lower()
-            if provider not in {"serviceops","servicenow","oidc"}:return self.send_json({"error":"Provider must be serviceops, servicenow, or oidc"},400)
+            if provider not in {"serviceops","servicenow","oidc","ldap"}:return self.send_json({"error":"Provider must be serviceops, servicenow, oidc, or ldap"},400)
             if path.endswith("/test"):
                 if provider=="servicenow": return self.test_servicenow_integration(db,actor,payload)
                 if provider=="oidc": return self.test_oidc_integration(db,actor,payload)
+                if provider=="ldap": return self.test_ldap_integration(db,actor,payload)
                 return self.test_integration(db,provider,actor,payload)
             allowed={"enabled","url","sync_on_live","sync_on_complete"}
             if provider=="serviceops": allowed|={"require_approved","trigger_workflow","record_evidence"}
             if provider=="servicenow": allowed|={"username"}
-            if provider=="oidc": allowed={"enabled","url","client_id"}
+            if provider=="oidc": allowed={"enabled","url","client_id",*OIDC_POLICY_KEYS}
+            if provider=="ldap": allowed=set(ldap_auth.SETTING_KEYS)
+            try:
+                for key in ("role_mappings","team_mappings"):
+                    if key in payload and key in allowed:
+                        payload[key]=json.dumps(identity.parse_mapping(payload[key] or "{}",key.split("_")[0]))
+            except ValueError as exc:return self.send_json({"error":str(exc)},400)
+            for key in ("default_role",):
+                if key in payload and key in allowed and str(payload[key]) not in identity.ROLE_RANK:return self.send_json({"error":f"Default role must be one of: {', '.join(identity.ROLE_RANK)}"},400)
             if "secret" in payload or "token" in payload:return self.send_json({"error":"Use the one-way credential field; secrets are never returned to the browser"},400)
             submitted=str(payload.get("credential","")).strip();revoke=payload.get("revoke_credential") is True
             if submitted and revoke:return self.send_json({"error":"Set or revoke a credential, not both"},400)
@@ -381,12 +409,20 @@ class IntegrationRoutes(BaseHandler):
                 except RuntimeError as exc:return self.send_json({"error":str(exc)},503)
                 db.execute("INSERT INTO integration_credentials(instance_id,provider,secret_encrypted,updated_by,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(instance_id,provider) DO UPDATE SET secret_encrypted=excluded.secret_encrypted,updated_by=excluded.updated_by,updated_at=excluded.updated_at",(actor["instance_id"],provider,encrypted,actor["id"],now()))
             elif revoke:db.execute("DELETE FROM integration_credentials WHERE instance_id=? AND provider=?",(actor["instance_id"],provider))
-            url=str(payload.get("url","")).strip().rstrip("/")
-            if url and not (url.startswith("http://") or url.startswith("https://") or url.startswith("mock://")):return self.send_json({"error":"Connection URL must use http or https"},400)
+            if provider=="ldap":
+                url=" ".join(ldap_auth.server_uris(str(payload.get("url",""))))
+                if url and not all(uri.lower().startswith(("ldap://","ldaps://")) for uri in url.split()):return self.send_json({"error":"Directory server URLs must start with ldap:// or ldaps://"},400)
+                for key in ("user_filter","group_search_filter"):
+                    if payload.get(key) and not (str(payload[key]).strip().startswith("(") and str(payload[key]).strip().endswith(")")):return self.send_json({"error":"LDAP filters must be wrapped in parentheses"},400)
+            else:
+                url=str(payload.get("url","")).strip().rstrip("/")
+                if url and not (url.startswith("http://") or url.startswith("https://") or url.startswith("mock://")):return self.send_json({"error":"Connection URL must use http or https"},400)
             for key in allowed:
                 if key in payload:
                     value=url if key=="url" else str(payload[key]).lower() if isinstance(payload[key],bool) else str(payload[key])
-                    db.execute("INSERT INTO instance_settings(instance_id,key,value,updated_at) VALUES(?,?,?,?) ON CONFLICT(instance_id,key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",(actor["instance_id"],f"{provider}_{key}",value[:500],now()))
+                    limit=8000 if key.endswith("_mappings") else 500
+                    if len(value)>limit:return self.send_json({"error":f"{key.replace('_',' ').capitalize()} is too long"},400)
+                    db.execute("INSERT INTO instance_settings(instance_id,key,value,updated_at) VALUES(?,?,?,?) ON CONFLICT(instance_id,key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",(actor["instance_id"],f"{provider}_{key}",value,now()))
             credential_action="; credential rotated" if submitted else "; stored credential revoked" if revoke else ""
             append_audit(db,None,"integration.configured",f"{provider} connection policy updated{credential_action}",actor["display_name"],actor["instance_id"]);db.commit()
             return self.send_json({"data":{"ok":True,"provider":provider}})

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import sqlite3
 import time
 import traceback
@@ -15,7 +16,7 @@ from http.server import BaseHTTPRequestHandler
 from typing import Any
 
 from flowops.config import MAX_BODY, ROLE_PERMISSIONS, STATIC, TOKEN_SCOPE_PERMISSIONS, VERSION
-from flowops.db import now
+from flowops.db import instance_settings, now
 from flowops.ratelimit import check_rate_limit
 
 
@@ -69,6 +70,17 @@ class BaseHandler(BaseHTTPRequestHandler):
         secure=" Secure;" if self.request_is_over_tls() else ""
         return f"flowops_session={raw}; Path=/;{secure} HttpOnly; SameSite=Strict; Max-Age={max_age}"
 
+    def start_session(self, db: sqlite3.Connection, user) -> tuple[dict[str,Any], str]:
+        """Create a browser session for `user` (the caller audits and commits).
+        Returns the signed-in user payload and its Set-Cookie header."""
+        hours=max(1,min(24,int(instance_settings(db,user["instance_id"]).get("session_hours","8")))); session_seconds=hours*3600
+        raw=secrets.token_urlsafe(36); csrf=secrets.token_urlsafe(24); expires=int(time.time())+session_seconds
+        db.execute("DELETE FROM sessions WHERE expires_at<=?",(int(time.time()),))
+        db.execute("INSERT INTO sessions(token_hash,csrf_token,user_id,expires_at,created_at,ip_address,user_agent) VALUES(?,?,?,?,?,?,?)",(hashlib.sha256(raw.encode()).hexdigest(),csrf,user["id"],expires,now(),self.client_address[0][:64],self.headers.get("User-Agent","")[:300]))
+        db.execute("UPDATE users SET last_login_at=?,failed_login_count=0,locked_until=NULL WHERE id=?",(now(),user["id"]))
+        safe={k:user[k] for k in ("id","username","display_name","email","role","team")}; safe["permissions"]=sorted(ROLE_PERMISSIONS[user["role"]]); safe["csrf_token"]=csrf
+        return safe,self.session_cookie(raw,session_seconds)
+
     def send_json(self, payload: Any, status=200, headers: dict[str,str] | None=None):
         body=json.dumps(payload, separators=(",", ":")).encode()
         self.send_response(status); self.send_header("Content-Type","application/json; charset=utf-8")
@@ -99,7 +111,9 @@ class BaseHandler(BaseHTTPRequestHandler):
         digest=hashlib.sha256(token.encode()).hexdigest()
         row=db.execute("SELECT u.*,s.csrf_token,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>? AND u.active=1",(digest,int(time.time()))).fetchone()
         if not row: return None
-        user=dict(row); user["permissions"]=sorted(ROLE_PERMISSIONS.get(user["role"],set())); user.pop("password_hash",None); user["auth_method"]="session"
+        user=dict(row); user["permissions"]=sorted(ROLE_PERMISSIONS.get(user["role"],set())); user["mfa_backup_codes_remaining"]=len(json.loads(user.get("mfa_backup_codes") or "[]"))
+        for secret_column in ("password_hash","mfa_secret_encrypted","mfa_pending_secret_encrypted","mfa_backup_codes","mfa_last_step"): user.pop(secret_column,None)
+        user["auth_method"]="session"
         return user
 
     def require(self, db: sqlite3.Connection, permission: str) -> dict[str,Any] | None:

@@ -1,1 +1,3 @@
-# FlowOps runtime dependencies are provided by Python's standard library and OpenSSL.
+# Everything else is Python's standard library plus OpenSSL.
+# Native AD/LDAP sign-in (flowops/ldap_auth.py).
+ldap3==2.9.1
