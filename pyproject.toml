@@ -1,0 +1,8 @@
+[project]
+name = "flowops"
+dynamic = ["version"]
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

@@ -8,7 +8,10 @@ tmp.close()
 os.environ['FLOWOPS_DB'] = tmp.name
 os.environ['FLOWOPS_PREVIEW_TOKENS'] = 'true'
 os.environ['FLOWOPS_SETTINGS_ENCRYPTION_KEY'] = 'a1J1M20wV3JlbklvNWt1a2NTYk9pQ3VHTW5PRzFjTFI='
-import server
+import flowops.db
+import flowops.schema
+import flowops.web.handler
+from http.server import ThreadingHTTPServer
 
 try:
     from playwright.sync_api import sync_playwright
@@ -25,8 +28,8 @@ class FlowOpsBrowserTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        server.init_db()
-        cls.http = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        flowops.schema.init_db()
+        cls.http = ThreadingHTTPServer(('127.0.0.1', 0), flowops.web.handler.Handler)
         cls.base = f'http://127.0.0.1:{cls.http.server_port}'
         threading.Thread(target=cls.http.serve_forever, daemon=True).start()
         cls.playwright = sync_playwright().start()
@@ -724,7 +727,7 @@ class FlowOpsBrowserTest(unittest.TestCase):
 
     def test_withdrawn_serviceops_change_shows_an_alert_on_the_runbook(self):
         rid = self._make_runbook('Withdrawn change UI', [{'title': 'Step'}])
-        with server.connect() as db:
+        with flowops.db.connect() as db:
             db.execute("UPDATE runbooks SET serviceops_ticket='CHG0000900',serviceops_state='Cancelled',serviceops_alert=? WHERE id=?",
                        ('ServiceOps change CHG0000900 is now Cancelled. The work is no longer authorised; confirm with the change manager before continuing.', rid))
             db.commit()

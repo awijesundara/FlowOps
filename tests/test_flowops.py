@@ -17,10 +17,27 @@ tmp=tempfile.NamedTemporaryFile(suffix='.db',delete=False); tmp.close()
 os.environ['FLOWOPS_DB']=tmp.name
 os.environ['FLOWOPS_PREVIEW_TOKENS']='true'
 os.environ['FLOWOPS_SETTINGS_ENCRYPTION_KEY']='a1J1M20wV3JlbklvNWt1a2NTYk9pQ3VHTW5PRzFjTFI='
-import server
+import flowops.backups
+import flowops.config
+import flowops.crypto
+import flowops.dashboard_email
+import flowops.db
+import flowops.mail
+import flowops.net
+import flowops.push
+import flowops.ratelimit
+import flowops.runbooks
+import flowops.schema
+import flowops.serviceops
+import flowops.sso
+import flowops.web.handler
+import flowops.webhooks
+from http.server import ThreadingHTTPServer
+from datetime import datetime, timedelta, timezone
+import sqlite3
 
 def unrestricted_urlopen(url,data=None,headers=None,method='GET',timeout=8,allow_private_network=False,max_redirects=3):
-    """A drop-in replacement for server.safe_urlopen used ONLY to bypass the
+    """A drop-in replacement for flowops.net.safe_urlopen used ONLY to bypass the
     SSRF loopback rejection in tests that need to point at a real receiver
     running on 127.0.0.1 (there's no other practical way to run a real HTTP
     server in this test environment) -- the SSRF *validation* itself stays
@@ -33,7 +50,7 @@ def unrestricted_urlopen(url,data=None,headers=None,method='GET',timeout=8,allow
 class FlowOpsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        server.init_db(); cls.http=server.ThreadingHTTPServer(('127.0.0.1',0),server.Handler)
+        flowops.schema.init_db(); cls.http=ThreadingHTTPServer(('127.0.0.1',0),flowops.web.handler.Handler)
         cls.base=f'http://127.0.0.1:{cls.http.server_port}'; threading.Thread(target=cls.http.serve_forever,daemon=True).start(); cls.opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())); cls.csrf=''
         _,login=cls.req('/api/auth/login','POST',{'username':'admin','password':'FlowOps!Preview2026'}); cls.csrf=login['data']['csrf_token']
     @classmethod
@@ -50,12 +67,12 @@ class FlowOpsTest(unittest.TestCase):
     def test_health_and_seed(self):
         self.assertEqual(self.req('/health')[0],200); code,body=self.req('/api/runbooks'); self.assertEqual(code,200); self.assertTrue(body['data'])
     def test_serviceops_sync_browser_action_uses_csrf_aware_api_helper(self):
-        source=(server.STATIC/'app.js').read_text()
+        source=(flowops.config.STATIC/'app.js').read_text()
         function=source.split('async function syncServiceOps()',1)[1].split('function openModal',1)[0]
         self.assertIn("await api(`/api/runbooks/${state.current.id}/serviceops-sync`",function)
         self.assertNotIn('await fetch(',function)
     def test_browser_api_refreshes_stale_csrf_and_retries_once(self):
-        source=(server.STATIC/'app.js').read_text()
+        source=(flowops.config.STATIC/'app.js').read_text()
         helper=source.split('async function api(',1)[1].split('function toast',1)[0]
         self.assertIn("body.error==='Invalid or missing CSRF token'",helper)
         self.assertIn("fetch('/api/auth/me'",helper)
@@ -127,7 +144,7 @@ class FlowOpsTest(unittest.TestCase):
     def test_admin_can_rotate_and_revoke_encrypted_serviceops_credential_without_readback(self):
         secret='sop_ui_managed_secret_value'
         code,_=self.req('/api/admin/integrations','POST',{'provider':'serviceops','url':'https://serviceops.example','credential':secret});self.assertEqual(code,200)
-        with server.connect() as db:
+        with flowops.db.connect() as db:
             stored=db.execute("SELECT secret_encrypted FROM integration_credentials WHERE provider='serviceops'").fetchone()[0]
         self.assertNotIn(secret,stored)
         _,connections=self.req('/api/admin/integrations');serviceops=connections['data']['serviceops']
@@ -140,7 +157,7 @@ class FlowOpsTest(unittest.TestCase):
             def __enter__(self):return self
             def __exit__(self,*_):return False
         def fake_open(request,timeout=0):captured.append(request);return Response()
-        with patch('server.urllib.request.urlopen',fake_open):self.assertEqual(self.req('/api/admin/integrations/test','POST',{'provider':'serviceops'})[0],200)
+        with patch('urllib.request.urlopen',fake_open):self.assertEqual(self.req('/api/admin/integrations/test','POST',{'provider':'serviceops'})[0],200)
         self.assertEqual(captured[0].get_header('Authorization'),f'Bearer {secret}')
         self.assertEqual(self.req('/api/admin/integrations','POST',{'provider':'serviceops','revoke_credential':True})[0],200)
         _,connections=self.req('/api/admin/integrations');self.assertFalse(connections['data']['serviceops']['credential_configured'])
@@ -154,11 +171,11 @@ class FlowOpsTest(unittest.TestCase):
             def __exit__(self,*_):return False
         def fake_open(request,timeout=0):captured.append(request);return Response()
         candidate='sop_newly_pasted_browser_key'
-        with patch('server.urllib.request.urlopen',fake_open):
+        with patch('urllib.request.urlopen',fake_open):
             code,result=self.req('/api/admin/integrations/test','POST',{'provider':'serviceops','url':'https://serviceops.example','credential':candidate})
         self.assertEqual(code,200);self.assertTrue(result['data']['tested_unsaved_credential'])
         self.assertEqual(captured[0].get_header('Authorization'),f'Bearer {candidate}')
-        with server.connect() as db:self.assertFalse(db.execute("SELECT 1 FROM integration_credentials WHERE provider='serviceops'").fetchone())
+        with flowops.db.connect() as db:self.assertFalse(db.execute("SELECT 1 FROM integration_credentials WHERE provider='serviceops'").fetchone())
     def test_connection_test_against_a_real_url_never_uses_the_mock_shortcut(self):
         # Only a literal mock:// URL gets the canned test-harness result;
         # any real http(s):// URL -- even with a bad credential -- must
@@ -166,7 +183,7 @@ class FlowOpsTest(unittest.TestCase):
         # mocked "verified" response.
         def fake_open(request,timeout=0):
             raise urllib.error.HTTPError('https://serviceops.example/api/v1/tickets?limit=1',401,'Unauthorized',{},None)
-        with patch('server.urllib.request.urlopen',fake_open):
+        with patch('urllib.request.urlopen',fake_open):
             code,result=self.req('/api/admin/integrations/test','POST',{'provider':'serviceops','url':'https://serviceops.example','credential':'sop_bad_key'})
         self.assertEqual(code,502)
         self.assertIn('rejected the API key',result['error'])
@@ -179,7 +196,7 @@ class FlowOpsTest(unittest.TestCase):
         variables={'FLOWOPS_PREVIEW_TOKENS':'false','FLOWOPS_SMTP_HOST':'smtp.example','FLOWOPS_MAIL_FROM':'flowops@example.com','FLOWOPS_PUBLIC_URL':'https://flowops.example'}
         previous={key:os.environ.get(key) for key in variables};os.environ.update(variables)
         try:
-            with patch('server.send_mail') as send:
+            with patch('flowops.mail.send_mail') as send:
                 code,invite=self.req('/api/admin/invitations','POST',{'email':'smtp-invite@example.com','role':'Member'});self.assertEqual(code,201)
                 self.assertEqual(invite['data']['delivery'],'email');self.assertNotIn('invite_token',invite['data']);self.assertIn('/?invite=',send.call_args.args[2])
                 self.req('/api/admin/users','POST',{'username':'smtp-user','display_name':'SMTP User','email':'smtp-reset@example.com','role':'Member','password':'Temporary!123'})
@@ -192,7 +209,7 @@ class FlowOpsTest(unittest.TestCase):
         variables={'FLOWOPS_SMTP_HOST':'smtp.example','FLOWOPS_SMTP_PORT':'587','FLOWOPS_SMTP_SECURITY':'starttls','FLOWOPS_SMTP_USERNAME':'flowops-sender','FLOWOPS_SMTP_PASSWORD':'smtp-secret','FLOWOPS_MAIL_FROM':'flowops@example.com','FLOWOPS_PUBLIC_URL':'https://flowops.example'}
         previous={key:os.environ.get(key) for key in variables};os.environ.update(variables);client=MagicMock();context=MagicMock();context.__enter__.return_value=client
         try:
-            with patch('server.smtplib.SMTP',return_value=context) as smtp:server.send_mail('person@example.com','FlowOps test','Delivery body')
+            with patch('smtplib.SMTP',return_value=context) as smtp:flowops.mail.send_mail('person@example.com','FlowOps test','Delivery body')
             smtp.assert_called_once_with('smtp.example',587,timeout=10);client.starttls.assert_called_once();client.login.assert_called_once_with('flowops-sender','smtp-secret');message=client.send_message.call_args.args[0];self.assertEqual(message['To'],'person@example.com');self.assertEqual(message['From'],'flowops@example.com')
         finally:
             for key,value in previous.items():
@@ -217,7 +234,7 @@ class FlowOpsTest(unittest.TestCase):
                     {'number':'CTASK0000002','title':'Apply migration','state':'Open','sequence':2,'assignee':None},
                 ]}).encode())
             return Response(b'{"data":{"id":42,"number":"CHG0000042","type":"change","title":"Core release","state":"Approved","priority":"P2"}}')
-        with patch('server.urllib.request.urlopen',fake_open):code,body=self.req(f'/api/runbooks/{rid}/serviceops-sync','POST',{})
+        with patch('urllib.request.urlopen',fake_open):code,body=self.req(f'/api/runbooks/{rid}/serviceops-sync','POST',{})
         self.assertEqual(code,200);doc=body['data'];self.assertEqual(doc['serviceops_state'],'Approved');self.assertEqual(doc['serviceops_title'],'Core release')
         self.assertEqual(captured[0].full_url,'https://serviceops.example/api/v1/tickets/CHG0000042');self.assertEqual(captured[0].get_header('Authorization'),'Bearer sop_test_only');self.assertTrue(captured[0].get_header('X-request-id'))
         self.assertEqual(body['ctasks_imported'],2)
@@ -228,7 +245,7 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(imported[0]['owner_display'],'Nova Reyes')
         self.assertIn('Change tasks',[s['name'] for s in runbook['streams']])
         # syncing again must not duplicate the already-imported change tasks
-        with patch('server.urllib.request.urlopen',fake_open):code,body=self.req(f'/api/runbooks/{rid}/serviceops-sync','POST',{})
+        with patch('urllib.request.urlopen',fake_open):code,body=self.req(f'/api/runbooks/{rid}/serviceops-sync','POST',{})
         self.assertEqual(body['ctasks_imported'],0)
         runbook=self.req(f'/api/runbooks/{rid}')[1]['data']
         self.assertEqual(len([t for t in runbook['tasks'] if t['stream']=='Change tasks']),2)
@@ -249,7 +266,7 @@ class FlowOpsTest(unittest.TestCase):
                 return Response(b'{"data":{"number":"CHG0000050","type":"change","title":"Team-tracked change","state":"Approved","priority":"P2"}}')
             return fake_open
         first=[{'number':'CTASK0000020','title':'Wipe servers','state':'Open','sequence':1,'assignmentGroup':'Unix','assignee':None}]
-        with patch('server.urllib.request.urlopen',ctasks_response(first)):
+        with patch('urllib.request.urlopen',ctasks_response(first)):
             self.req(f'/api/runbooks/{rid}/serviceops-sync','POST',{})
         runbook=self.req(f'/api/runbooks/{rid}')[1]['data']
         task=next(t for t in runbook['tasks'] if t['serviceops_ctask']=='CTASK0000020')
@@ -258,7 +275,7 @@ class FlowOpsTest(unittest.TestCase):
         # ServiceOps now shows an assignee picked up the task -- re-sync must
         # update the existing task, not silently skip it.
         second=[{'number':'CTASK0000020','title':'Wipe servers','state':'Open','sequence':1,'assignmentGroup':'Unix','assignee':'Nova Reyes'}]
-        with patch('server.urllib.request.urlopen',ctasks_response(second)):
+        with patch('urllib.request.urlopen',ctasks_response(second)):
             code,body=self.req(f'/api/runbooks/{rid}/serviceops-sync','POST',{})
         self.assertEqual(code,200)
         runbook=self.req(f'/api/runbooks/{rid}')[1]['data']
@@ -285,7 +302,7 @@ class FlowOpsTest(unittest.TestCase):
         threading.Thread(target=double.serve_forever,daemon=True).start()
         try:
             base=f'http://127.0.0.1:{double.server_port}'
-            with patch('server.safe_urlopen',unrestricted_urlopen):
+            with patch('flowops.net.safe_urlopen',unrestricted_urlopen):
                 code,saved=self.req('/api/admin/integrations','POST',{'provider':'servicenow','url':base,'username':'svc_flowops','credential':'sn_pw','enabled':True})
                 self.assertEqual(code,200)
                 code,tested=self.req('/api/admin/integrations/test','POST',{'provider':'servicenow'})
@@ -349,7 +366,7 @@ class FlowOpsTest(unittest.TestCase):
         def b64url(data: bytes) -> str:
             return b64.urlsafe_b64encode(data).decode().rstrip("=")
         kid="oidc-test-key"; issuer="https://idp.example.test/realms/flowops"; audience="flowops-client"
-        server._oidc_jwks_cache["https://idp.example.test/jwks"]={"keys":{kid:(n,e)},"fetched_at":time.monotonic()}
+        flowops.sso._oidc_jwks_cache["https://idp.example.test/jwks"]={"keys":{kid:(n,e)},"fetched_at":time.monotonic()}
         def make_jwt(email,aud=audience,iss=issuer,exp=None,kid_used=kid,tamper=False):
             header=b64url(json.dumps({"alg":"RS256","kid":kid_used}).encode())
             payload=b64url(json.dumps({"email":email,"iss":iss,"aud":aud,"exp":exp if exp is not None else int(time.time())+300}).encode())
@@ -358,18 +375,18 @@ class FlowOpsTest(unittest.TestCase):
                 payload=b64url(json.dumps({"email":"attacker@example.com","iss":iss,"aud":aud,"exp":int(time.time())+300}).encode())
             return f"{header}.{payload}.{b64url(sig)}"
         jwks_url="https://idp.example.test/jwks"
-        claims=server.verify_oidc_id_token(jwks_url,issuer,audience,make_jwt("user@example.com"))
+        claims=flowops.sso.verify_oidc_id_token(jwks_url,issuer,audience,make_jwt("user@example.com"))
         self.assertIsNotNone(claims); self.assertEqual(claims['email'],'user@example.com')
-        self.assertIsNone(server.verify_oidc_id_token(jwks_url,issuer,audience,make_jwt("user@example.com",tamper=True)),"tampered payload must fail signature check")
-        self.assertIsNone(server.verify_oidc_id_token(jwks_url,issuer,audience,make_jwt("user@example.com",aud="some-other-client")),"wrong audience must be rejected")
-        self.assertIsNone(server.verify_oidc_id_token(jwks_url,issuer,audience,make_jwt("user@example.com",iss="https://attacker.example/realms/evil")),"wrong issuer must be rejected")
-        self.assertIsNone(server.verify_oidc_id_token(jwks_url,issuer,audience,make_jwt("user@example.com",exp=int(time.time())-10)),"expired token must be rejected")
-        self.assertIsNone(server.verify_oidc_id_token(jwks_url,issuer,audience,make_jwt("user@example.com",kid_used="not-a-real-kid")),"unknown kid must be rejected")
+        self.assertIsNone(flowops.sso.verify_oidc_id_token(jwks_url,issuer,audience,make_jwt("user@example.com",tamper=True)),"tampered payload must fail signature check")
+        self.assertIsNone(flowops.sso.verify_oidc_id_token(jwks_url,issuer,audience,make_jwt("user@example.com",aud="some-other-client")),"wrong audience must be rejected")
+        self.assertIsNone(flowops.sso.verify_oidc_id_token(jwks_url,issuer,audience,make_jwt("user@example.com",iss="https://attacker.example/realms/evil")),"wrong issuer must be rejected")
+        self.assertIsNone(flowops.sso.verify_oidc_id_token(jwks_url,issuer,audience,make_jwt("user@example.com",exp=int(time.time())-10)),"expired token must be rejected")
+        self.assertIsNone(flowops.sso.verify_oidc_id_token(jwks_url,issuer,audience,make_jwt("user@example.com",kid_used="not-a-real-kid")),"unknown kid must be rejected")
         # aud may also be delivered as a list per the OIDC spec
         header=b64url(json.dumps({"alg":"RS256","kid":kid}).encode())
         payload=b64url(json.dumps({"email":"user@example.com","iss":issuer,"aud":[audience,"other"],"exp":int(time.time())+300}).encode())
         list_token=f"{header}.{payload}.{b64url(sign(f'{header}.{payload}'.encode()))}"
-        self.assertIsNotNone(server.verify_oidc_id_token(jwks_url,issuer,audience,list_token))
+        self.assertIsNotNone(flowops.sso.verify_oidc_id_token(jwks_url,issuer,audience,list_token))
     def test_oidc_connection_test_verifies_a_real_discovery_document_and_jwks(self):
         import http.server as http_server_module
         class OidcDouble(http_server_module.BaseHTTPRequestHandler):
@@ -391,7 +408,7 @@ class FlowOpsTest(unittest.TestCase):
         threading.Thread(target=double.serve_forever,daemon=True).start()
         try:
             base=f'http://127.0.0.1:{double.server_port}/realms/flowops'
-            with patch('server.safe_urlopen',unrestricted_urlopen):
+            with patch('flowops.net.safe_urlopen',unrestricted_urlopen):
                 code,saved=self.req('/api/admin/integrations','POST',{'provider':'oidc','url':base,'client_id':'flowops','credential':'kc_secret','enabled':True})
                 self.assertEqual(code,200)
                 code,tested=self.req('/api/admin/integrations/test','POST',{'provider':'oidc'})
@@ -427,7 +444,7 @@ class FlowOpsTest(unittest.TestCase):
             return err.code,(json.loads(raw) if raw else None)
     def test_scim_requires_a_bearer_token_with_the_scim_scope(self):
         code,body=self.scim_req('/scim/v2/Users')
-        self.assertEqual(code,401); self.assertEqual(body['schemas'],[server.SCIM_ERROR_SCHEMA])
+        self.assertEqual(code,401); self.assertEqual(body['schemas'],[flowops.config.SCIM_ERROR_SCHEMA])
         _,wrong=self.req('/api/admin/api-tokens','POST',{'name':'Not SCIM','scopes':['runbooks:read']})
         code,body=self.scim_req('/scim/v2/Users',token=wrong['data']['token'])
         self.assertEqual(code,403)
@@ -440,7 +457,7 @@ class FlowOpsTest(unittest.TestCase):
             'emails':[{'value':'jsmith@example.com','primary':True}],'active':True,
         })
         self.assertEqual(code,201,created)
-        self.assertEqual(created['schemas'],[server.SCIM_USER_SCHEMA])
+        self.assertEqual(created['schemas'],[flowops.config.SCIM_USER_SCHEMA])
         self.assertEqual(created['userName'],'scim.jsmith')
         self.assertTrue(created['active'])
         uid=created['id']
@@ -452,7 +469,7 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(code,200); self.assertEqual(fetched['emails'][0]['value'],'jsmith@example.com')
         # GET list includes it, real DB row confirms mapping
         code,listed=self.scim_req('/scim/v2/Users',token=token)
-        self.assertEqual(code,200); self.assertEqual(listed['schemas'],[server.SCIM_LIST_SCHEMA])
+        self.assertEqual(code,200); self.assertEqual(listed['schemas'],[flowops.config.SCIM_LIST_SCHEMA])
         self.assertIn(uid,[u['id'] for u in listed['Resources']])
         # PATCH: rename + deactivate via Operations shape
         code,patched=self.scim_req(f'/scim/v2/Users/{uid}','PATCH',token,{
@@ -460,13 +477,13 @@ class FlowOpsTest(unittest.TestCase):
             'Operations':[{'op':'replace','path':'displayName','value':'Renamed Smith'},{'op':'replace','path':'active','value':False}],
         })
         self.assertEqual(code,200); self.assertEqual(patched['displayName'],'Renamed Smith'); self.assertFalse(patched['active'])
-        with server.connect() as db:
+        with flowops.db.connect() as db:
             row=db.execute('SELECT display_name,active FROM users WHERE id=?',(int(uid),)).fetchone()
             self.assertEqual(row['display_name'],'Renamed Smith'); self.assertEqual(row['active'],0)
         # DELETE deprovisions (soft-delete), not a hard row delete
         code,_=self.scim_req(f'/scim/v2/Users/{uid}','DELETE',token=token)
         self.assertEqual(code,204)
-        with server.connect() as db:
+        with flowops.db.connect() as db:
             row=db.execute('SELECT active FROM users WHERE id=?',(int(uid),)).fetchone()
             self.assertIsNotNone(row,'SCIM DELETE must not hard-delete the user row')
             self.assertEqual(row['active'],0)
@@ -489,17 +506,17 @@ class FlowOpsTest(unittest.TestCase):
         _,alice=self.scim_req('/scim/v2/Users','POST',token,{'userName':'scim.alice','displayName':'Alice'})
         _,bob=self.scim_req('/scim/v2/Users','POST',token,{'userName':'scim.bob','displayName':'Bob'})
         code,group=self.scim_req('/scim/v2/Groups','POST',token,{'displayName':'SCIM Provisioned Team','members':[{'value':alice['id']}]})
-        self.assertEqual(code,201,group); self.assertEqual(group['schemas'],[server.SCIM_GROUP_SCHEMA])
+        self.assertEqual(code,201,group); self.assertEqual(group['schemas'],[flowops.config.SCIM_GROUP_SCHEMA])
         gid=group['id']
         self.assertEqual([m['value'] for m in group['members']],[alice['id']])
-        with server.connect() as db:
+        with flowops.db.connect() as db:
             member_ids={row[0] for row in db.execute('SELECT user_id FROM central_team_members WHERE team_id=?',(int(gid),))}
             self.assertEqual(member_ids,{int(alice['id'])})
         # PATCH add Bob
         code,patched=self.scim_req(f'/scim/v2/Groups/{gid}','PATCH',token,{'Operations':[{'op':'add','path':'members','value':[{'value':bob['id']}]}]})
         self.assertEqual(code,200)
         self.assertEqual(sorted(m['value'] for m in patched['members']),sorted([alice['id'],bob['id']]))
-        with server.connect() as db:
+        with flowops.db.connect() as db:
             member_ids={row[0] for row in db.execute('SELECT user_id FROM central_team_members WHERE team_id=?',(int(gid),))}
             self.assertEqual(member_ids,{int(alice['id']),int(bob['id'])})
         # PATCH remove Alice
@@ -509,7 +526,7 @@ class FlowOpsTest(unittest.TestCase):
         # DELETE the group removes it entirely (no runbook is linked to it)
         code,_=self.scim_req(f'/scim/v2/Groups/{gid}','DELETE',token=token)
         self.assertEqual(code,204)
-        with server.connect() as db:
+        with flowops.db.connect() as db:
             self.assertIsNone(db.execute('SELECT 1 FROM central_teams WHERE id=?',(int(gid),)).fetchone())
     def test_task_escalation_and_incident_flags_toggle_and_are_audited(self):
         _,created=self.req('/api/runbooks','POST',{'name':'Escalation test runbook'}); rid=created['data']['id']
@@ -543,7 +560,7 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(code,200,body)
         code,body=self.req(f'/api/runbooks/{rid}')
         self.assertEqual(code,404,'the runbook itself should be gone')
-        with server.connect() as db:
+        with flowops.db.connect() as db:
             self.assertIsNone(db.execute('SELECT 1 FROM tasks WHERE runbook_id=?',(rid,)).fetchone(),'tasks should cascade-delete')
             audit_row=db.execute("SELECT * FROM audit WHERE action='runbook.deleted' AND runbook_id IS NULL ORDER BY id DESC LIMIT 1").fetchone()
             self.assertIsNotNone(audit_row,'a runbook.deleted audit row must survive the runbook itself being gone')
@@ -579,32 +596,32 @@ class FlowOpsTest(unittest.TestCase):
             if '/ctasks/' in request.full_url:
                 return Response(json.dumps({'data':{'number':'CTASK0000010','state':json.loads(request.data).get('state','Closed Complete')}}).encode())
             return Response(b'{"data":{"number":"CHG0000044","type":"change","title":"Push-back change","state":"Approved","priority":"P2"}}')
-        with patch('server.urllib.request.urlopen',fake_open):
+        with patch('urllib.request.urlopen',fake_open):
             self.req(f'/api/runbooks/{rid}/serviceops-sync','POST',{})
         runbook=self.req(f'/api/runbooks/{rid}')[1]['data']
         task_id=next(t['id'] for t in runbook['tasks'] if t['serviceops_ctask']=='CTASK0000010')
         task2_id=next(t['id'] for t in runbook['tasks'] if t['serviceops_ctask']=='CTASK0000011')
         self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})
-        with patch('server.urllib.request.urlopen',fake_open):
+        with patch('urllib.request.urlopen',fake_open):
             self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
         captured.clear()
-        with patch('server.urllib.request.urlopen',fake_open):
+        with patch('urllib.request.urlopen',fake_open):
             code,body=self.req(f'/api/tasks/{task_id}','PATCH',{'status':'running'})
         self.assertEqual(code,200)
         # The request thread never calls ServiceOps: the write is queued
         # in the same transaction as the task transition.
         self.assertFalse([r for r in captured if '/ctasks/' in r.full_url])
         self.assertEqual(body['data']['serviceops_writeback'],{'pending':1,'failed':0})
-        with patch('server.urllib.request.urlopen',fake_open):self.assertEqual(server.dispatch_serviceops_outbox(),1)
+        with patch('urllib.request.urlopen',fake_open):self.assertEqual(flowops.serviceops.dispatch_serviceops_outbox(),1)
         running_push=next(r for r in captured if '/ctasks/CTASK0000010' in r.full_url)
         self.assertEqual(running_push.method,'PATCH')
         self.assertEqual(json.loads(running_push.data),{'state':'Work in Progress'})
         self.assertEqual(running_push.get_header('Idempotency-key'),'flowops-ctask-CTASK0000010-running')
         captured.clear()
-        with patch('server.urllib.request.urlopen',fake_open):
+        with patch('urllib.request.urlopen',fake_open):
             code,body=self.req(f'/api/tasks/{task_id}','PATCH',{'status':'complete'})
             self.assertEqual(code,200)
-            self.assertEqual(server.dispatch_serviceops_outbox(),2)
+            self.assertEqual(flowops.serviceops.dispatch_serviceops_outbox(),2)
         pushes=[r for r in captured if '/ctasks/CTASK0000010' in r.full_url]
         self.assertEqual(json.loads(pushes[0].data),{'state':'Closed Complete'})
         # Completion also records append-only execution evidence on the CTASK.
@@ -617,18 +634,18 @@ class FlowOpsTest(unittest.TestCase):
         # A ServiceOps outage never blocks the local transition and the write
         # is retried on a backoff schedule instead of being dropped.
         def broken(request,timeout=0):raise urllib.error.URLError('unreachable')
-        with patch('server.urllib.request.urlopen',broken):
+        with patch('urllib.request.urlopen',broken):
             code,body=self.req(f'/api/tasks/{task2_id}','PATCH',{'status':'running'})
             self.assertEqual(code,200)
             self.assertEqual(next(t['status'] for t in body['data']['tasks'] if t['id']==task2_id),'running')
-            self.assertEqual(server.dispatch_serviceops_outbox(),1)
-            self.assertEqual(server.dispatch_serviceops_outbox(),0,'a failed write waits for its backoff, not the next pass')
-        with server.connect() as db:
+            self.assertEqual(flowops.serviceops.dispatch_serviceops_outbox(),1)
+            self.assertEqual(flowops.serviceops.dispatch_serviceops_outbox(),0,'a failed write waits for its backoff, not the next pass')
+        with flowops.db.connect() as db:
             row=db.execute("SELECT status,attempts,last_error,next_attempt_at FROM serviceops_outbox WHERE label='CTASK0000011 → Work in Progress'").fetchone()
         self.assertEqual((row['status'],row['attempts'],row['last_error']),('pending',1,'ServiceOps is unreachable'))
         self.assertGreater(row['next_attempt_at'],time.time()+10)
         captured.clear()
-        with patch('server.urllib.request.urlopen',fake_open):self.assertEqual(server.dispatch_serviceops_outbox(include_future=True),1)
+        with patch('urllib.request.urlopen',fake_open):self.assertEqual(flowops.serviceops.dispatch_serviceops_outbox(include_future=True),1)
         self.assertEqual(json.loads(next(r for r in captured if '/ctasks/CTASK0000011' in r.full_url).data),{'state':'Work in Progress'})
         self.req('/api/admin/integrations','POST',{'provider':'serviceops','revoke_credential':True})
     # --- ServiceOps collaboration: signed inbound events and durable write-back ---
@@ -655,7 +672,7 @@ class FlowOpsTest(unittest.TestCase):
     def linked_runbook(self,name,ticket,ctasks):
         self.req('/api/admin/integrations','POST',{'provider':'serviceops','url':'https://serviceops.example','credential':'sop_collab','enabled':True})
         _,created=self.req('/api/runbooks','POST',{'name':name});rid=created['data']['id']
-        with patch('server.urllib.request.urlopen',self.serviceops_fake([],ctasks=ctasks)):
+        with patch('urllib.request.urlopen',self.serviceops_fake([],ctasks=ctasks)):
             self.req(f'/api/runbooks/{rid}/serviceops-sync','POST',{'ticket':ticket})
         return rid,{t['serviceops_ctask']:t['id'] for t in self.req(f'/api/runbooks/{rid}')[1]['data']['tasks'] if t['serviceops_ctask']}
     def events_secret(self):
@@ -674,22 +691,22 @@ class FlowOpsTest(unittest.TestCase):
     def test_serviceops_signature_verification_accepts_raw_and_legacy_canonical_bodies(self):
         secret='whsec_test';stamp=str(int(time.time()));body=b'{"data":{"b":1,"a":2},"id":"e"}'
         sign=lambda payload:'sha256='+hmac.new(secret.encode(),stamp.encode()+b'.'+payload,hashlib.sha256).hexdigest()
-        self.assertTrue(server.verify_serviceops_signature(secret,stamp,sign(body),body))
+        self.assertTrue(flowops.serviceops.verify_serviceops_signature(secret,stamp,sign(body),body))
         # ServiceOps <= 1.108 signed the sorted compact form but sent requests' json= encoding.
         sent=b'{"id": "e", "data": {"b": 1, "a": 2}}'
-        self.assertTrue(server.verify_serviceops_signature(secret,stamp,sign(b'{"data":{"a":2,"b":1},"id":"e"}'),sent))
-        self.assertFalse(server.verify_serviceops_signature(secret,stamp,sign(body),body+b' '),'a modified body must fail')
-        self.assertFalse(server.verify_serviceops_signature('other',stamp,sign(body),body))
-        self.assertFalse(server.verify_serviceops_signature(secret,str(int(stamp)-301),sign(body),body),'outside the replay window')
-        self.assertFalse(server.verify_serviceops_signature('',stamp,sign(body),body),'no secret configured')
-        self.assertFalse(server.verify_serviceops_signature(secret,'soon',sign(body),body))
+        self.assertTrue(flowops.serviceops.verify_serviceops_signature(secret,stamp,sign(b'{"data":{"a":2,"b":1},"id":"e"}'),sent))
+        self.assertFalse(flowops.serviceops.verify_serviceops_signature(secret,stamp,sign(body),body+b' '),'a modified body must fail')
+        self.assertFalse(flowops.serviceops.verify_serviceops_signature('other',stamp,sign(body),body))
+        self.assertFalse(flowops.serviceops.verify_serviceops_signature(secret,str(int(stamp)-301),sign(body),body),'outside the replay window')
+        self.assertFalse(flowops.serviceops.verify_serviceops_signature('',stamp,sign(body),body),'no secret configured')
+        self.assertFalse(flowops.serviceops.verify_serviceops_signature(secret,'soon',sign(body),body))
     def test_serviceops_events_secret_is_shown_once_and_receiver_rejects_bad_signatures(self):
         secret,path=self.events_secret()
         self.assertTrue(secret.startswith('whsec_'));self.assertEqual(path,'/api/integrations/serviceops/events/flowops')
         _,connections=self.req('/api/admin/integrations');events=connections['data']['serviceops']['events']
         self.assertTrue(events['configured']);self.assertNotIn('secret',events)
         self.assertEqual(events['subscribed_events'],['change.state_changed','change_task.state_changed'])
-        with server.connect() as db:stored=db.execute("SELECT secret_encrypted FROM integration_credentials WHERE provider='serviceops_events'").fetchone()[0]
+        with flowops.db.connect() as db:stored=db.execute("SELECT secret_encrypted FROM integration_credentials WHERE provider='serviceops_events'").fetchone()[0]
         self.assertNotIn(secret,stored)
         event={'id':'evt-bad','type':'change.state_changed','data':{'number':'CHG0000700','state':'Approved'}}
         self.assertEqual(self.post_event(path,'wrong-secret',event)[0],401)
@@ -729,7 +746,7 @@ class FlowOpsTest(unittest.TestCase):
         task=next(t for t in self.req(f'/api/runbooks/{rid}')[1]['data']['tasks'] if t['id']==tasks['CTASK0000720'])
         self.assertEqual((task['status'],task['serviceops_ctask_state']),('pending','Work in Progress'))
         self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})
-        with patch('server.urllib.request.urlopen',self.serviceops_fake([])):
+        with patch('urllib.request.urlopen',self.serviceops_fake([])):
             self.assertEqual(self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})[0],200)
         code,body=self.post_event(path,secret,{'id':'evt-720-done','type':'change_task.state_changed','data':{'number':'CTASK0000720','ticket':'CHG0000720','state':'Closed Complete','previous_state':'Work in Progress'}})
         self.assertEqual(code,200);self.assertEqual(body['data']['applied'],1)
@@ -743,22 +760,22 @@ class FlowOpsTest(unittest.TestCase):
         # superseded rather than delivered stale and reported as failed.
         self.assertEqual(self.req(f'/api/tasks/{tasks["CTASK0000721"]}','PATCH',{'status':'running'})[0],200)
         self.post_event(path,secret,{'id':'evt-721-done','type':'change_task.state_changed','data':{'number':'CTASK0000721','ticket':'CHG0000720','state':'Closed Complete'}})
-        with server.connect() as db:
+        with flowops.db.connect() as db:
             row=db.execute("SELECT status,last_error FROM serviceops_outbox WHERE label='CTASK0000721 → Work in Progress'").fetchone()
         self.assertEqual(row['status'],'superseded');self.assertIn('set to Closed Complete in ServiceOps',row['last_error'])
         self.assertEqual(self.req(f'/api/runbooks/{rid}')[1]['data']['serviceops_writeback'],{'pending':0,'failed':0})
         # An event for a CTASK linked under a different change is ignored.
         code,body=self.post_event(path,secret,{'id':'evt-720-other','type':'change_task.state_changed','data':{'number':'CTASK0000720','ticket':'CHG0009999','state':'Cancelled'}})
         self.assertEqual(body['data']['tasks'],0)
-        with patch('server.urllib.request.urlopen',self.serviceops_fake([])):server.dispatch_serviceops_outbox(include_future=True)
+        with patch('urllib.request.urlopen',self.serviceops_fake([])):flowops.serviceops.dispatch_serviceops_outbox(include_future=True)
         self.req('/api/admin/integrations','POST',{'provider':'serviceops','revoke_credential':True})
     def test_serviceops_permanent_writeback_failure_parks_and_admin_can_retry(self):
         rid,tasks=self.linked_runbook('Refused write-back','CHG0000730',[{'number':'CTASK0000730','title':'Drain','state':'Open','sequence':1}])
         self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})
-        with patch('server.urllib.request.urlopen',self.serviceops_fake([])):self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        with patch('urllib.request.urlopen',self.serviceops_fake([])):self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
         self.req(f'/api/tasks/{tasks["CTASK0000730"]}','PATCH',{'status':'running'})
         captured=[]
-        with patch('server.urllib.request.urlopen',self.serviceops_fake(captured,ctask_status=403)):server.dispatch_serviceops_outbox(include_future=True)
+        with patch('urllib.request.urlopen',self.serviceops_fake(captured,ctask_status=403)):flowops.serviceops.dispatch_serviceops_outbox(include_future=True)
         doc=self.req(f'/api/runbooks/{rid}')[1]['data']
         self.assertEqual(doc['serviceops_writeback'],{'pending':0,'failed':1},'a 4xx is not retried blindly')
         self.assertTrue(any(a['action']=='serviceops.ctask_sync_failed' and 'HTTP 403' in a['detail'] for a in doc['audit']))
@@ -768,7 +785,7 @@ class FlowOpsTest(unittest.TestCase):
         _,connections=self.req('/api/admin/integrations');self.assertGreaterEqual(connections['data']['serviceops']['writeback']['failed'],1)
         self.assertEqual(self.req(f'/api/admin/integrations/serviceops/outbox/{failed["id"]}/retry','POST',{})[0],200)
         captured.clear()
-        with patch('server.urllib.request.urlopen',self.serviceops_fake(captured)):self.assertEqual(server.dispatch_serviceops_outbox(),1)
+        with patch('urllib.request.urlopen',self.serviceops_fake(captured)):self.assertEqual(flowops.serviceops.dispatch_serviceops_outbox(),1)
         self.assertEqual(self.req(f'/api/runbooks/{rid}')[1]['data']['serviceops_writeback'],{'pending':0,'failed':0})
         self.assertEqual(self.req(f'/api/admin/integrations/serviceops/outbox/{failed["id"]}/retry','POST',{})[0],409)
         self.assertEqual(self.req('/api/admin/integrations/serviceops/outbox/999999/retry','POST',{})[0],404)
@@ -779,11 +796,11 @@ class FlowOpsTest(unittest.TestCase):
         rid,tasks=self.linked_runbook('Flush before resolve','CHG0000740',[{'number':'CTASK0000740','title':'Only step','state':'Open','sequence':1}])
         self.req('/api/admin/integrations','POST',{'provider':'serviceops','record_evidence':False})
         self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'})
-        with patch('server.urllib.request.urlopen',self.serviceops_fake([])):self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        with patch('urllib.request.urlopen',self.serviceops_fake([])):self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
         self.req(f'/api/tasks/{tasks["CTASK0000740"]}','PATCH',{'status':'running'})
         self.req(f'/api/tasks/{tasks["CTASK0000740"]}','PATCH',{'status':'complete'})
         captured=[]
-        with patch('server.urllib.request.urlopen',self.serviceops_fake(captured)):
+        with patch('urllib.request.urlopen',self.serviceops_fake(captured)):
             code,_=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'complete'})
         self.assertEqual(code,200)
         writes=[(r.full_url.rsplit('/',1)[-1],json.loads(r.data)) for r in captured if r.method=='PATCH']
@@ -802,7 +819,7 @@ class FlowOpsTest(unittest.TestCase):
             def __exit__(self,*_):return False
             def read(self,*_):return json.dumps({'data':{'number':'CHG0000043','type':'change','title':'Payments release','state':self.state,'priority':'P1'}}).encode()
         def approved(request,timeout=0):requests.append(request);return Response('In Progress' if request.method=='PATCH' else 'Approved')
-        with patch('server.urllib.request.urlopen',approved):code,body=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
+        with patch('urllib.request.urlopen',approved):code,body=self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
         self.assertEqual(code,200);self.assertEqual(body['data']['serviceops_state'],'In Progress');self.assertEqual([r.method for r in requests],['GET','PATCH'])
         self.assertEqual(requests[1].get_header('Idempotency-key'),f'flowops-{rid}-live');self.assertEqual(json.loads(requests[1].data),{'state':'In Progress'})
     def test_audit_export_is_checksummed_and_chain_verified(self):
@@ -823,11 +840,11 @@ class FlowOpsTest(unittest.TestCase):
         self.assertGreater(body['data']['events_checked'],0)
     def test_audit_rows_are_immutable_by_policy_at_the_database_level(self):
         self.req('/api/runbooks','POST',{'name':'Immutability check'})
-        with server.connect() as db:
+        with flowops.db.connect() as db:
             row_id=db.execute("SELECT MAX(id) FROM audit").fetchone()[0]
-            with self.assertRaises(server.sqlite3.IntegrityError):
+            with self.assertRaises(sqlite3.IntegrityError):
                 db.execute("UPDATE audit SET detail='forged' WHERE id=?",(row_id,))
-            with self.assertRaises(server.sqlite3.IntegrityError):
+            with self.assertRaises(sqlite3.IntegrityError):
                 db.execute("DELETE FROM audit WHERE id=?",(row_id,))
             # a raw delete outside the sanctioned purge path (which toggles
             # audit_purge_lock around its DELETE) must still be rejected even
@@ -836,7 +853,7 @@ class FlowOpsTest(unittest.TestCase):
             self.assertIsNotNone(still_there)
     def test_configurable_audit_retention_purges_old_events_and_keeps_chain_verifiable(self):
         _,created=self.req('/api/runbooks','POST',{'name':'Retention prefix check'})
-        with server.connect() as db:
+        with flowops.db.connect() as db:
             instance_id=db.execute("SELECT id FROM instances WHERE slug='flowops'").fetchone()[0]
             oldest_id=db.execute("SELECT MIN(id) FROM audit WHERE instance_id=?",(instance_id,)).fetchone()[0]
             old_stamp=(__import__('datetime').datetime.now(__import__('datetime').timezone.utc)-__import__('datetime').timedelta(days=400)).isoformat(timespec='seconds')
@@ -852,7 +869,7 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(self.req('/api/admin/settings','POST',{'audit_retention_days':'365'})[0],200)
         code,purged=self.req('/api/admin/audit/purge','POST',{})
         self.assertEqual(code,200); self.assertGreaterEqual(purged['data']['purged'],1)
-        with server.connect() as db:
+        with flowops.db.connect() as db:
             self.assertIsNone(db.execute("SELECT 1 FROM audit WHERE id=?",(oldest_id,)).fetchone())
         code,exported=self.req('/api/admin/audit/export')
         self.assertEqual(code,200); self.assertTrue(exported['data']['chain_verified'])
@@ -912,7 +929,7 @@ class FlowOpsTest(unittest.TestCase):
             _,created=self.req('/api/runbooks','POST',{'name':'Automation success'}); rid=created['data']['id']
             _,task=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Call webhook','task_type':'automation','automation_url':f'http://127.0.0.1:{receiver.server_port}/hook'}); tid=task['data']['tasks'][0]['id']
             self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'}); self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
-            with patch('server.safe_urlopen',unrestricted_urlopen):
+            with patch('flowops.net.safe_urlopen',unrestricted_urlopen):
                 code,started=self.req(f'/api/tasks/{tid}','PATCH',{'status':'running'})
                 self.assertEqual(code,200)
                 started_task=next(t for t in started['data']['tasks'] if t['id']==tid)
@@ -948,7 +965,7 @@ class FlowOpsTest(unittest.TestCase):
             self.assertEqual(updated['data']['automation_context'],{'headers':{'X-Tenant':'acme-corp'},'variables':{'env':'prod'}})
             _,task=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Deploy','task_type':'automation','automation_url':f'http://127.0.0.1:{receiver.server_port}/hook?target={{{{env}}}}'}); tid=task['data']['tasks'][0]['id']
             self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'}); self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
-            with patch('server.safe_urlopen',unrestricted_urlopen):
+            with patch('flowops.net.safe_urlopen',unrestricted_urlopen):
                 self.req(f'/api/tasks/{tid}','PATCH',{'status':'running'})
                 for _ in range(50):
                     _,doc=self.req(f'/api/runbooks/{rid}')
@@ -976,7 +993,7 @@ class FlowOpsTest(unittest.TestCase):
             _,created=self.req('/api/runbooks','POST',{'name':'Test-fire check'}); rid=created['data']['id']
             _,task=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Deploy','task_type':'automation','automation_url':f'http://127.0.0.1:{receiver.server_port}/hook'}); tid=task['data']['tasks'][0]['id']
             before=next(t for t in task['data']['tasks'] if t['id']==tid)
-            with patch('server.safe_urlopen',unrestricted_urlopen):
+            with patch('flowops.net.safe_urlopen',unrestricted_urlopen):
                 code,fired=self.req(f'/api/tasks/{tid}/test-fire','POST',{})
             self.assertEqual(code,200)
             self.assertTrue(fired['data']['ok'])
@@ -1083,7 +1100,7 @@ class FlowOpsTest(unittest.TestCase):
             code,teamsHook=self.req('/api/admin/webhooks','POST',{'name':'Teams channel','url':f'http://127.0.0.1:{receiver_port}/teams','provider':'teams','events':['*']})
             self.assertEqual(code,201)
             self.assertEqual(self.req('/api/admin/webhooks','POST',{'name':'Bad provider','url':f'http://127.0.0.1:{receiver_port}/x','provider':'discord'})[0],400)
-            with patch('server.safe_urlopen',unrestricted_urlopen):
+            with patch('flowops.net.safe_urlopen',unrestricted_urlopen):
                 self.req(f"/api/admin/webhooks/{slackHook['data']['id']}/test",'POST',{})
                 self.req(f"/api/admin/webhooks/{teamsHook['data']['id']}/test",'POST',{})
             self.assertEqual(len(received),2)
@@ -1102,12 +1119,12 @@ class FlowOpsTest(unittest.TestCase):
         # same events and each would deliver them -- so the real assertion
         # here is that every claimed audit id appears in exactly one
         # thread's result, never both.
-        while server.claim_new_audit_events(): pass  # drain any backlog so the cursor starts caught up, regardless of how many audit rows earlier tests produced
+        while flowops.webhooks.claim_new_audit_events(): pass  # drain any backlog so the cursor starts caught up, regardless of how many audit rows earlier tests produced
         _,before=self.req('/api/admin/audit/export'); start_id=before['data']['events'][-1]['id']
         for i in range(20): self.req('/api/runbooks','POST',{'name':f'Race event {i}'})
         results=[None,None]
         def claim(index):
-            results[index]=server.claim_new_audit_events()
+            results[index]=flowops.webhooks.claim_new_audit_events()
         barrier=threading.Barrier(2)
         def synchronized_claim(index):
             barrier.wait()
@@ -1118,7 +1135,7 @@ class FlowOpsTest(unittest.TestCase):
         ids_a={e['id'] for e in results[0] if e['id']>start_id}
         ids_b={e['id'] for e in results[1] if e['id']>start_id}
         self.assertEqual(ids_a & ids_b, set(), "the same audit event was claimed by both simulated replicas")
-        remaining=server.claim_new_audit_events()
+        remaining=flowops.webhooks.claim_new_audit_events()
         self.assertEqual([e for e in remaining if e['id']>start_id], [])
     def test_webhook_delivers_signed_payload_to_a_real_receiver(self):
         import http.server as http_server_module
@@ -1137,7 +1154,7 @@ class FlowOpsTest(unittest.TestCase):
             self.assertEqual(code,201)
             self.assertTrue(created['data']['secret'])
             webhook_id=created['data']['id']
-            with patch('server.safe_urlopen',unrestricted_urlopen):
+            with patch('flowops.net.safe_urlopen',unrestricted_urlopen):
                 code,tested=self.req(f'/api/admin/webhooks/{webhook_id}/test','POST',{})
             self.assertEqual(code,200)
             self.assertEqual(len(received),1)
@@ -1194,10 +1211,10 @@ class FlowOpsTest(unittest.TestCase):
             self.assertEqual(code,201); webhook_ids.append(fast_webhook['data']['id'])
             code,created=self.req('/api/admin/webhooks','POST',{'name':'Slow receiver','url':f'http://127.0.0.1:{slow_receiver.server_port}/hook','events':['folder.created']})
             self.assertEqual(code,201); webhook_ids.append(created['data']['id'])
-            with patch('server.safe_urlopen',unrestricted_urlopen):
+            with patch('flowops.net.safe_urlopen',unrestricted_urlopen):
                 code,_=self.req('/api/folders','POST',{'name':f'DispatchLockTest{time.time()}'})
                 self.assertIn(code,(200,201))
-                dispatch_thread=threading.Thread(target=server.dispatch_pending_webhooks)
+                dispatch_thread=threading.Thread(target=flowops.webhooks.dispatch_pending_webhooks)
                 dispatch_thread.start()
                 time.sleep(0.3)  # let the dispatcher start the (blocked) delivery
                 # An isolated request/opener -- self.req() shares this
@@ -1224,13 +1241,13 @@ class FlowOpsTest(unittest.TestCase):
             for webhook_id in webhook_ids: self.req(f'/api/admin/webhooks/{webhook_id}','DELETE')
     def test_webhook_event_actions_list_matches_real_append_audit_call_sites(self):
         import re
-        source=(server.STATIC.parent/'server.py').read_text()
+        source=''.join(p.read_text() for p in sorted((flowops.config.ROOT/'flowops').rglob('*.py')))
         real_actions=set(re.findall(r'append_audit\([^)]*?,\s*"([a-z_.]+)"',source))
-        self.assertEqual(set(server.WEBHOOK_EVENT_ACTIONS),real_actions,
-            'WEBHOOK_EVENT_ACTIONS has drifted from the real append_audit() call sites -- update the constant in server.py')
+        self.assertEqual(set(flowops.config.WEBHOOK_EVENT_ACTIONS),real_actions,
+            'WEBHOOK_EVENT_ACTIONS has drifted from the real append_audit() call sites -- update the constant in flowops/config.py')
     def test_webhook_available_events_lists_canonical_actions(self):
         _,listed=self.req('/api/admin/webhooks')
-        self.assertEqual(set(listed['available_events']),set(server.WEBHOOK_EVENT_ACTIONS))
+        self.assertEqual(set(listed['available_events']),set(flowops.config.WEBHOOK_EVENT_ACTIONS))
         self.assertIn('runbook.created',listed['available_events'])
     def test_webhook_only_delivers_to_subscribed_event_types(self):
         import http.server as http_server_module
@@ -1247,16 +1264,16 @@ class FlowOpsTest(unittest.TestCase):
             code,created=self.req('/api/admin/webhooks','POST',{'name':'Folder-only subscriber','url':f'http://127.0.0.1:{receiver.server_port}/hook','events':['folder.created']})
             self.assertEqual(code,201)
             webhook_id=created['data']['id']
-            while server.claim_new_audit_events(): pass  # drain any backlog first
+            while flowops.webhooks.claim_new_audit_events(): pass  # drain any backlog first
             self.req('/api/folders','POST',{'name':f'Filter test folder {time.time()}'})  # folder.created -- should match
             self.req('/api/runbooks','POST',{'name':'Filter test runbook'})  # runbook.created -- should NOT match
-            events=server.claim_new_audit_events()
-            with server.connect() as db:
+            events=flowops.webhooks.claim_new_audit_events()
+            with flowops.db.connect() as db:
                 webhook=dict(db.execute("SELECT * FROM webhooks WHERE id=?",(webhook_id,)).fetchone())
-            with patch('server.safe_urlopen',unrestricted_urlopen):
+            with patch('flowops.net.safe_urlopen',unrestricted_urlopen):
                 for event in events:
-                    if not server.webhook_matches(webhook['events_json'],event['action']): continue
-                    server.deliver_webhook_once(webhook,event)
+                    if not flowops.webhooks.webhook_matches(webhook['events_json'],event['action']): continue
+                    flowops.webhooks.deliver_webhook_once(webhook,event)
             self.assertEqual(received,['folder.created'])
         finally:
             receiver.shutdown()
@@ -1273,18 +1290,18 @@ class FlowOpsTest(unittest.TestCase):
         # halves: over-blocking a legitimate public destination would be as
         # real a bug as under-blocking a private one.
         for literal in ('http://127.0.0.1/x','http://169.254.169.254/latest/meta-data/','http://10.0.0.5/x','http://[::1]/x'):
-            ok,_,_=server.resolve_endpoint_addresses_safely(literal)
+            ok,_,_=flowops.net.resolve_endpoint_addresses_safely(literal)
             self.assertFalse(ok,f'{literal} must be rejected')
-        ok,hostname,infos=server.resolve_endpoint_addresses_safely('http://8.8.8.8/x')
+        ok,hostname,infos=flowops.net.resolve_endpoint_addresses_safely('http://8.8.8.8/x')
         self.assertTrue(ok); self.assertIsNone(hostname); self.assertIsNone(infos)
         # allow_private_network=True (trusted, admin-configured integrations
         # like ServiceNow) permits ordinary private ranges but never loopback.
-        self.assertTrue(server.resolve_endpoint_addresses_safely('http://10.0.0.5/x',allow_private_network=True)[0])
-        self.assertFalse(server.resolve_endpoint_addresses_safely('http://127.0.0.1/x',allow_private_network=True)[0])
+        self.assertTrue(flowops.net.resolve_endpoint_addresses_safely('http://10.0.0.5/x',allow_private_network=True)[0])
+        self.assertFalse(flowops.net.resolve_endpoint_addresses_safely('http://127.0.0.1/x',allow_private_network=True)[0])
     def test_pin_resolved_addresses_forces_the_pinned_answer_for_the_same_host(self):
         import socket as socket_module
         fake_infos=[(socket_module.AF_INET,socket_module.SOCK_STREAM,6,'',('203.0.113.5',0))]
-        with server.pin_resolved_addresses('pinned.example',fake_infos):
+        with flowops.net.pin_resolved_addresses('pinned.example',fake_infos):
             result=socket_module.getaddrinfo('pinned.example',443)
             self.assertEqual(result[0][4][0],'203.0.113.5')
         # pin is cleared on exit -- a real lookup for an unrelated host must
@@ -1293,19 +1310,19 @@ class FlowOpsTest(unittest.TestCase):
             socket_module.getaddrinfo('pinned.example',443)
     def test_vapid_jwt_is_a_real_ec_signature_verifiable_by_openssl_itself(self):
         import subprocess,tempfile as tf,os as os_module
-        private_key_pem,public_key_b64url=server.generate_vapid_keypair()
+        private_key_pem,public_key_b64url=flowops.push.generate_vapid_keypair()
         self.assertTrue(public_key_b64url)
         raw_point=base64.urlsafe_b64decode(public_key_b64url+'=='*((4-len(public_key_b64url)%4)%4))
         self.assertEqual(len(raw_point),65); self.assertEqual(raw_point[0],0x04)
-        token=server.vapid_jwt(private_key_pem,'https://push.example.test','mailto:ops@example.test')
+        token=flowops.push.vapid_jwt(private_key_pem,'https://push.example.test','mailto:ops@example.test')
         header_b64,payload_b64,sig_b64=token.split('.')
-        claims=json.loads(server._b64url_decode(payload_b64))
+        claims=json.loads(flowops.sso._b64url_decode(payload_b64))
         self.assertEqual(claims['aud'],'https://push.example.test')
         self.assertEqual(claims['sub'],'mailto:ops@example.test')
         self.assertGreater(claims['exp'],time.time())
         # Verify the signature is real by asking openssl itself to check it --
         # independent confirmation, not just re-running our own signer.
-        raw_sig=server._b64url_decode(sig_b64)
+        raw_sig=flowops.sso._b64url_decode(sig_b64)
         r,s=raw_sig[:32],raw_sig[32:]
         def der_int(component):
             component=component.lstrip(b'\x00') or b'\x00'
@@ -1329,13 +1346,13 @@ class FlowOpsTest(unittest.TestCase):
         endpoint='https://push.example.test/subscription/abc123'
         code,body=self.req('/api/push/subscribe','POST',{'endpoint':endpoint,'keys':{'p256dh':'fake-p256dh','auth':'fake-auth'}})
         self.assertEqual(code,201)
-        with server.connect() as db:
+        with flowops.db.connect() as db:
             row=db.execute('SELECT * FROM push_subscriptions WHERE endpoint=?',(endpoint,)).fetchone()
             self.assertIsNotNone(row); self.assertEqual(row['p256dh'],'fake-p256dh')
         request=urllib.request.Request(self.base+f'/api/push/subscribe?endpoint={urllib.parse.quote(endpoint)}',method='DELETE',headers={'X-CSRF-Token':self.csrf})
         with self.opener.open(request) as res: code=res.status
         self.assertEqual(code,200)
-        with server.connect() as db:
+        with flowops.db.connect() as db:
             self.assertIsNone(db.execute('SELECT 1 FROM push_subscriptions WHERE endpoint=?',(endpoint,)).fetchone())
     def test_task_assignment_sends_a_real_web_push_and_expired_subscription_is_pruned(self):
         import http.server as http_server_module
@@ -1355,7 +1372,7 @@ class FlowOpsTest(unittest.TestCase):
             _,created=self.req('/api/runbooks','POST',{'name':'Push notify test'}); rid=created['data']['id']
             _,task=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Notify me'})
             task_id=task['data']['tasks'][0]['id']
-            with patch('server.safe_urlopen',unrestricted_urlopen):
+            with patch('flowops.net.safe_urlopen',unrestricted_urlopen):
                 code,updated=self.req(f'/api/tasks/{task_id}','PATCH',{'owner_user_id':1})
             self.assertEqual(code,200)
             deadline=time.monotonic()+3
@@ -1376,10 +1393,10 @@ class FlowOpsTest(unittest.TestCase):
         try:
             endpoint2=f'http://127.0.0.1:{gone.server_port}/push/gone'
             self.req('/api/push/subscribe','POST',{'endpoint':endpoint2,'keys':{'p256dh':'p','auth':'a'}})
-            with server.connect() as db:
+            with flowops.db.connect() as db:
                 sub=db.execute('SELECT * FROM push_subscriptions WHERE endpoint=?',(endpoint2,)).fetchone()
-                with patch('server.safe_urlopen',unrestricted_urlopen):
-                    server.send_web_push(db,dict(sub),sub['instance_id']); db.commit()
+                with patch('flowops.net.safe_urlopen',unrestricted_urlopen):
+                    flowops.push.send_web_push(db,dict(sub),sub['instance_id']); db.commit()
                 self.assertIsNone(db.execute('SELECT 1 FROM push_subscriptions WHERE endpoint=?',(endpoint2,)).fetchone())
         finally:
             gone.shutdown()
@@ -1422,9 +1439,9 @@ class FlowOpsTest(unittest.TestCase):
         def b64url(data: bytes) -> str:
             return b64.urlsafe_b64encode(data).decode().rstrip("=")
         kid = "test-key"
-        server._cf_access_jwks_cache["keys"] = {kid: (n, e)}
-        server._cf_access_jwks_cache["fetched_at"] = time.monotonic()
-        with patch.object(server, "CF_ACCESS_TEAM_DOMAIN", "test.cloudflareaccess.com"), patch.object(server, "CF_ACCESS_AUD", "test-aud"):
+        flowops.sso._cf_access_jwks_cache["keys"] = {kid: (n, e)}
+        flowops.sso._cf_access_jwks_cache["fetched_at"] = time.monotonic()
+        with patch.object(flowops.config, "CF_ACCESS_TEAM_DOMAIN", "test.cloudflareaccess.com"), patch.object(flowops.config, "CF_ACCESS_AUD", "test-aud"):
             def make_jwt(email, aud="test-aud", exp=None, kid_used=kid, tamper=False):
                 header = b64url(json.dumps({"alg": "RS256", "kid": kid_used}).encode())
                 payload = b64url(json.dumps({"email": email, "aud": [aud], "exp": exp if exp is not None else int(time.time()) + 300}).encode())
@@ -2055,7 +2072,7 @@ class FlowOpsTest(unittest.TestCase):
         self.assertTrue(len(export['audit_history'])>0)
     def test_unhandled_exception_returns_structured_500_instead_of_crashing(self):
         _,created=self.req('/api/runbooks','POST',{'name':'Error path probe'}); rid=created['data']['id']
-        with patch('server.runbook_document', side_effect=RuntimeError('boom')):
+        with patch('flowops.runbooks.runbook_document', side_effect=RuntimeError('boom')):
             code,body=self.req(f'/api/runbooks/{rid}')
         self.assertEqual(code,500)
         self.assertIn('error_id',body)
@@ -2064,7 +2081,7 @@ class FlowOpsTest(unittest.TestCase):
         self.assertEqual(self.req('/api/runbooks')[0],200)
     def test_admin_can_trigger_and_list_database_backups(self):
         with tempfile.TemporaryDirectory() as backup_dir:
-            with patch('server.BACKUP_DIR', __import__('pathlib').Path(backup_dir)):
+            with patch('flowops.config.BACKUP_DIR', __import__('pathlib').Path(backup_dir)):
                 code,created=self.req('/api/admin/backups','POST',{})
                 self.assertEqual(code,201)
                 self.assertTrue(created['data']['filename'].startswith('flowops-'))
@@ -2075,7 +2092,7 @@ class FlowOpsTest(unittest.TestCase):
                 self.assertIn(created['data']['filename'],filenames)
     def test_backups_read_scoped_token_can_list_backups_without_admin_access(self):
         with tempfile.TemporaryDirectory() as backup_dir:
-            with patch('server.BACKUP_DIR', __import__('pathlib').Path(backup_dir)):
+            with patch('flowops.config.BACKUP_DIR', __import__('pathlib').Path(backup_dir)):
                 self.req('/api/admin/backups','POST',{})
                 _,scoped_token=self.req('/api/admin/api-tokens','POST',{'name':'List-only sync check','scopes':['backups:read']})
                 request=urllib.request.Request(self.base+'/api/admin/backups',headers={'Authorization':f"Bearer {scoped_token['data']['token']}"})
@@ -2084,7 +2101,7 @@ class FlowOpsTest(unittest.TestCase):
                     self.assertTrue(json.load(res)['data']['backups'])
     def test_admin_can_download_a_backup_file_and_bytes_match_disk(self):
         with tempfile.TemporaryDirectory() as backup_dir:
-            with patch('server.BACKUP_DIR', __import__('pathlib').Path(backup_dir)):
+            with patch('flowops.config.BACKUP_DIR', __import__('pathlib').Path(backup_dir)):
                 _,created=self.req('/api/admin/backups','POST',{})
                 filename=created['data']['filename']
                 on_disk=(__import__('pathlib').Path(backup_dir)/filename).read_bytes()
@@ -2095,7 +2112,7 @@ class FlowOpsTest(unittest.TestCase):
                     self.assertIn(filename,res.headers.get('Content-Disposition',''))
     def test_backup_download_requires_its_own_scope_not_broader_admin_access(self):
         with tempfile.TemporaryDirectory() as backup_dir:
-            with patch('server.BACKUP_DIR', __import__('pathlib').Path(backup_dir)):
+            with patch('flowops.config.BACKUP_DIR', __import__('pathlib').Path(backup_dir)):
                 _,created=self.req('/api/admin/backups','POST',{})
                 filename=created['data']['filename']
                 _,runbooks_token=self.req('/api/admin/api-tokens','POST',{'name':'Wrong scope for backups','scopes':['runbooks:read']})
@@ -2109,7 +2126,7 @@ class FlowOpsTest(unittest.TestCase):
                 self.assertEqual(bearer_get(backups_token['data']['token']),200)
     def test_backup_download_rejects_unknown_or_path_traversal_filenames(self):
         with tempfile.TemporaryDirectory() as backup_dir:
-            with patch('server.BACKUP_DIR', __import__('pathlib').Path(backup_dir)):
+            with patch('flowops.config.BACKUP_DIR', __import__('pathlib').Path(backup_dir)):
                 self.req('/api/admin/backups','POST',{})
                 for bad_name in ('does-not-exist.db.enc','..%2F..%2F..%2Fetc%2Fpasswd','..','flowops-x/../../../etc/passwd'):
                     request=urllib.request.Request(self.base+f'/api/admin/backups/{bad_name}')
@@ -2119,13 +2136,13 @@ class FlowOpsTest(unittest.TestCase):
                     self.assertEqual(code,404,bad_name)
     def test_backup_retention_deletes_oldest_beyond_retain_limit(self):
         with tempfile.TemporaryDirectory() as backup_dir:
-            with patch('server.BACKUP_DIR', __import__('pathlib').Path(backup_dir)), patch('server.BACKUP_RETAIN', 2):
-                for _ in range(4): server.backup_database()
-                self.assertEqual(len(server.list_backups()), 2)
+            with patch('flowops.config.BACKUP_DIR', __import__('pathlib').Path(backup_dir)), patch('flowops.config.BACKUP_RETAIN', 2):
+                for _ in range(4): flowops.backups.backup_database()
+                self.assertEqual(len(flowops.backups.list_backups()), 2)
     def test_database_backups_are_encrypted_at_rest_and_round_trip_decrypt(self):
         with tempfile.TemporaryDirectory() as backup_dir:
-            with patch('server.BACKUP_DIR', __import__('pathlib').Path(backup_dir)):
-                result=server.backup_database()
+            with patch('flowops.config.BACKUP_DIR', __import__('pathlib').Path(backup_dir)):
+                result=flowops.backups.backup_database()
                 self.assertTrue(result['filename'].endswith('.db.enc'))
                 enc_path=__import__('pathlib').Path(backup_dir)/result['filename']
                 ciphertext=enc_path.read_bytes()
@@ -2140,54 +2157,54 @@ class FlowOpsTest(unittest.TestCase):
                 # 1's schema, so it reliably raises on a genuinely
                 # non-SQLite file regardless of SQLite version.
                 self.assertFalse(ciphertext.startswith(b'SQLite format 3'))
-                with self.assertRaises(server.sqlite3.DatabaseError):
-                    server.sqlite3.connect(str(enc_path)).execute(
+                with self.assertRaises(sqlite3.DatabaseError):
+                    sqlite3.connect(str(enc_path)).execute(
                         "SELECT name FROM sqlite_master LIMIT 1"
                     ).fetchone()
                 # round-trips back to a valid SQLite database via the same cipher
-                plaintext=server.settings_cipher().decrypt(ciphertext)
+                plaintext=flowops.crypto.settings_cipher().decrypt(ciphertext)
                 self.assertTrue(plaintext.startswith(b'SQLite format 3'))
                 restored_path=__import__('pathlib').Path(backup_dir)/'restored.db'
                 restored_path.write_bytes(plaintext)
-                tables=server.sqlite3.connect(str(restored_path)).execute("SELECT name FROM sqlite_master WHERE type='table' AND name='audit'").fetchall()
+                tables=sqlite3.connect(str(restored_path)).execute("SELECT name FROM sqlite_master WHERE type='table' AND name='audit'").fetchall()
                 self.assertEqual(len(tables),1)
-                listed=server.list_backups()
+                listed=flowops.backups.list_backups()
                 self.assertTrue(any(b['filename']==result['filename'] and b['encrypted'] for b in listed))
     def test_dashboard_email_render_includes_runbook_and_completion_data(self):
-        with server.connect() as db:
+        with flowops.db.connect() as db:
             instance_id=db.execute("SELECT id FROM instances WHERE slug='flowops'").fetchone()[0]
         _,created=self.req('/api/runbooks','POST',{'name':'Digest visibility check'})
-        with server.connect() as db:
-            subject,body=server.render_dashboard_email(db,instance_id)
+        with flowops.db.connect() as db:
+            subject,body=flowops.dashboard_email.render_dashboard_email(db,instance_id)
         self.assertIn('FlowOps digest',subject)
         self.assertIn('Active runbooks',body)
         self.assertIn('Task completion',body)
         self.assertIn('Late or at-risk tasks',body)
     def test_dashboard_email_scheduling_gate_sends_only_once_per_configured_interval(self):
         self.req('/api/admin/settings','POST',{'dashboard_email_frequency':'daily','dashboard_email_hour':'9','dashboard_email_recipients':'ops@example.com, lead@example.com'})
-        with server.connect() as db:
+        with flowops.db.connect() as db:
             instance_id=db.execute("SELECT id FROM instances WHERE slug='flowops'").fetchone()[0]
-        wrong_hour=server.datetime(2026,1,1,8,0,tzinfo=server.timezone.utc)
-        with patch('server.send_mail') as send:
-            with server.connect() as db:
-                sent=server.maybe_send_dashboard_email(db,instance_id,current_time=wrong_hour)
+        wrong_hour=datetime(2026,1,1,8,0,tzinfo=timezone.utc)
+        with patch('flowops.mail.send_mail') as send:
+            with flowops.db.connect() as db:
+                sent=flowops.dashboard_email.maybe_send_dashboard_email(db,instance_id,current_time=wrong_hour)
             self.assertFalse(sent); send.assert_not_called()
-        first_run=server.datetime(2026,1,1,9,5,tzinfo=server.timezone.utc)
-        with patch('server.send_mail') as send:
-            with server.connect() as db:
-                sent=server.maybe_send_dashboard_email(db,instance_id,current_time=first_run)
+        first_run=datetime(2026,1,1,9,5,tzinfo=timezone.utc)
+        with patch('flowops.mail.send_mail') as send:
+            with flowops.db.connect() as db:
+                sent=flowops.dashboard_email.maybe_send_dashboard_email(db,instance_id,current_time=first_run)
             self.assertTrue(sent); self.assertEqual(send.call_count,2)  # two configured recipients
         # same day, same hour again -- must NOT re-send (daily gate not yet elapsed)
-        later_same_day=server.datetime(2026,1,1,9,10,tzinfo=server.timezone.utc)
-        with patch('server.send_mail') as send:
-            with server.connect() as db:
-                sent=server.maybe_send_dashboard_email(db,instance_id,current_time=later_same_day)
+        later_same_day=datetime(2026,1,1,9,10,tzinfo=timezone.utc)
+        with patch('flowops.mail.send_mail') as send:
+            with flowops.db.connect() as db:
+                sent=flowops.dashboard_email.maybe_send_dashboard_email(db,instance_id,current_time=later_same_day)
             self.assertFalse(sent); send.assert_not_called()
         # 25 hours later, same configured hour -- daily gate has elapsed, due again
-        next_day=server.datetime(2026,1,2,9,5,tzinfo=server.timezone.utc)
-        with patch('server.send_mail') as send:
-            with server.connect() as db:
-                sent=server.maybe_send_dashboard_email(db,instance_id,current_time=next_day)
+        next_day=datetime(2026,1,2,9,5,tzinfo=timezone.utc)
+        with patch('flowops.mail.send_mail') as send:
+            with flowops.db.connect() as db:
+                sent=flowops.dashboard_email.maybe_send_dashboard_email(db,instance_id,current_time=next_day)
             self.assertTrue(sent)
     def test_api_explorer_openapi_doc_paths_resolve_to_real_routes(self):
         code,body=self.req('/openapi.json')
@@ -2244,7 +2261,7 @@ class FlowOpsTest(unittest.TestCase):
             try:
                 with urllib.request.urlopen(request) as res:return res.status
             except urllib.error.HTTPError as err:return err.code
-        with patch('server.API_RATE_LIMIT', 3):
+        with patch('flowops.ratelimit.API_RATE_LIMIT', 3):
             statuses=[bearer_get(token['data']['token']) for _ in range(5)]
         self.assertEqual(statuses[:3], [200,200,200])
         self.assertIn(429, statuses[3:])
@@ -2267,7 +2284,7 @@ class FlowOpsTest(unittest.TestCase):
             try:
                 with urllib.request.urlopen(request) as res: return res.status
             except urllib.error.HTTPError as err: return err.code
-        with patch('server.LOGIN_RATE_LIMIT_PER_IP',10_000), patch('server.LOGIN_RATE_LIMIT_PER_ACCOUNT',3):
+        with patch('flowops.ratelimit.LOGIN_RATE_LIMIT_PER_IP',10_000), patch('flowops.ratelimit.LOGIN_RATE_LIMIT_PER_ACCOUNT',3):
             statuses=[attempt() for _ in range(5)]
         self.assertEqual(statuses[:3],[401,401,401])
         self.assertIn(429,statuses[3:])
@@ -2278,7 +2295,7 @@ class FlowOpsTest(unittest.TestCase):
         without TLS, and appear once the request looks like it arrived
         through a TLS-terminating reverse proxy (X-Forwarded-Proto: https,
         the header a real deployment's Cloudflare Tunnel sets)."""
-        with patch('server.LOGIN_RATE_LIMIT_PER_IP',10_000), patch('server.LOGIN_RATE_LIMIT_PER_ACCOUNT',10_000):
+        with patch('flowops.ratelimit.LOGIN_RATE_LIMIT_PER_IP',10_000), patch('flowops.ratelimit.LOGIN_RATE_LIMIT_PER_ACCOUNT',10_000):
             plain=urllib.request.Request(
                 self.base+'/api/auth/login',
                 data=json.dumps({'username':'admin','password':'FlowOps!Preview2026'}).encode(),
@@ -2483,7 +2500,7 @@ class FlowOpsTest(unittest.TestCase):
         _,a=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'First'});first=a['data']['tasks'][0]['id']
         _,b=self.req(f'/api/runbooks/{rid}/tasks','POST',{'title':'Second','depends_on':[first],'owner_user_id':operator['id']});second=b['data']['tasks'][1]['id']
         self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'ready'});self.req(f'/api/runbooks/{rid}/transition','POST',{'status':'live'})
-        with patch('server.notify_task_assignment') as notify:
+        with patch('flowops.push.notify_task_assignment') as notify:
             self.req(f'/api/tasks/{first}','PATCH',{'status':'running'})
             notify.assert_not_called()
             code,done=self.req(f'/api/tasks/{first}','PATCH',{'status':'complete'});self.assertEqual(code,200)
@@ -2507,7 +2524,7 @@ class FlowOpsTest(unittest.TestCase):
     def test_email_task_sends_to_each_recipient_on_completion_but_not_in_rehearsal(self):
         def run(run_type):
             rid,(tid,)=self._live_runbook(f'Comms {run_type}',[{'title':'Notify business','task_type':'email','recipients':'a@example.com, b@example.com','message':'Cutover has started'}],run_type=run_type)
-            with patch('server.send_mail') as send:
+            with patch('flowops.mail.send_mail') as send:
                 self.assertEqual(self.req(f'/api/tasks/{tid}','PATCH',{'status':'complete'})[0],200)
                 deadline=time.monotonic()+3;result=None
                 while time.monotonic()<deadline:
@@ -2536,8 +2553,8 @@ class FlowOpsTest(unittest.TestCase):
     def test_forecast_finish_moves_out_when_a_running_task_overruns(self):
         rid,(tid,)=self._live_runbook('Forecast run',[{'title':'Long step','duration':10}])
         self.req(f'/api/tasks/{tid}','PATCH',{'status':'running'})
-        thirty_ago=(server.datetime.now(server.timezone.utc)-server.timedelta(minutes=30)).isoformat(timespec='seconds')
-        with server.connect() as db:
+        thirty_ago=(datetime.now(timezone.utc)-timedelta(minutes=30)).isoformat(timespec='seconds')
+        with flowops.db.connect() as db:
             db.execute('UPDATE runbooks SET actual_started_at=? WHERE id=?',(thirty_ago,rid));db.execute('UPDATE tasks SET started_at=? WHERE id=?',(thirty_ago,tid));db.commit()
         timing=self.req(f'/api/runbooks/{rid}')[1]['data']['timing']
         self.assertIsNotNone(timing['forecast_end_at']);self.assertAlmostEqual(timing['forecast_variance_seconds'],1200,delta=30)

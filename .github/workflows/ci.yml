@@ -15,7 +15,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Check Python syntax
-        run: python3 -m py_compile server.py
+        run: python3 -m compileall -q server.py flowops
       - name: Check JS syntax
         run: node --check static/app.js
       - name: Install test dependencies
@@ -23,9 +23,9 @@ jobs:
       - name: Install Playwright browser
         run: python3 -m playwright install --with-deps chromium
       - name: Run server test suite
-        run: python3 -m pytest test_flowops.py -v
+        run: python3 -m pytest tests/test_flowops.py -v
       - name: Run browser regression suite
-        run: python3 -m pytest test_browser.py -v
+        run: python3 -m pytest tests/test_browser.py -v
 
   build:
     runs-on: ubuntu-latest

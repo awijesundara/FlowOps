@@ -103,9 +103,25 @@ curl -H "Authorization: Bearer fo_..." https://your-flowops-host/api/runbooks
 ## Testing
 
 ```bash
-python -m pytest test_flowops.py -q          # backend
-python -m pytest test_browser.py -v          # Playwright + axe-core a11y
+python -m pytest tests/test_flowops.py -q    # backend
+python -m pytest tests/test_browser.py -v    # Playwright + axe-core a11y
 ```
+
+## Code layout
+
+`server.py` only starts the app; the code lives in the `flowops/` package.
+
+| Path | Holds |
+|---|---|
+| `flowops/config.py` | Environment settings and product constants |
+| `flowops/schema.py`, `db.py`, `audit.py` | SQLite schema and upgrades, connections, hash-chained audit |
+| `flowops/crypto.py`, `ratelimit.py`, `net.py`, `sso.py` | Encryption and passwords, sign-in throttling, SSRF-safe HTTP, Cloudflare Access and OIDC tokens |
+| `flowops/runbooks.py`, `automation.py` | Planning, task rules, import/export, automation calls |
+| `flowops/serviceops.py`, `webhooks.py`, `scim.py` | ServiceOps write-back and events, outbound webhooks, SCIM documents |
+| `flowops/mail.py`, `push.py`, `dashboard_email.py`, `backups.py` | Mail, Web Push, scheduled reports, backups |
+| `flowops/web/` | HTTP routes, one module per area; `handler.py` dispatches to them |
+| `static/` | The single-page UI |
+| `tests/` | Backend, browser and opt-in live Keycloak tests |
 
 ## Independence
 

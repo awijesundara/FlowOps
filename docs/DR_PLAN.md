@@ -3,7 +3,7 @@
 ## Scope and objective
 
 FlowOps runs as a single SQLite database file per deployment, backed up on
-a schedule (`backup_loop()` in `server.py`) and on demand
+a schedule (`backup_loop()` in `flowops/backups.py`) and on demand
 (`POST /api/admin/backups`). This plan covers recovering that database
 from a backup after data loss or a corrupted instance — it does not cover
 regional failover (excluded from scope; see `PRODUCT_BACKLOG.md` Epic
@@ -12,7 +12,7 @@ available on this single-LAN, 2-node MicroK8s deployment).
 
 - **RPO (Recovery Point Objective):** bounded by the configured backup
   interval/schedule (`FLOWOPS_BACKUP_INTERVAL_MINUTES`, default in
-  `server.py`) plus however long since the last successful backup.
+  `flowops/backups.py`) plus however long since the last successful backup.
 - **RTO (Recovery Time Objective):** the time to build/pull the image,
   restore the decrypted backup into a fresh volume, and pass health
   checks — demonstrated at well under 2 minutes end-to-end for the

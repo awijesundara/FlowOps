@@ -33,13 +33,20 @@ if RUN:
     os.environ["FLOWOPS_DB"] = tmp.name
     os.environ["FLOWOPS_PREVIEW_TOKENS"] = "true"
     os.environ["FLOWOPS_SETTINGS_ENCRYPTION_KEY"] = "a1J1M20wV3JlbklvNWt1a2NTYk9pQ3VHTW5PRzFjTFI="
-    import server
+    import flowops.config
+    import flowops.crypto
+    import flowops.db
+    import flowops.net
+    import flowops.schema
+    import flowops.web.handler
+    from http.server import ThreadingHTTPServer
+    import secrets
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         sync_playwright = None
 else:
-    server = None
+    flowops = None
     sync_playwright = None
 
 
@@ -98,8 +105,8 @@ class OidcLiveKeycloakTest(unittest.TestCase):
             raise unittest.SkipTest(f"Could not start a local Keycloak container: {launch.stderr.strip()}")
         cls._wait_for_keycloak()
 
-        server.init_db()
-        cls.http = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        flowops.schema.init_db()
+        cls.http = ThreadingHTTPServer(("127.0.0.1", 0), flowops.web.handler.Handler)
         cls.base = f"http://127.0.0.1:{cls.http.server_port}"
         threading.Thread(target=cls.http.serve_forever, daemon=True).start()
         os.environ["FLOWOPS_PUBLIC_URL"] = cls.base
@@ -121,9 +128,9 @@ class OidcLiveKeycloakTest(unittest.TestCase):
             "credentials": [{"type": "password", "value": cls.TEST_PASSWORD, "temporary": False}],
         })
 
-        with server.connect() as db:
-            instance = db.execute("SELECT id FROM instances WHERE slug=?", (server.DEFAULT_INSTANCE_SLUG,)).fetchone()
-            stamp = server.now()
+        with flowops.db.connect() as db:
+            instance = db.execute("SELECT id FROM instances WHERE slug=?", (flowops.config.DEFAULT_INSTANCE_SLUG,)).fetchone()
+            stamp = flowops.db.now()
             for key, value in {
                 "oidc_enabled": "true",
                 "oidc_url": f"{cls.KC_BASE}/realms/{cls.REALM}",
@@ -134,7 +141,7 @@ class OidcLiveKeycloakTest(unittest.TestCase):
                     "ON CONFLICT(instance_id,key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
                     (instance["id"], key, value, stamp),
                 )
-            encrypted = server.settings_cipher().encrypt(cls.client_secret.encode()).decode()
+            encrypted = flowops.crypto.settings_cipher().encrypt(cls.client_secret.encode()).decode()
             db.execute(
                 "INSERT INTO integration_credentials(instance_id,provider,secret_encrypted,updated_by,updated_at) VALUES(?,?,?,?,?) "
                 "ON CONFLICT(instance_id,provider) DO UPDATE SET secret_encrypted=excluded.secret_encrypted,updated_at=excluded.updated_at",
@@ -142,7 +149,7 @@ class OidcLiveKeycloakTest(unittest.TestCase):
             )
             db.execute(
                 "INSERT INTO users(username,display_name,email,role,team,password_hash,created_at,instance_id) VALUES(?,?,?,?,?,?,?,?)",
-                ("oidclivetest", "OIDC Live Test", cls.TEST_EMAIL, "Member", "", server.password_hash(server.secrets.token_urlsafe(48)), stamp, instance["id"]),
+                ("oidclivetest", "OIDC Live Test", cls.TEST_EMAIL, "Member", "", flowops.crypto.password_hash(secrets.token_urlsafe(48)), stamp, instance["id"]),
             )
             db.commit()
 
@@ -180,7 +187,7 @@ class OidcLiveKeycloakTest(unittest.TestCase):
 
     def test_full_authorization_code_pkce_flow_establishes_a_real_flowops_session(self):
         page = self.browser.new_page()
-        patcher = patch("server.safe_urlopen", _unrestricted_urlopen)
+        patcher = patch("flowops.net.safe_urlopen", _unrestricted_urlopen)
         patcher.start()
         try:
             page.goto(f"{self.base}/auth/oidc/login")
@@ -200,13 +207,13 @@ class OidcLiveKeycloakTest(unittest.TestCase):
             page.close()
             patcher.stop()
 
-        with server.connect() as db:
+        with flowops.db.connect() as db:
             row = db.execute("SELECT * FROM audit WHERE action='auth.oidc_login' ORDER BY id DESC LIMIT 1").fetchone()
             self.assertIsNotNone(row, "a real auth.oidc_login audit row must be written")
             self.assertIn(self.TEST_EMAIL, row["detail"])
 
     def test_login_is_rejected_when_no_active_flowops_account_matches_the_oidc_email(self):
-        with server.connect() as db:
+        with flowops.db.connect() as db:
             token = _admin_token(self.KC_BASE)
             _admin_post(self.KC_BASE, token, f"/admin/realms/{self.REALM}/users", {
                 "username": "oidc-unmatched", "email": "no-such-flowops-user@example.com", "emailVerified": True,
@@ -214,7 +221,7 @@ class OidcLiveKeycloakTest(unittest.TestCase):
                 "credentials": [{"type": "password", "value": "Unmatched!2026", "temporary": False}],
             })
         page = self.browser.new_page()
-        patcher = patch("server.safe_urlopen", _unrestricted_urlopen)
+        patcher = patch("flowops.net.safe_urlopen", _unrestricted_urlopen)
         patcher.start()
         try:
             page.goto(f"{self.base}/auth/oidc/login")
