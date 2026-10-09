@@ -38,9 +38,12 @@ class IntegrationRoutes(BaseHandler):
         slug=db.execute("SELECT slug FROM instances WHERE id=?",(instance_id,)).fetchone()[0]
         configured=bool(db.execute("SELECT 1 FROM integration_credentials WHERE instance_id=? AND provider='serviceops_events'",(instance_id,)).fetchone())
         last=db.execute("SELECT event_type,outcome,received_at FROM serviceops_inbound_events WHERE instance_id=? ORDER BY received_at DESC,rowid DESC LIMIT 1",(instance_id,)).fetchone()
-        public=os.getenv("FLOWOPS_PUBLIC_URL","").strip().rstrip("/")
+        # In a cluster ServiceOps posts to FlowOps' Service directly
+        # (FLOWOPS_INTERNAL_URL); the public URL is usually behind an
+        # identity proxy that answers server calls with a login page.
+        base=(os.getenv("FLOWOPS_INTERNAL_URL","") or os.getenv("FLOWOPS_PUBLIC_URL","")).strip().rstrip("/")
         receiver=f"/api/integrations/serviceops/events/{slug}"
-        return {"configured":configured,"receiver_path":receiver,"receiver_url":f"{public}{receiver}" if public else None,
+        return {"configured":configured,"receiver_path":receiver,"receiver_url":f"{base}{receiver}" if base else None,
                 "subscribed_events":["change.state_changed","change_task.state_changed"],
                 "last_event":dict(last) if last else None}
 

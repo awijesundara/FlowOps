@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 BASE = os.environ.get("FLOWOPS_BASE", "http://localhost:8088")
 CONCURRENCY = int(sys.argv[1]) if len(sys.argv) > 1 else 25
 USERNAME = os.environ.get("FLOWOPS_LOAD_USER", "admin")
-PASSWORD = os.environ.get("FLOWOPS_LOAD_PASSWORD", "FlowOps!Preview2026")
+PASSWORD = os.environ["FLOWOPS_LOAD_PASSWORD"]
 
 
 def login():
