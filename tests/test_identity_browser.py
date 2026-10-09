@@ -79,9 +79,18 @@ class IdentityBrowserTest(unittest.TestCase):
     def sign_in(self, username, password):
         self.page.goto(self.base)
         self.page.wait_for_selector("#enterpriseLoginForm:not([hidden])")
+        self.page.wait_for_function("document.querySelector('#authSource option')")
+        # Other modules sharing this database may leave a directory source on.
+        # (The picker is hidden when local is the only source.)
+        self.page.evaluate("document.querySelector('#authSource').value='local'")
         self.page.fill("#loginIdentity", username)
         self.page.fill("#loginPassword", password)
         self.page.click("#enterpriseLoginForm .login-button")
+
+    def signed_in(self):
+        self.page.wait_for_selector(".shell:not(.app-hidden), #toast.show, #mfaForm:not([hidden])")
+        self.assertTrue(self.page.locator(".shell:not(.app-hidden)").count(),
+                        f"sign-in did not open the workspace: {self.page.inner_text('#toast')!r}")
 
     def make_user(self, username):
         with flowops.db.connect() as db:
@@ -104,7 +113,7 @@ class IdentityBrowserTest(unittest.TestCase):
     def test_enrol_mfa_from_the_profile_then_sign_in_with_a_code(self):
         self.make_user("browser-mfa")
         self.sign_in("browser-mfa", PASSWORD)
-        self.page.wait_for_selector(".shell:not(.app-hidden)")
+        self.signed_in()
         self.page.click("#accountMenuToggle")
         self.page.click("#openProfile")
         self.page.click('[data-ptab="security"]')
@@ -137,7 +146,7 @@ class IdentityBrowserTest(unittest.TestCase):
         directory = ldap_server.LdapServer().start()
         try:
             self.sign_in("admin", "FlowOps!Preview2026")
-            self.page.wait_for_selector(".shell:not(.app-hidden)")
+            self.signed_in()
             self.page.evaluate("show('admin',{skipHistory:true}); openAdminTool('identity')")
             form = "#ldapForm"
             self.page.wait_for_selector(form)

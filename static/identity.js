@@ -12,7 +12,8 @@ const loginForm=$('#enterpriseLoginForm');
 const mfaForm=document.createElement('form');
 mfaForm.id='mfaForm';mfaForm.className='enterprise-login mfa-step';mfaForm.hidden=true;
 mfaForm.innerHTML=`<div class="enterprise-brand"><span class="enterprise-mark">F</span><strong>FlowOps</strong></div><h1>Verify it's you</h1><p>Enter the 6-digit code from your authenticator app, or one of your backup codes.</p><div class="auth-row"><label for="mfaCode">Verification code</label><input id="mfaCode" name="code" autocomplete="one-time-code" inputmode="numeric" required maxlength="20"></div><button class="primary login-button" type="submit">Verify</button><div class="enterprise-meta"><a href="#" id="mfaBack">Back to sign in</a></div>`;
-if(loginForm)loginForm.after(mfaForm);
+// Added to the page only while a code is being asked for, so the sign-in
+// form stays the only one on the page otherwise.
 let mfaToken='';
 async function finishSignIn(user){
   state.user=user;state.csrf=user.csrf_token;
@@ -20,12 +21,13 @@ async function finishSignIn(user){
   await enterWorkspace(session);
   if(user.notice)toast(user.notice);
 }
-window.startMfaStep=token=>{mfaToken=token;if(loginForm)loginForm.hidden=true;mfaForm.hidden=false;mfaForm.reset();$('#mfaCode').focus()};
-function backToSignIn(){mfaToken='';mfaForm.hidden=true;if(loginForm){loginForm.hidden=false;$('#loginPassword').value='';$('#loginPassword').focus()}}
-$('#mfaBack')?.addEventListener('click',e=>{e.preventDefault();backToSignIn()});
-mfaForm.onsubmit=async e=>{e.preventDefault();const button=mfaForm.querySelector('button[type=submit]');button.disabled=true;
-  try{await finishSignIn(await api('/api/auth/mfa',{method:'POST',body:JSON.stringify({mfa_token:mfaToken,code:$('#mfaCode').value})}));mfaForm.hidden=true;if(loginForm)loginForm.hidden=false}
-  catch(err){toast(err.message,true);if(err.status===401&&/expired|Sign in again/.test(err.message))backToSignIn();else{$('#mfaCode').value='';$('#mfaCode').focus()}}
+window.startMfaStep=token=>{mfaToken=token;if(loginForm){loginForm.hidden=true;loginForm.after(mfaForm)}mfaForm.hidden=false;mfaForm.reset();$('#mfaCode').focus()};
+function closeMfaStep(){mfaToken='';mfaForm.hidden=true;mfaForm.remove();if(loginForm)loginForm.hidden=false}
+function backToSignIn(){closeMfaStep();if(loginForm){$('#loginPassword').value='';$('#loginPassword').focus()}}
+mfaForm.querySelector('#mfaBack').addEventListener('click',e=>{e.preventDefault();backToSignIn()});
+mfaForm.onsubmit=async e=>{e.preventDefault();const button=mfaForm.querySelector('button[type=submit]'),code=mfaForm.querySelector('#mfaCode');button.disabled=true;
+  try{const user=await api('/api/auth/mfa',{method:'POST',body:JSON.stringify({mfa_token:mfaToken,code:code.value})});closeMfaStep();await finishSignIn(user)}
+  catch(err){toast(err.message,true);if(err.status===401&&/expired|Sign in again/.test(err.message))backToSignIn();else{code.value='';code.focus()}}
   finally{button.disabled=false}};
 if(loginForm)loginForm.onsubmit=async e=>{e.preventDefault();const button=e.currentTarget.querySelector('button[type=submit]');button.disabled=true;button.textContent='Signing in…';const values=Object.fromEntries(new FormData(e.currentTarget));
   try{const result=await api('/api/auth/login',{method:'POST',body:JSON.stringify({username:values.username,password:values.password,source:values.source})});
