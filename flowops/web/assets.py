@@ -20,6 +20,7 @@ class AssetRoutes(BaseHandler):
         if path in ("/runbooks","/my-tasks","/templates","/analytics","/admin") or re.match(r"^/runbooks/\d+$",path) or re.match(r"^/admin/[A-Za-z]+$",path):
             return self.static("index.html","text/html; charset=utf-8")
         if path=="/app.js": return self.static("app.js","application/javascript; charset=utf-8")
+        if path=="/identity.js": return self.static("identity.js","application/javascript; charset=utf-8")
         if path=="/strings.js": return self.static("strings.js","application/javascript; charset=utf-8")
         if path=="/sw.js": return self.static("sw.js","application/javascript; charset=utf-8")
         if path=="/monitor.html": return self.static("monitor.html","text/html; charset=utf-8")

@@ -28,7 +28,7 @@ jobs:
       - name: Run server test suite
         run: python3 -m pytest tests/test_flowops.py -v
       - name: Run sign-in and directory suite (real slapd)
-        run: python3 -m pytest tests/test_identity.py -v
+        run: python3 -m pytest tests/test_identity.py tests/test_identity_browser.py -v
       - name: Run browser regression suite
         run: python3 -m pytest tests/test_browser.py -v
 

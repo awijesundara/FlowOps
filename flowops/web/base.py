@@ -191,6 +191,7 @@ class BaseHandler(BaseHTTPRequestHandler):
             # needed -- the browser has no choice but to fetch fresh.
             body=body.replace(b'href="/styles.css"', f'href="/styles.css?v={VERSION}"'.encode())
             body=body.replace(b'src="/app.js"', f'src="/app.js?v={VERSION}"'.encode())
+            body=body.replace(b'src="/identity.js"', f'src="/identity.js?v={VERSION}"'.encode())
         self.send_response(200); self.send_header("Content-Type",content_type); self.send_header("Content-Length",str(len(body)))
         # no-store, not no-cache: no-cache still permits a cache (browser or,
         # critically, Cloudflare's edge in front of this app) to serve a
